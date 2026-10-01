@@ -1,0 +1,21 @@
+Uncurser bundles unmodified third-party libraries. Their individual licenses
+and package versions are included in this directory.
+
+PySide6-Essentials and Shiboken6 declare LGPL-3.0-only OR GPL-2.0-only OR
+GPL-3.0-only in their package metadata. Qt/PySide dynamic libraries remain
+separate from the application under _internal. LGPL-3.0 and its accompanying
+GPL-3.0 text are included. These libraries are used under the LGPL option.
+Do not remove the library license notices when redistributing the app.
+
+Qt for Python source and project:
+https://code.qt.io/pyside/pyside-setup
+https://www.qt.io/qt-for-python
+
+Qt source:
+https://download.qt.io/official_releases/qt/
+
+Python source and project:
+https://www.python.org/downloads/source/
+
+The application does not restrict modification or replacement of the LGPL
+libraries, or reverse engineering for debugging modifications to them.
