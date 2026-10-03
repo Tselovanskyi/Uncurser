@@ -1,6 +1,9 @@
 # Uncurser
 
-Portable Windows app for ~~uncursing~~ improving your 3d printer firmware, currently supported printers: **Creality K2 Plus, firmware 1.1.6.4**.
+Portable Windows app for ~~uncursing~~ improving your 3d printer firmware.
+
+Currently supported printers: **Creality K2 Plus, firmware 1.1.6.4**.
+
 
 **[Download Uncurser.exe](https://github.com/Tselovanskyi/Uncurser/releases/latest/download/Uncurser.exe)**
 
