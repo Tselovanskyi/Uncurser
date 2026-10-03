@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1254" height="1254" viewBox="0 0 1254 1254" role="img" aria-labelledby="title">
+  <title id="title">Uncurser bronze nozzle and cyan sparkle</title>
+  <defs>
+    <linearGradient id="bronze" x1="394" y1="0" x2="840" y2="0" gradientUnits="userSpaceOnUse" color-interpolation="sRGB">
+      <stop offset="0" stop-color="#804B27"/>
+      <stop offset="0.125560538" stop-color="#D2A56A"/>
+      <stop offset="0.235874439" stop-color="#ECC27F"/>
+      <stop offset="0.407802691" stop-color="#CDA366"/>
+      <stop offset="0.522421525" stop-color="#9F612F"/>
+      <stop offset="0.61793722" stop-color="#804B27"/>
+      <stop offset="0.732556054" stop-color="#9F622F"/>
+      <stop offset="1" stop-color="#E3B674"/>
+    </linearGradient>
+    <linearGradient id="bottom-cut" x1="586.722352" y1="0" x2="654" y2="0" gradientUnits="userSpaceOnUse" color-interpolation="sRGB">
+      <stop offset="0" stop-color="#7C3E21"/>
+      <stop offset="1" stop-color="#FDDEA1"/>
+    </linearGradient>
+  </defs>
+  <g id="nozzle-trimmed-at-948">
+    <path id="nozzle" fill="url(#bronze)" d="M 518 298 H 736 L 812 374 772 414 812 454 770 496 V 520 H 880 V 772 L 794 796 665.316456 948 H 588.683544 L 460 796 374 772 V 520 H 484 V 496 L 442 454 482 414 442 374 Z"/>
+    <path id="left-edge" fill="#7C3E21" d="M 518 298 H 536 L 463 374 503 414 463 454 504 495 V 520 H 394 V 755 L 487 780 586.722352 930 H 573.444703 L 460 796 374 772 V 520 H 484 V 496 L 442 454 482 414 442 374 Z"/>
+    <path id="right-edge" fill="#FDDEA1" d="M 700 298 H 736 L 812 374 772 414 812 454 770 496 V 520 H 880 V 772 L 794 796 680.555297 930 H 654 L 740 764 840 738 V 520 H 730 V 494 L 770 454 730 414 770 374 Z"/>
+    <path id="bottom-highlight" fill="url(#bottom-cut)" d="M 573.444703 930 H 680.555297 L 665.316456 948 H 588.683544 Z"/>
+  </g>
+  <path id="sparkle" fill="#00FBFC" d="M 1007 62 C 1015 62 1019 70 1022 83 C 1051 193 1089 238 1207 270 C 1219 273 1225 276 1225 284 C 1225 292 1219 295 1207 298 C 1089 330 1051 375 1022 485 C 1019 498 1015 506 1007 506 C 999 506 995 498 992 485 C 963 375 925 330 807 298 C 795 295 789 292 789 284 C 789 276 795 273 807 270 C 925 238 963 193 992 83 C 995 70 999 62 1007 62 Z"/>
+</svg>

@@ -1,6 +1,7 @@
 # Publish app sources only; keep local printer data and investigations private.
 /*
 !/.gitignore
+!/AGENTS.md
 !/README.md
 !/Uncurser.py
 !/requirements.txt

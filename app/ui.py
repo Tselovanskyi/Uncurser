@@ -10,9 +10,9 @@ from PySide6.QtGui import QColor, QDesktopServices, QIcon, QLinearGradient, QPai
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QDialogButtonBox,
                                QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox,
-                               QPushButton, QPlainTextEdit, QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
+                               QPushButton, QPlainTextEdit, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
 
-from . import engine, mesh, mesh_temperature, mods, network, settings
+from . import __version__, engine, mesh, mesh_temperature, mods, network, settings
 from .remote import Connection, NewHostKey, trust_key
 
 
@@ -484,11 +484,15 @@ class PrinterRow(QWidget):
         self.availability = label("Checking…", "muted")
         self.availability.setFixedWidth(110)
         self.availability.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.connection_state = QStackedWidget()
+        self.connection_state.setFixedWidth(110)
+        self.connection_state.addWidget(self.availability)
+        self.connection_state.addWidget(self.connect_button)
         self.remove_button = SymbolButton("×", lambda: self.remove_requested.emit(self))
         self.remove_button.setObjectName("remove")
         self.remove_button.setAccessibleName("Remove saved printer")
         self.remove_button.setToolTip("Remove this printer from the saved list")
-        for widget in (self.remove_button, self.name, self.host, self.username, self.password, self.connect_button, self.availability):
+        for widget in (self.remove_button, self.name, self.host, self.username, self.password, self.connection_state):
             row.addWidget(widget, alignment=Qt.AlignmentFlag.AlignVCenter)
         for field in (self.name, self.host, self.username, self.password):
             field.textEdited.connect(lambda text: self.edited.emit(self))
@@ -504,12 +508,11 @@ class PrinterRow(QWidget):
         return Connection(network.parse_host(values["host"]), username=values["username"], password=values["password"])
 
     def refresh(self, active, busy):
-        self.connect_button.setVisible(bool(self.reachable) or active)
+        self.connection_state.setCurrentWidget(self.connect_button if self.reachable or active else self.availability)
         self.connect_button.setEnabled(not busy)
         self.connect_button.set_connected(active)
         self.remove_button.setEnabled(not busy)
-        self.availability.setVisible(bool(self.host.text().strip()) and not self.reachable and not active)
-        self.availability.setText("Checking…" if self.reachable is None else "Unavailable")
+        self.availability.setText(("Checking…" if self.reachable is None else "Unavailable") if self.host.text().strip() else "")
         self.availability.setToolTip("" if active else "Connect is available when the printer is reachable.")
         for field in (self.name, self.host, self.username, self.password):
             field.setEnabled(not busy)
@@ -635,6 +638,7 @@ class Window(QMainWindow):
         top = QHBoxLayout()
         top.addWidget(label('UNCURSER <span style="font-size: 14pt; font-weight: 400; color: #999999;">for K2 Plus</span>', "title"))
         top.addStretch()
+        top.addWidget(label(f"v{__version__}", "muted"), alignment=Qt.AlignmentFlag.AlignVCenter)
         header.addLayout(top)
 
         connection_card, layout = card()
@@ -871,18 +875,6 @@ class Window(QMainWindow):
         if start_polling:
             self.poll_timer.start(10000)
             self.probe_timer.start(0)
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        # Settle styled size hints and nested layouts before the first paint.
-        widgets = [self, *self.findChildren(QWidget)]
-        for widget in reversed(widgets):
-            widget.ensurePolished()
-            if widget.layout() is not None:
-                widget.layout().invalidate()
-        for widget in widgets:
-            if widget.layout() is not None:
-                widget.layout().activate()
 
     def support_development(self):
         if not QDesktopServices.openUrl(QUrl(SUPPORT_URL)):
@@ -1424,13 +1416,28 @@ class Window(QMainWindow):
                                                    mesh_desired=mesh_desired, temperature_desired=temperature_desired), applied)
 
     def show_write_success(self):
-        dialog = QMessageBox(QMessageBox.Icon.NoIcon, "Write successful", "Write successful.",
-                             QMessageBox.StandardButton.Ok, self)
-        dialog.setInformativeText("Power cycle the printer to apply the changes!")
-        dialog.setOption(QMessageBox.Option.DontUseNativeDialog, True)
-        dialog.setStyleSheet("QWidget { font-family: 'Google Sans'; font-size: 18pt; }"
-                            "QLabel#qt_msgbox_label { font-size: 22pt; font-weight: 600; }"
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Write successful")
+        dialog.setStyleSheet("QWidget { font-family: 'Google Sans'; font-size: 16pt; }"
+                            "QLabel#powerCycle { font-size: 18pt; font-weight: 600; color: #ffffff; "
+                            "background: #b51f2a; border-radius: 0; padding: 4px 8px; }"
                             "QPushButton { font-size: 14pt; min-width: 120px; padding: 12px 24px; }")
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(20)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+        success = label("Write successful.")
+        success.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(success)
+        power_cycle = label("Physically power cycle the printer to apply the changes!", "powerCycle")
+        power_cycle.setWordWrap(False)
+        power_cycle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(power_cycle)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.setCenterButtons(True)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setDefault(True)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
         dialog.exec()
 
     def find_printers(self):

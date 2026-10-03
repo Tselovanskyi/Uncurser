@@ -27,7 +27,7 @@ def run(runtime):
         logging.basicConfig(level=logging.WARNING, handlers=[handler])
     except OSError as error:
         import ctypes
-        ctypes.windll.user32.MessageBoxW(None, "Move Uncurser.exe to a writable folder.\n\n" + str(error), "Uncurser", 16)
+        ctypes.windll.user32.MessageBoxW(None, "Move Uncurser to a writable folder.\n\n" + str(error), "Uncurser", 16)
         return 1
     from PySide6.QtWidgets import QApplication, QMessageBox
     from app.appearance import configure

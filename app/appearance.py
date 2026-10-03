@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject
-from PySide6.QtGui import QFont, QFontDatabase
+from PySide6.QtGui import QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import QWidget
 
 
@@ -30,9 +30,13 @@ class TitleBars(QObject):
 
 
 def configure(app):
+    icon = QIcon(str(Path(__file__).resolve().parent / "assets" / "icons" / "uncurser.ico"))
+    if icon.isNull():
+        raise RuntimeError("The bundled app icon could not be loaded. Download a fresh copy of Uncurser.")
+    app.setWindowIcon(icon)
     font = Path(__file__).resolve().parent / "assets" / "fonts" / "GoogleSans.ttf"
     if QFontDatabase.addApplicationFont(str(font)) < 0:
-        raise RuntimeError("The bundled Google Sans font could not be loaded. Download a fresh copy of Uncurser.exe.")
+        raise RuntimeError("The bundled Google Sans font could not be loaded. Download a fresh copy of Uncurser.")
     ui_font = QFont("Google Sans", 10)
     ui_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.NoSubpixelAntialias)
     ui_font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)

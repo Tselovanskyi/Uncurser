@@ -60,6 +60,20 @@ assert not window.heat_details.isEnabled() and not window.mesh_details.isEnabled
 assert window.scan_card.isHidden()
 first = window.printer_rows[0]
 assert first.password.text() == "creality_2024"
+# Background reachability changes must not enlarge the content beyond the
+# unfocused window, even momentarily. No click, focus change, or resize repairs it.
+app.processEvents()
+assert not window.isActiveWindow()
+initial_fields = [field.geometry() for field in (first.name, first.host, first.username, first.password)]
+for reachable in (True, False, None, True):
+    window.receive_reachability({"192.168.50.130": reachable})
+    for settled in (False, True):
+        if settled:
+            app.processEvents()
+        assert window.centralWidget().width() == window.width() == 720
+        assert [field.geometry() for field in (first.name, first.host, first.username, first.password)] == initial_fields
+        for widget in (window.find_button, window.toggle, window.mesh_toggle, window.temperature_toggle, window.apply_button):
+            assert widget.mapTo(window, QPoint(widget.width(), 0)).x() <= window.width()
 first.name.setText("Workshop printer")
 first.password.setText("synthetic-password")
 # Adding/removing a draft must not stretch or move the existing printer row.
