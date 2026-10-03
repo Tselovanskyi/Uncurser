@@ -5,8 +5,8 @@ import re
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRectF, QRunnable, QSignalBlocker, Qt, QThreadPool, QTimer, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRectF, QRunnable, QSignalBlocker, QSize, Qt, QThreadPool, QTimer, QUrl, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QLinearGradient, QPainter, QPen, QTextCharFormat, QTextCursor
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QDialogButtonBox,
                                QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox,
@@ -23,6 +23,7 @@ QFrame#card { background: #0a0a0a; border: none; border-radius: 6px; }
 QFrame#card QLabel { background: transparent; }
 QWidget#modContent, QWidget#modBody, QWidget#modItem { background: transparent; }
 QWidget#fileStatuses, QWidget#fileStatusRow, QWidget#scanContent { background: transparent; }
+QWidget#scrollFade { background: transparent; }
 QFrame#printers { background: transparent; border: none; }
 QFrame#scanPanel { background: #071625; border: none; border-radius: 6px; }
 QFrame#scanPanel QLabel { background: transparent; }
@@ -48,12 +49,17 @@ QPushButton#scan { background: #13283b; color: #ffffff; }
 QPushButton#scan:hover { background: #1c344a; }
 QPushButton#scan:disabled { background: #102130; color: #7b8996; }
 QPushButton#scan[working="true"] { background: #13283b; color: #ffffff; }
+QPushButton#restore, QPushButton#restore:hover, QPushButton#restore:pressed, QPushButton#restore:disabled { background: transparent; }
 QPushButton#restore { color: #ff7373; }
+QPushButton#restore:hover { color: #ffa0a0; }
 QPushButton#restore:disabled { color: #754040; }
 QPushButton#textOnly, QPushButton#textOnly:hover, QPushButton#textOnly:pressed, QPushButton#textOnly:disabled { background: transparent; border: none; }
 QPushButton#textOnly { color: #cccccc; }
 QPushButton#textOnly:hover { color: #ffffff; }
 QPushButton#textOnly:disabled { color: #555555; }
+QPushButton#support { background: transparent; color: #cccccc; font-weight: 700; min-height: 38px; padding: 0 10px; }
+QPushButton#support:hover { background: transparent; color: #ffffff; }
+QPushButton#support:pressed { background: transparent; color: #79eaf4; }
 QPushButton#modDetails, QPushButton#modDetails:hover, QPushButton#modDetails:pressed, QPushButton#modDetails:disabled { background: transparent; border: none; }
 QPushButton#modDetails { text-align: left; padding: 6px 0; color: #999999; }
 QPushButton#modDetails:hover { color: #ededed; }
@@ -76,12 +82,14 @@ QScrollBar:vertical { background: #0a0a0a; width: 8px; margin: 0; }
 QScrollBar::handle:vertical { background: #333333; min-height: 24px; border-radius: 4px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-QScrollBar#pageScrollBar:vertical:disabled, QScrollBar#pageScrollBar::handle:vertical:disabled { background: transparent; }
+QScrollBar#cardsScrollBar:vertical { background: #000000; }
+QScrollBar#cardsScrollBar:vertical:disabled, QScrollBar#cardsScrollBar::handle:vertical:disabled { background: transparent; }
 QToolTip { background: #000000; color: #ededed; border: 1px solid #666666; }
 """
 
 DEFAULT_PASSWORD = "creality_2024"
 PRINTER_ROW_HEIGHT = 48
+SUPPORT_URL = "https://donatello.to/uncurse"
 
 
 class ActivityButton(QPushButton):
@@ -180,6 +188,87 @@ class SymbolButton(QPushButton):
         painter.end()
 
 
+class SmoothScrollArea(QScrollArea):
+    def __init__(self):
+        super().__init__()
+        bar = self.verticalScrollBar()
+        self.scroll_animation = QVariantAnimation(self)
+        self.scroll_animation.setDuration(180)
+        self.scroll_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.scroll_animation.valueChanged.connect(lambda value: bar.setValue(round(value)))
+        bar.sliderPressed.connect(self.scroll_animation.stop)
+        bar.actionTriggered.connect(self.scroll_animation.stop)
+        bar.rangeChanged.connect(self.scroll_animation.stop)
+        bar.installEventFilter(self)
+
+    def wheelEvent(self, event):
+        bar = self.verticalScrollBar()
+        if event.pixelDelta().y():
+            # Touchpads already provide small, smooth position changes.
+            self.scroll_animation.stop()
+            bar.setValue(bar.value() - event.pixelDelta().y())
+        elif event.angleDelta().y():
+            delta = event.angleDelta().y() / 120 * QApplication.wheelScrollLines() * bar.singleStep()
+            target = self.scroll_animation.endValue() if self.scroll_animation.state() == QVariantAnimation.State.Running else bar.value()
+            if (target - bar.value()) * delta > 0:
+                target = bar.value()
+            target = max(bar.minimum(), min(bar.maximum(), round(target - delta)))
+            self.scroll_animation.stop()
+            with QSignalBlocker(self.scroll_animation):
+                self.scroll_animation.setStartValue(float(bar.value()))
+                self.scroll_animation.setEndValue(float(target))
+                self.scroll_animation.start()
+        else:
+            super().wheelEvent(event)
+            return
+        event.accept()
+
+    def eventFilter(self, widget, event):
+        if widget is self.verticalScrollBar() and event.type() == QEvent.Type.Wheel:
+            self.wheelEvent(event)
+            return event.isAccepted()
+        return super().eventFilter(widget, event)
+
+
+class ScrollFade(QWidget):
+    def __init__(self, scroll):
+        super().__init__(scroll.viewport())
+        self.setObjectName("scrollFade")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.bar = scroll.verticalScrollBar()
+        self.bar.rangeChanged.connect(self.sync)
+        self.bar.valueChanged.connect(self.sync)
+        scroll.viewport().installEventFilter(self)
+        self.sync()
+
+    def sync(self, *unused):
+        self.setGeometry(self.parentWidget().rect())
+        self.bar.setEnabled(self.bar.maximum() > self.bar.minimum())
+        self.setVisible(self.bar.maximum() > self.bar.minimum())
+        self.raise_()
+        self.update()
+
+    def eventFilter(self, widget, event):
+        if event.type() == QEvent.Type.Resize:
+            self.sync()
+        return False
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        extent = min(64, self.height() // 2)
+        top = min(extent, self.bar.value() - self.bar.minimum())
+        bottom = min(extent, self.bar.maximum() - self.bar.value())
+        for height, y, reverse in ((top, 0, False), (bottom, self.height() - bottom, True)):
+            if height <= 0:
+                continue
+            fade = QLinearGradient(0, y, 0, y + height)
+            fade.setColorAt(0, QColor(0, 0, 0, 0 if reverse else 255))
+            fade.setColorAt(1, QColor(0, 0, 0, 255 if reverse else 0))
+            painter.fillRect(QRectF(0, y, self.width(), height), fade)
+
+
 class DetailsReveal(QWidget):
     def __init__(self, body):
         super().__init__()
@@ -191,14 +280,14 @@ class DetailsReveal(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setFixedHeight(0)
         self.animation = QVariantAnimation(self)
-        self.animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self.animation.setEasingCurve(QEasingCurve.Type.InOutSine)
         self.animation.valueChanged.connect(self.reveal)
 
     def set_expanded(self, expanded):
         self.animation.stop()
         target = 1.0 if expanded else 0.0
         with QSignalBlocker(self.animation):
-            self.animation.setDuration(max(1, round(220 * abs(target - self.fraction))))
+            self.animation.setDuration(max(1, round(300 * abs(target - self.fraction))))
             self.animation.setStartValue(self.fraction)
             self.animation.setEndValue(target)
             self.animation.start()
@@ -338,13 +427,22 @@ class Task(QRunnable):
     def __init__(self, function):
         super().__init__()
         self.function, self.signals = function, Signals()
+        self.cancelled = threading.Event()
+
+    def progress(self, message):
+        if not self.cancelled.is_set():
+            self.signals.progress.emit(message)
 
     def run(self):
         try:
-            self.signals.done.emit(self.function(self.signals.progress.emit))
+            result = self.function(self.progress)
         except Exception as error:
-            logging.exception("Operation failed")
-            self.signals.error.emit(error)
+            if not self.cancelled.is_set():
+                logging.exception("Operation failed")
+                self.signals.error.emit(error)
+        else:
+            if not self.cancelled.is_set():
+                self.signals.done.emit(result)
 
 
 class PrinterRow(QWidget):
@@ -525,24 +623,19 @@ class Window(QMainWindow):
         self.setStyleSheet(STYLE)
         container = QWidget()
         outer = QVBoxLayout(container)
-        # The permanent 8px scrollbar gutter completes the 28px right margin.
-        outer.setContentsMargins(28, 22, 20, 20)
+        # Reserve a 12px gap before the 8px scrollbar without narrowing cards.
+        outer.setContentsMargins(28, 22, 8, 20)
         outer.setSpacing(16)
-        outer.setAlignment(Qt.AlignmentFlag.AlignTop)
         outer.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
-        self.page_scroll = QScrollArea()
-        self.page_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        page_bar = self.page_scroll.verticalScrollBar()
-        page_bar.setObjectName("pageScrollBar")
-        page_bar.setEnabled(False)
-        page_bar.rangeChanged.connect(lambda minimum, maximum: page_bar.setEnabled(maximum > minimum))
-        self.page_scroll.setWidgetResizable(True)
-        self.page_scroll.setWidget(container)
-        self.setCentralWidget(self.page_scroll)
+        self.setCentralWidget(container)
+        header = QVBoxLayout()
+        header.setContentsMargins(0, 0, 20, 0)
+        header.setSpacing(16)
+        outer.addLayout(header)
         top = QHBoxLayout()
         top.addWidget(label('UNCURSER <span style="font-size: 14pt; font-weight: 400; color: #999999;">for K2 Plus</span>', "title"))
         top.addStretch()
-        outer.addLayout(top)
+        header.addLayout(top)
 
         connection_card, layout = card()
         connection_card.setObjectName("printers")
@@ -576,7 +669,7 @@ class Window(QMainWindow):
             if isinstance(values, dict) and str(values.get("host", "")).strip():
                 self.add_printer(values, save=False)
         self.update_printer_list()
-        outer.addWidget(connection_card)
+        header.addWidget(connection_card)
 
         self.scan_card, layout = card()
         self.scan_card.setObjectName("scanPanel")
@@ -612,7 +705,6 @@ class Window(QMainWindow):
         actions.addWidget(self.review_button)
         actions.addStretch()
         layout.addLayout(actions)
-        outer.addWidget(self.scan_card)
 
         mod_section, section_layout = card()
         section_layout.addWidget(label("PRINT STARTUP", "groupHeading"))
@@ -720,10 +812,27 @@ class Window(QMainWindow):
             disclosure.toggled.connect(lambda expanded, active=disclosure: self.close_other_details(active, expanded))
         mods_and_footer = QVBoxLayout()
         mods_and_footer.setSpacing(4)
-        mods_and_footer.addWidget(mod_section)
-        outer.addLayout(mods_and_footer)
+        cards = QWidget()
+        cards_layout = QVBoxLayout(cards)
+        cards_layout.setContentsMargins(0, 0, 12, 0)
+        cards_layout.setSpacing(16)
+        cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        cards_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        cards_layout.addWidget(self.scan_card)
+        cards_layout.addWidget(mod_section)
+        self.cards_scroll = SmoothScrollArea()
+        self.cards_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.cards_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.cards_scroll.verticalScrollBar().setObjectName("cardsScrollBar")
+        self.cards_scroll.setWidgetResizable(True)
+        self.cards_scroll.setMinimumHeight(100)
+        self.cards_scroll.setWidget(cards)
+        self.cards_fade = ScrollFade(self.cards_scroll)
+        mods_and_footer.addWidget(self.cards_scroll, 1)
+        outer.addLayout(mods_and_footer, 1)
 
         footer_group = QVBoxLayout()
+        footer_group.setContentsMargins(0, 0, 20, 0)
         footer_group.setSpacing(8)
         review_row = QHBoxLayout()
         review_row.addStretch()
@@ -733,12 +842,18 @@ class Window(QMainWindow):
         review_row.addWidget(self.preview_button)
         footer_group.addLayout(review_row)
         footer = QHBoxLayout()
+        self.support_button = button("SUPPORT DEVELOPMENT", self.support_development)
+        self.support_button.setIcon(QIcon(str(Path(__file__).resolve().parent / "assets" / "icons" / "material_favorite_white_18.png")))
+        self.support_button.setIconSize(QSize(18, 18))
+        self.support_button.setObjectName("support")
+        self.support_button.setAccessibleName("Support development")
+        self.support_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.support_button.setToolTip(SUPPORT_URL)
+        footer.addWidget(self.support_button)
+        footer.addStretch()
         self.original_button = button("Restore original…", self.stage_restore)
         self.original_button.setObjectName("restore")
         footer.addWidget(self.original_button)
-        footer.addStretch()
-        self.power_cycle_label = label("Power cycle printer after applying", "muted")
-        footer.addWidget(self.power_cycle_label)
         self.cancel_button = button("Cancel", self.cancel_staged)
         self.apply_button = ActivityButton("Apply", "Applying…", self.apply_clicked)
         self.apply_button.setObjectName("primary")
@@ -756,6 +871,22 @@ class Window(QMainWindow):
         if start_polling:
             self.poll_timer.start(10000)
             self.probe_timer.start(0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Settle styled size hints and nested layouts before the first paint.
+        widgets = [self, *self.findChildren(QWidget)]
+        for widget in reversed(widgets):
+            widget.ensurePolished()
+            if widget.layout() is not None:
+                widget.layout().invalidate()
+        for widget in widgets:
+            if widget.layout() is not None:
+                widget.layout().activate()
+
+    def support_development(self):
+        if not QDesktopServices.openUrl(QUrl(SUPPORT_URL)):
+            QMessageBox.warning(self, "Support development", "Could not open the support page. Visit:\n\n" + SUPPORT_URL)
 
     def close_other_details(self, active, expanded):
         if expanded:
@@ -811,11 +942,6 @@ class Window(QMainWindow):
         if row is None:
             row = self.add_printer({"host": "", "username": "root"})
         row.host.setFocus()
-        def reveal():
-            if row in self.printer_rows:
-                self.printer_layout.activate()
-                self.page_scroll.ensureWidgetVisible(row, 0, 0)
-        QTimer.singleShot(0, reveal)
 
     def focus_changed(self, old, new):
         QTimer.singleShot(0, self.discard_empty_printers)
@@ -955,6 +1081,8 @@ class Window(QMainWindow):
         self.files_status.set_files(())
         self.files_errors.hide()
         self.review_button.hide()
+        self.cards_scroll.scroll_animation.stop()
+        self.cards_scroll.verticalScrollBar().setValue(0)
         self.run_task(lambda progress: engine.scan(connection, self.known_hosts, progress),
                       lambda result: self.receive_scan(result, connection), scan=True)
 
@@ -966,7 +1094,7 @@ class Window(QMainWindow):
         self.refresh()
 
     def run_task(self, function, done, *, scan=False):
-        if self.busy:
+        if self.busy or self.closing:
             return
         self.reachability_generation += 1
         self.busy = True
@@ -979,7 +1107,10 @@ class Window(QMainWindow):
         self.refresh()
         task = Task(function)
         self.active_task = task
-        task.signals.progress.connect(self.scan_progress if scan else self.apply_button.setToolTip)
+        def progress(message):
+            if not self.closing:
+                (self.scan_progress if scan else self.apply_button.setToolTip)(message)
+        task.signals.progress.connect(progress)
         def stop_progress():
             self.busy = False
             self.scanning = False
@@ -988,10 +1119,14 @@ class Window(QMainWindow):
             else:
                 self.apply_button.set_running(False)
         def finish(value):
+            if self.closing:
+                return
             stop_progress()
             done(value)
             self.refresh()
         def fail(error):
+            if self.closing:
+                return
             stop_progress()
             self.refresh()
             if isinstance(error, NewHostKey):
@@ -1010,7 +1145,11 @@ class Window(QMainWindow):
             QMessageBox.warning(self, "Operation stopped", str(error))
         task.signals.done.connect(finish)
         task.signals.error.connect(fail)
-        self.pool.start(task)
+        if scan:
+            # A blocked network read must not hold the app open on exit.
+            threading.Thread(target=task.run, daemon=True, name="printer-scan").start()
+        else:
+            self.pool.start(task)
 
     def scan_clicked(self):
         if not self.connected:
@@ -1279,8 +1418,20 @@ class Window(QMainWindow):
             self.restore_pending = False
             self.receive_scan(result["snapshot"], connection, review=False)
             self.apply_button.setToolTip(result["message"])
+            if result.get("written"):
+                self.show_write_success()
         self.run_task(lambda progress: engine.apply(connection, self.known_hosts, scanned, desired, restore, risk, progress,
                                                    mesh_desired=mesh_desired, temperature_desired=temperature_desired), applied)
+
+    def show_write_success(self):
+        dialog = QMessageBox(QMessageBox.Icon.NoIcon, "Write successful", "Write successful.",
+                             QMessageBox.StandardButton.Ok, self)
+        dialog.setInformativeText("Power cycle the printer to apply the changes!")
+        dialog.setOption(QMessageBox.Option.DontUseNativeDialog, True)
+        dialog.setStyleSheet("QWidget { font-family: 'Google Sans'; font-size: 18pt; }"
+                            "QLabel#qt_msgbox_label { font-size: 22pt; font-weight: 600; }"
+                            "QPushButton { font-size: 14pt; min-width: 120px; padding: 12px 24px; }")
+        dialog.exec()
 
     def find_printers(self):
         if self.discovery_task is not None:
@@ -1352,8 +1503,8 @@ class Window(QMainWindow):
         self.search_progress("Search stopped: " + str(error))
 
     def closeEvent(self, event):
-        if self.busy:
-            QMessageBox.information(self, "Operation in progress", "Wait for the current operation to finish before closing the app.")
+        if self.busy and not self.scanning:
+            QMessageBox.information(self, "Write in progress", "Wait for the printer files to finish writing before closing the app.")
             event.ignore()
         elif self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.restore_pending:
             dialog = QMessageBox(QMessageBox.Icon.Question, "Discard pending edits?",
@@ -1376,6 +1527,8 @@ class Window(QMainWindow):
                 event.ignore()
                 return
             self.closing = True
+            if self.scanning and self.active_task is not None:
+                self.active_task.cancelled.set()
             self.discovery_stop.set()
             self.find_button.timer.stop()
             self.scan_button.timer.stop()

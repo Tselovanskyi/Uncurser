@@ -252,9 +252,9 @@ assert window.staged is True and window.apply_button.toolTip() == "Saved write s
 # belongs to the scan button; write details use Apply's tooltip, without a label row.
 immediate_task = window.run_task
 window.run_task = Window.run_task.__get__(window, Window)
-with patch.object(window.pool, "start") as start:
+with patch.object(window.pool, "start") as start, patch("app.ui.threading.Thread") as scan_thread:
     window.scan_clicked()
-    scan_task = start.call_args.args[0]
+    scan_task = scan_thread.call_args.kwargs["target"].__self__
     assert window.scanning and window.scan_button.running and not window.scan_card.isHidden()
     assert not window.apply_button.running and window.apply_button.toolTip() == "Saved write status"
     scan_task.signals.progress.emit("Reading current printer files…")
@@ -267,7 +267,7 @@ with patch.object(window.pool, "start") as start:
     assert window.staged is True and window.apply_button.toolTip() == "Saved write status"
     window.scan_clicked()
     with patch.object(QMessageBox, "warning"):
-        start.call_args.args[0].signals.error.emit(RuntimeError("Example scan failure"))
+        scan_thread.call_args.kwargs["target"].__self__.signals.error.emit(RuntimeError("Example scan failure"))
     assert window.scan_button.text() == "Scan failed" and window.apply_button.toolTip() == "Saved write status"
     window.run_task(lambda progress: None, lambda result: window.apply_button.setToolTip("Saved and verified."))
     write_task = start.call_args.args[0]

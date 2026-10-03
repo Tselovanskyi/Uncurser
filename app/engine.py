@@ -258,7 +258,7 @@ def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore,
     pending = {path: data for path, data in pending.items()
                if data != file_snapshot(fresh, path).data}
     if not pending:
-        return {"snapshot": fresh, "message": "Printer files already match the requested state.", "restarted": False}
+        return {"snapshot": fresh, "message": "Printer files already match the requested state.", "restarted": False, "written": False}
     if mods.TARGET in pending and not restore and not fresh.identity.get("history"):
         raise RuntimeError("Native print history is unavailable; early heating cannot identify new jobs.")
     with Remote(connection, known_hosts) as remote:
@@ -305,7 +305,7 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
         value = file_snapshot(result, path)
         if value.sha256 != mods.digest(data):
             raise RuntimeError("A saved file changed after Apply. Rescan before proceeding.")
-    return {"snapshot": result, "message": "Saved and verified. Power cycle the printer before printing.", "restarted": False}
+    return {"snapshot": result, "message": "Saved and verified. Power cycle the printer before printing.", "restarted": False, "written": True}
 
 
 def apply(connection, known_hosts, scanned, desired, restore=False, full_risk=False,
@@ -325,7 +325,7 @@ def apply(connection, known_hosts, scanned, desired, restore=False, full_risk=Fa
         raise RuntimeError("Native print history is unavailable; the early-heating mod cannot identify new jobs.")
     new = prepare(fresh, desired, restore, full_risk)
     if new == fresh.data:
-        return {"snapshot": fresh, "message": "The printer files already match the requested state.", "restarted": False}
+        return {"snapshot": fresh, "message": "The printer files already match the requested state.", "restarted": False, "written": False}
     progress("Verifying cancellation support and the prepared Python source…")
     with Remote(connection, known_hosts) as remote:
         capabilities = remote.python('''import ast,json
@@ -348,4 +348,4 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
     result = scan(connection, known_hosts, progress)
     if result.sha256 != mods.digest(new):
         raise RuntimeError("The saved file changed after Apply. Rescan before making further changes.")
-    return {"snapshot": result, "message": "Saved and verified. Power cycle the printer before printing.", "restarted": False}
+    return {"snapshot": result, "message": "Saved and verified. Power cycle the printer before printing.", "restarted": False, "written": True}
