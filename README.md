@@ -1,17 +1,15 @@
 # Uncurser
 
-Portable Windows app for **Creality K2 Plus, firmware 1.1.6.4**.
+Portable Windows app for ~~uncursing~~ improving your 3d printer firmware, currently supported printers: **Creality K2 Plus, firmware 1.1.6.4**.
 
 **[Download Uncurser.exe](https://github.com/Tselovanskyi/Uncurser/releases/latest/download/Uncurser.exe)**
 
-Run `Uncurser.exe` from a writable folder. No installation or separate runtime folder needed.
+No installation or separate runtime folder needed.
 
-Available mods:
+<img width="745" height="953" alt="image" src="https://github.com/user-attachments/assets/18f31ae4-91ae-447e-8f21-d4e4c9e8fbf7" />
 
-- Heat before homing & calibration
-- Speed up Bed mesh
-- Mesh at print temperature
+Automatically find or add your printer manually, connect to it, select mods, apply while the printer is idle to write the files, then power cycle the printer to apply, like actually power cycle it physically, not through fluidd, don't skip this step, it's important;).
 
-Find or add your printer, connect over SSH, select mods, and review changes before applying. Apply while the printer is idle, then power cycle it.
+All mods are reversible.
 
-Original backups stay on the printer. Turn a mod off to undo it, or use **Restore original**. Saved printers, plaintext SSH passwords and trusted SSH keys stay in `Uncurser_settings` beside the EXE. Move both files together to keep your settings.
+Original backups are automatically created on the printer on first apply. Turn a mod off to undo it, or use **Restore original** to restore everything to pre-uncurser state.
