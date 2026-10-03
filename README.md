@@ -13,7 +13,11 @@ Currently supports Creality K2 Plus, firmware 1.1.6.4
 
 <img width="745" height="953" alt="image" src="https://github.com/user-attachments/assets/9d11b348-215f-45cc-85ef-02e1ca315db3" />
 
-Automatically find or add your printer manually, connect to it, select mods, apply while the printer is idle to write the files, then power cycle the printer to apply, like actually power cycle it physically, not through fluidd, don't skip this step, it's important;).
+1. Automatically find or add your printer manually.
+2. Connect to it.
+3. Select mods you want to use.
+4. Apply while the printer is idle.
+5. Once the message shows succesfull write - power cycle the printer to finish applying (like actually power cycle it physically, not through fluidd, don't skip this step, it's important).
 
 All mods are reversible.
 
