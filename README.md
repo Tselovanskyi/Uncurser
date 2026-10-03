@@ -19,7 +19,7 @@ Currently supports Creality K2 Plus, firmware 1.1.6.4
 4. Apply while the printer is idle.
 5. Once the message shows succesfull write - power cycle the printer to finish applying (like actually power cycle it physically, not through fluidd, don't skip this step, it's important).
 
-All mods are reversible.
 
 > [!TIP]
->Original backups are automatically created on the printer on first apply. Turn a mod off to undo it, or use **Restore original** to restore everything to pre-uncurser state.
+>All mods are reversible.
+>Original backups are automatically created directly on the printer on first apply. Turn a mod off to undo it, or use **Restore original** to restore everything to pre-uncurser state.
