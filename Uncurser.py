@@ -5,22 +5,29 @@ import logging.handlers
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 
 def main():
+    with tempfile.TemporaryDirectory(prefix="Uncurser-") as temporary:
+        try:
+            return run(Path(temporary))
+        finally:
+            logging.shutdown()
+
+
+def run(runtime):
     base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-    data = base / "data"
     try:
-        data.mkdir(exist_ok=True)
         os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-        os.environ["QT_SHADER_CACHE_PATH"] = str(data / "cache")
+        os.environ["QT_SHADER_CACHE_PATH"] = str(runtime / "cache")
         sys.dont_write_bytecode = True
-        handler = logging.handlers.RotatingFileHandler(data / "Uncurser.log", maxBytes=1024 * 1024, backupCount=1, encoding="utf-8")
+        handler = logging.handlers.RotatingFileHandler(runtime / "Uncurser.log", maxBytes=1024 * 1024, backupCount=1, encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         logging.basicConfig(level=logging.WARNING, handlers=[handler])
     except OSError as error:
         import ctypes
-        ctypes.windll.user32.MessageBoxW(None, "Extract the entire app to a writable folder.\n\n" + str(error), "Uncurser", 16)
+        ctypes.windll.user32.MessageBoxW(None, "Move Uncurser.exe to a writable folder.\n\n" + str(error), "Uncurser", 16)
         return 1
     from PySide6.QtWidgets import QApplication, QMessageBox
     from app.appearance import configure
@@ -33,15 +40,21 @@ def main():
         logging.error("Unhandled error", exc_info=(kind, error, traceback))
         QMessageBox.critical(None, "Uncurser", str(error))
     sys.excepthook = unhandled
-    window = Window(data, start_polling="--self-check" not in sys.argv)
+    try:
+        window = Window(base, start_polling="--self-check" not in sys.argv)
+    except (OSError, ValueError) as error:
+        QMessageBox.critical(None, "Cannot open settings", str(error))
+        return 1
     if "--self-check" in sys.argv:
         from PySide6.QtCore import Qt
         window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
         window.show()
         app.processEvents()
-        window.grab().save(str(data / "self-check.png"))
+        output = Path(os.environ.get("UNCURSER_CHECK_DIR", runtime))
+        output.mkdir(parents=True, exist_ok=True)
+        window.grab().save(str(output / "self-check.png"))
         import json
-        (data / "self-check.json").write_text(json.dumps({"bundled": bool(getattr(sys, "frozen", False)), "ui": "ready"}), encoding="utf-8")
+        (output / "self-check.json").write_text(json.dumps({"bundled": bool(getattr(sys, "frozen", False)), "ui": "ready"}), encoding="utf-8")
         window.close()
         return 0
     window.show()

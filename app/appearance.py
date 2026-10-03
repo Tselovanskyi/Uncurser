@@ -32,7 +32,7 @@ class TitleBars(QObject):
 def configure(app):
     font = Path(__file__).resolve().parent / "assets" / "fonts" / "GoogleSans.ttf"
     if QFontDatabase.addApplicationFont(str(font)) < 0:
-        raise RuntimeError("The bundled Google Sans font could not be loaded. Extract the complete app folder.")
+        raise RuntimeError("The bundled Google Sans font could not be loaded. Download a fresh copy of Uncurser.exe.")
     ui_font = QFont("Google Sans", 10)
     ui_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.NoSubpixelAntialias)
     ui_font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)

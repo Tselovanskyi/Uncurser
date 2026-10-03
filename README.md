@@ -2,9 +2,9 @@
 
 Portable Windows app for **Creality K2 Plus, firmware 1.1.6.4**.
 
-**[Download the app](https://github.com/Tselovanskyi/Uncurser/releases/latest/download/Uncurser-portable-win64.zip)**
+**[Download Uncurser.exe](https://github.com/Tselovanskyi/Uncurser/releases/latest/download/Uncurser.exe)**
 
-Extract the entire ZIP and run `Uncurser.exe`. No installation needed.
+Run `Uncurser.exe` from a writable folder. No installation or separate runtime folder needed.
 
 Available mods:
 
@@ -14,4 +14,4 @@ Available mods:
 
 Find or add your printer, connect over SSH, select mods, and review changes before applying. Apply while the printer is idle, then power cycle it.
 
-Original backups stay on the printer. Turn a mod off to undo it, or use **Restore original**. Connection settings, including plaintext SSH passwords, stay in the app's local `data` folder.
+Original backups stay on the printer. Turn a mod off to undo it, or use **Restore original**. Saved printers, plaintext SSH passwords and trusted SSH keys stay in `Uncurser_settings` beside the EXE. Move both files together to keep your settings.

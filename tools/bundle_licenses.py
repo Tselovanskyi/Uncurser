@@ -1,11 +1,11 @@
-"""Include dependency license texts in the redistributable portable folder."""
+"""Collect dependency license texts for embedding in the portable executable."""
 import importlib.metadata
 import pathlib
 import shutil
 
 root = pathlib.Path(__file__).resolve().parents[1]
-destination = root / "dist" / "Uncurser" / "licenses"
-destination.mkdir(exist_ok=True)
+destination = root / "build" / "licenses"
+destination.mkdir(parents=True, exist_ok=True)
 for name in ("PySide6-Essentials", "shiboken6", "paramiko", "cryptography", "bcrypt", "PyNaCl", "cffi", "websocket-client", "pycparser"):
     distribution = importlib.metadata.distribution(name)
     target = destination / name

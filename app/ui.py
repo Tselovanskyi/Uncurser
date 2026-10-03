@@ -1,6 +1,5 @@
 import datetime
 import ipaddress
-import json
 import logging
 import re
 import threading
@@ -13,7 +12,7 @@ from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QDialogBu
                                QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox,
                                QPushButton, QPlainTextEdit, QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 
-from . import engine, mesh, mesh_temperature, mods, network
+from . import engine, mesh, mesh_temperature, mods, network, settings
 from .remote import Connection, NewHostKey, trust_key
 
 
@@ -480,19 +479,13 @@ class FileStatusList(QWidget):
 
 
 class Window(QMainWindow):
-    def __init__(self, data_dir: Path, start_polling=True):
+    def __init__(self, app_dir: Path, start_polling=True):
         super().__init__()
-        self.data_dir = data_dir
-        self.known_hosts = data_dir / "known_hosts"
-        self.settings_path = data_dir / "settings.json"
-        self.settings = {}
+        self.settings_path = app_dir / settings.FILENAME
+        settings.migrate(self.settings_path)
+        self.known_hosts = self.settings_path
+        self.settings = settings.load(self.settings_path)
         self.settings_dirty = False
-        try:
-            self.settings = json.loads(self.settings_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            pass
-        if not isinstance(self.settings, dict):
-            self.settings = {}
         self.printer_rows = []
         self.active_row = None
         self.connected = False
@@ -776,17 +769,14 @@ class Window(QMainWindow):
         return self.active_row.connection()
 
     def save_settings(self):
-        settings = {"printers": [row.values() for row in self.printer_rows if row.host.text().strip()]}
-        temporary = self.settings_path.with_suffix(".pending")
-        temporary.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-        temporary.replace(self.settings_path)
+        settings.update(self.settings_path, printers=[row.values() for row in self.printer_rows if row.host.text().strip()])
         self.settings_dirty = False
 
     def persist_settings(self):
         self.settings_dirty = True
         try:
             self.save_settings()
-        except OSError as error:
+        except (OSError, ValueError) as error:
             QMessageBox.warning(self, "Printer list not saved", str(error))
 
     def update_printer_list(self):
@@ -852,7 +842,7 @@ class Window(QMainWindow):
         self.printer_rows.remove(row)
         try:
             self.save_settings()
-        except OSError as error:
+        except (OSError, ValueError) as error:
             self.printer_rows.insert(index, row)
             QMessageBox.warning(self, "Cannot remove saved printer", str(error))
             return
@@ -1381,7 +1371,7 @@ class Window(QMainWindow):
             try:
                 if self.settings_dirty:
                     self.save_settings()
-            except OSError as error:
+            except (OSError, ValueError) as error:
                 QMessageBox.warning(self, "Printer list not saved", str(error))
                 event.ignore()
                 return

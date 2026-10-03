@@ -39,7 +39,7 @@ if sys.platform == "win32":
 temporary = tempfile.TemporaryDirectory(dir=data)
 settings_dir = pathlib.Path(temporary.name)
 assert settings_dir.resolve().is_relative_to(data.resolve())
-(settings_dir / "settings.json").write_text(json.dumps({"host": "192.168.50.130", "username": "root"}))
+(settings_dir / "Uncurser_settings").write_text(json.dumps({"host": "192.168.50.130", "username": "root"}))
 window = Window(settings_dir, start_polling=False)
 window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
 window.show()
@@ -171,11 +171,11 @@ app.processEvents()
 window.grab().save(str(data / "interface.png"))
 second.remove_button.click()
 assert window.printer_rows == [first] and window.connected and window.staged is False
-assert json.loads((settings_dir / "settings.json").read_text())["printers"] == [first.values()]
+assert json.loads((settings_dir / "Uncurser_settings").read_text())["printers"] == [first.values()]
 first.remove_button.click()
 assert not window.printer_rows and not window.connected and window.active_row is None
 assert window.staged is None and not window.mod_card.isEnabled() and not window.apply_button.isEnabled()
-assert json.loads((settings_dir / "settings.json").read_text())["printers"] == []
+assert json.loads((settings_dir / "Uncurser_settings").read_text())["printers"] == []
 
 # Draft rows stay unique, do not enter settings, and disappear when abandoned.
 window.add_manual_printer()
@@ -183,7 +183,7 @@ draft = window.printer_rows[0]
 window.add_manual_printer()
 assert window.printer_rows == [draft]
 window.save_settings()
-assert json.loads((settings_dir / "settings.json").read_text())["printers"] == []
+assert json.loads((settings_dir / "Uncurser_settings").read_text())["printers"] == []
 assert window.find_button.objectName() == "primary"
 window.find_button.setFocus()
 window.discard_empty_printers()
@@ -235,7 +235,7 @@ with (patch("app.ui.network.discover", side_effect=discover),
         window.receive_candidate((candidate.host.text(), "Different discovered name"))
         assert window.printer_rows == [candidate] and candidate.values() == saved_values
         assert window.connected and window.staged is True
-        assert json.loads((settings_dir / "settings.json").read_text())["printers"] == [saved_values]
+        assert json.loads((settings_dir / "Uncurser_settings").read_text())["printers"] == [saved_values]
         window.apply_button.setToolTip("Saved write status")
         app.processEvents()
         window.grab().save(str(data / "searching.png"))

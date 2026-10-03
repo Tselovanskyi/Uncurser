@@ -9,6 +9,8 @@ from pathlib import Path
 
 import paramiko
 
+from . import settings
+
 
 @dataclass
 class Connection:
@@ -31,11 +33,9 @@ class AskHostKey(paramiko.MissingHostKeyPolicy):
 
 
 def trust_key(path: Path, error: NewHostKey):
-    keys = paramiko.HostKeys()
-    if path.exists():
-        keys.load(str(path))
+    keys = settings.host_keys(settings.load(path))
     keys.add(error.hostname, error.key.get_name(), error.key)
-    keys.save(str(path))
+    settings.update(path, ssh_host_keys=settings.encode_keys(keys))
 
 
 READ = '''import os,sys,json,base64,hashlib,stat
@@ -219,8 +219,9 @@ class Remote:
     def __init__(self, connection: Connection, known_hosts: Path):
         self.connection = connection
         self.client = paramiko.SSHClient()
-        if known_hosts.exists():
-            self.client.load_host_keys(str(known_hosts))
+        for hostname, records in settings.host_keys(settings.load(known_hosts)).items():
+            for kind, key in records.items():
+                self.client.get_host_keys().add(hostname, kind, key)
         self.client.set_missing_host_key_policy(AskHostKey())
 
     def __enter__(self):
