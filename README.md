@@ -13,7 +13,7 @@ Currently supports Creality K2 Plus, firmware 1.1.6.4 and tested only with lates
 
 
 
-<img width="745" height="953" alt="image" src="https://github.com/user-attachments/assets/9d11b348-215f-45cc-85ef-02e1ca315db3" />
+<img width="771" height="1053" alt="image" src="https://github.com/user-attachments/assets/7dd03fb1-3d6d-4c01-b28b-33bbde8f0f4d" />
 
 1. Automatically find or add your printer manually.
 2. Connect to it.
