@@ -1,7 +1,7 @@
 # Uncurser
 ### Portable Windows app for ~~uncursing~~ improving your 3d printer firmware.
 
-**[Download Uncurser](https://github.com/Tselovanskyi/Uncurser/releases/latest)**
+**[Download latest release](https://github.com/Tselovanskyi/Uncurser/releases/latest)**
 (No installation needed)
 
 Currently supports Creality K2 Plus, firmware 1.1.6.4 and tested only with latest Orca.
