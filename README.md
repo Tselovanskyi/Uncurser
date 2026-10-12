@@ -30,6 +30,6 @@ Every mod, including the bed screw helper, stores its version and verified unins
 
 ## Roadmap
 
-- [x] **Bed screw adjustment helper** — guide manual adjustment of the bed leveling screws. After enabling it and power cycling, run `SCREWS_TILT_CALCULATE` in Fluidd.
-- [ ] **Safe print stop** — lower the bed before moving the printhead when stopping or cancelling a print.
-- [ ] **Fluidd camera fix** — restore the camera feed in Fluidd.
+- [x] **Bed screw adjustment helper** - Fluidd helper for manual adjustment of the bed leveling screws. Power cycle, home all then run `SCREWS_TILT_CALCULATE` in Tools dropdown in Fluidd.
+- [ ] **Safe print stop** - lower the bed before moving the printhead when stopping or cancelling a print.
+- [ ] **Fluidd camera fix** - restore the camera feed in Fluidd.
