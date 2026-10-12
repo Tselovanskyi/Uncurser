@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from app import engine, mesh, mesh_temperature as mod, mods
+from app import engine, mesh, mesh_temperature as mod, mod_versions, mods
 from app.remote import Connection
 import test_mesh
 import test_mods
@@ -69,7 +69,9 @@ class TemperatureTests(unittest.TestCase):
         generated = b'\n#*# <---------------------- SAVE_CONFIG ---------------------->\n#*# [bed_mesh default]\n#*# points = 0.2, 0.3\n'
         original = SOURCE + generated
         current = mod.transform(original, True).replace(b'0.2, 0.3', b'0.4, 0.5')
-        self.assertEqual(mod.restore(current, original), original.replace(b'0.2, 0.3', b'0.4, 0.5'))
+        snapshot = engine.MeshSnapshot(current, None, {}, original=original)
+        self.assertEqual(engine.prepare_mesh(snapshot, None, restore=True, module=mod),
+                         original.replace(b'0.2, 0.3', b'0.4, 0.5'))
 
     def test_included_override_is_blocked(self):
         with self.assertRaisesRegex(ValueError, 'also defined'):
@@ -91,12 +93,18 @@ class TemperatureTests(unittest.TestCase):
         saved.mesh.sha256 = mods.digest(saved.mesh.data)
         saved.mesh_temperature.data = mod.transform(SOURCE, True)
         saved.mesh_temperature.sha256 = mods.digest(saved.mesh_temperature.data)
+        ledger = engine.prepare_all(snapshot, None, mesh_desired=True,
+                                    temperature_desired=True)[mod_versions.TARGET]
+        saved.versions = engine.MeshSnapshot(ledger, mods.digest(ledger),
+            {'known': True, 'enabled': True, 'patchable': True},
+            original_hash=mods.digest(b''), original_absent=True)
         with patch.object(engine, 'scan', side_effect=[snapshot, saved]), \
                 patch.object(engine.network, 'status', return_value=status), patch.object(engine, 'Remote') as remote:
             engine.apply(Connection('192.0.2.1'), Path('unused'), snapshot, None,
                          mesh_desired=True, temperature_desired=True)
             request = remote.return_value.__enter__.return_value.python.call_args.args[1]
-        self.assertEqual({item['path'] for item in request['files']}, {mesh.TARGET, mod.TARGET})
+        self.assertEqual({item['path'] for item in request['files']}, {mesh.TARGET, mod.TARGET, mod_versions.TARGET})
+        self.assertEqual(request['files'][-1]['path'], mod_versions.TARGET)
         self.assertEqual(request['guards'], {})
         self.assertTrue(all(item['may_capture_original'] for item in request['files']))
 

@@ -114,7 +114,7 @@ with patch.object(window, "show_diff") as shown:
     window.mesh_details.click()
     initial_preview = shown.call_args.args
     assert initial_preview[1] == "Baseline: on-printer original backup."
-    assert "-speed: 125" in initial_preview[2] and "+speed: 700" in initial_preview[2]
+    assert "-speed: 125" in initial_preview[2] and "+speed: 600" in initial_preview[2]
     window.mesh_toggle.click()
     window.mesh_details.click()
     assert shown.call_args.args == initial_preview
@@ -266,6 +266,18 @@ assert window.staged is True and window.apply_button.toolTip() == "Saved write s
 # belongs to the scan button; write details use Apply's tooltip, without a label row.
 immediate_task = window.run_task
 window.run_task = Window.run_task.__get__(window, Window)
+stopped_dialogs = []
+def dismiss_error_dialog(dialog):
+    assert dialog.windowTitle() == "Operation stopped"
+    assert dialog.text() in ("Example scan failure", "Example apply failure")
+    assert dialog.textFormat() == Qt.TextFormat.PlainText
+    assert "RuntimeError" in dialog.detailedText()
+    if dialog.text() == "Example apply failure":
+        assert "Scan the printer" in dialog.informativeText()
+    stopped_dialogs.append(dialog.text())
+    dialog.accept()
+    return QMessageBox.StandardButton.Ok
+
 with patch.object(window.pool, "start") as start, patch("app.ui.threading.Thread") as scan_thread:
     window.scan_clicked()
     scan_task = scan_thread.call_args.kwargs["target"].__self__
@@ -280,8 +292,9 @@ with patch.object(window.pool, "start") as start, patch("app.ui.threading.Thread
     assert not window.scanning and not window.scan_button.running
     assert window.staged is True and window.apply_button.toolTip() == "Saved write status"
     window.scan_clicked()
-    with patch.object(QMessageBox, "warning"):
+    with patch.object(QMessageBox, "exec", new=dismiss_error_dialog):
         scan_thread.call_args.kwargs["target"].__self__.signals.error.emit(RuntimeError("Example scan failure"))
+    assert stopped_dialogs[-1] == "Example scan failure"
     assert window.scan_button.text() == "Scan failed" and window.apply_button.toolTip() == "Saved write status"
     window.run_task(lambda progress: None, lambda result: window.apply_button.setToolTip("Saved and verified."))
     write_task = start.call_args.args[0]
@@ -295,8 +308,9 @@ with patch.object(window.pool, "start") as start, patch("app.ui.threading.Thread
     assert not window.apply_button.running and window.apply_button.text() == "Apply"
     assert window.apply_button.toolTip() == "Saved and verified."
     window.run_task(lambda progress: None, lambda result: None)
-    with patch.object(QMessageBox, "warning"):
+    with patch.object(QMessageBox, "exec", new=dismiss_error_dialog):
         start.call_args.args[0].signals.error.emit(RuntimeError("Example apply failure"))
+    assert stopped_dialogs == ["Example scan failure", "Example apply failure"]
     assert not window.apply_button.running and not window.apply_button.timer.isActive()
     assert window.apply_button.text() == "Apply" and window.apply_button.toolTip() == "Example apply failure"
 window.run_task = immediate_task

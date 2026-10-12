@@ -46,17 +46,31 @@ def run(runtime):
         QMessageBox.critical(None, "Cannot open settings", str(error))
         return 1
     if "--self-check" in sys.argv:
-        from PySide6.QtCore import Qt
+        from app import mesh, mesh_temperature, mod_versions, mods, screws, smoothing
+        mod_versions.require_registered({path: None for path in
+            (mods.TARGET, mesh.TARGET, mesh_temperature.TARGET, screws.PYTHON, smoothing.TARGET)})
+        for helper in screws.FILES:
+            screws.payload(helper.TARGET)
+        from PySide6.QtCore import QTimer, Qt
         window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
-        window.show()
-        app.processEvents()
-        output = Path(os.environ.get("UNCURSER_CHECK_DIR", runtime))
-        output.mkdir(parents=True, exist_ok=True)
-        window.grab().save(str(output / "self-check.png"))
-        import json
-        (output / "self-check.json").write_text(json.dumps({"bundled": bool(getattr(sys, "frozen", False)), "ui": "ready"}), encoding="utf-8")
-        window.close()
-        return 0
+        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        def check_window():
+            try:
+                output = Path(os.environ.get("UNCURSER_CHECK_DIR", runtime))
+                output.mkdir(parents=True, exist_ok=True)
+                if not window.grab().save(str(output / "self-check.png")):
+                    raise RuntimeError("The startup check could not capture the window.")
+                import json
+                (output / "self-check.json").write_text(json.dumps({"bundled": bool(getattr(sys, "frozen", False)), "ui": "ready"}), encoding="utf-8")
+            except Exception:
+                logging.exception("The startup check failed")
+                window.close()
+                app.exit(1)
+            else:
+                window.close()
+
+        QTimer.singleShot(0, check_window)
     window.show()
     return app.exec()
 

@@ -1,0 +1,54 @@
+[
+  [
+    "var e=this,t=e._self._c;return",
+    "var e=this,t=e._self._c,h=e.screwsTiltAdjust,a=h.screws,p=h.probed_temperature,r=h.running===!0,er=h.phase===\"error\"||h.error===!0,done=h.phase===\"complete\"&&!r&&!er,d=done&&a.length===4&&Number.isFinite(p)&&p>=0,v=d&&h.can_save_mesh===!0&&!e.printerBusy&&!e.hasWaits&&e.klippyReady&&e.socketConnected,tp=Number.isFinite(h.total_points)&&h.total_points>0?Math.floor(h.total_points):0,cp=Number.isFinite(h.completed_points)&&h.completed_points>=0?Math.min(tp,Math.floor(h.completed_points)):0,tm=s=>Number.isFinite(s)&&s>=0?Math.floor(s/60)+\"m \"+String(Math.floor(s%60)).padStart(2,\"0\")+\"s\":\"Not available yet\",xs=[...new Set(a.map(s=>s.x))].sort((a,b)=>a-b),ys=[...new Set(a.map(s=>s.y))].sort((a,b)=>b-a),g=a.length===4&&xs.length===2&&ys.length===2&&a.every(s=>Number.isFinite(s.x)&&Number.isFinite(s.y))&&new Set(a.map(s=>s.x+\",\"+s.y)).size===4,c=g?{height:\"auto\",border:\"0\",padding:\"6px 8px\",overflowWrap:\"anywhere\",minWidth:\"0\"}:{};return"
+  ],
+  [
+    "t(\"thead\",[",
+    "t(\"thead\",{style:g?{display:\"none\"}:{}},["
+  ],
+  [
+    "t(\"tbody\",e._l",
+    "t(\"tbody\",{style:g?{display:\"grid\",gridTemplateColumns:\"repeat(2,minmax(0,1fr))\",gap:\"12px\",padding:\"12px\",boxSizing:\"border-box\",width:\"100%\"}:{}},e._l"
+  ],
+  [
+    "t(\"tr\",{key:s.name},",
+    "t(\"tr\",{key:s.key,style:g?{display:\"grid\",gridColumn:String(xs.indexOf(s.x)+1),gridRow:String(ys.indexOf(s.y)+1),minWidth:\"0\",padding:\"8px\",border:\"1px solid currentColor\"}:{}},"
+  ],
+  [
+    "t(\"td\",[",
+    "t(\"td\",{style:c},["
+  ],
+  [
+    ",t(\"br\"),t(\"small\",{staticClass:\"secondary--text\"},[e._v(e._s(`X = ${s.x}, Y = ${s.y}`))])",
+    ""
+  ],
+  [
+    "{staticClass:\"focus--text text-right\"}",
+    "{staticClass:\"focus--text text-right\",style:c}"
+  ],
+  [
+    "t(\"td\",{staticClass:\"text-right\"}",
+    "t(\"td\",{staticClass:\"text-right\",style:c}"
+  ],
+  [
+    "e._s(s.adjust)",
+    "e._s(s.adjustMinutes*6)+\"°\""
+  ],
+  [
+    "return[t(wt),t(k,{attrs:{color:\"primary\",type:\"submit\"}},[e._v(\" \"+e._s(e.$t(\"app.general.btn.retry\"))+\" \")])]",
+    "return[t(\"div\",{style:{display:\"flex\",flexWrap:\"wrap\",gap:\"8px\",width:\"100%\",justifyContent:\"flex-end\"}},[done?t(k,{style:{whiteSpace:\"normal\",height:\"auto\",minHeight:\"36px\",maxWidth:\"100%\"},attrs:{color:\"primary\",type:\"button\",disabled:!v,loading:e.hasWait(e.$waits.onBedScrewsCalculate)},on:{click:function(){var s=e.screwsTiltAdjust;if(s.phase===\"complete\"&&s.running!==!0&&s.error!==!0&&s.can_save_mesh===!0&&s.screws.length===4&&Number.isFinite(s.probed_temperature)&&s.probed_temperature>=0&&!e.printerBusy&&!e.hasWaits&&e.klippyReady&&e.socketConnected)e.sendGcode(\"SCREWS_TILT_SAVE_MESH\",e.$waits.onBedScrewsCalculate)}}},[e._v(\"Save bed mesh\")]):e._e(),done?t(k,{style:{whiteSpace:\"normal\",height:\"auto\",minHeight:\"36px\",maxWidth:\"100%\"},attrs:{color:\"primary\",type:\"button\",disabled:!v,loading:e.hasWait(e.$waits.onBedScrewsCalculate)},on:{click:function(){var s=e.screwsTiltAdjust;if(s.phase===\"complete\"&&s.running!==!0&&s.error!==!0&&s.can_save_mesh===!0&&s.screws.length===4&&Number.isFinite(s.probed_temperature)&&s.probed_temperature>=0&&!e.printerBusy&&!e.hasWaits&&e.klippyReady&&e.socketConnected)e.sendGcode(\"SCREWS_TILT_SAVE_MESH DEFAULT=1\",e.$waits.onBedScrewsCalculate)}}},[e._v(\"Save as default bed mesh\")]):e._e(),t(wt),t(k,{attrs:{color:\"primary\",type:\"submit\",disabled:r||e.printerBusy||e.hasWaits||!e.klippyReady||!e.socketConnected,loading:r||e.hasWait(e.$waits.onBedScrewsCalculate)}},[e._v(\" \"+e._s(e.$t(\"app.general.btn.retry\"))+\" \")]),t(k,{attrs:{type:\"button\"},on:{click:function(){e.open=!1}}},[e._v(e._s(e.$t(\"app.general.btn.close\")))])],1)]"
+  ],
+  [
+    "[t(qt,[",
+    "[d?t(\"div\",{style:{padding:\"12px 12px 0\",textAlign:\"right\",fontSize:\"12px\",letterSpacing:\".5px\"}},[e._v(\"PROBED AT \"+e._s(Math.round(p*10)/10)+\"°C\")]):e._e(),r?t(\"div\",{style:{padding:\"20px\"}},[t(\"div\",{style:{fontSize:\"16px\",fontWeight:\"500\"}},[e._v(e._s({homing:\"Homing\",probing:\"Probing bed mesh\",calculating:\"Calculating screw adjustments\"}[h.phase]||\"Preparing bed mesh\"))]),t(_n,{staticClass:\"my-4\",attrs:{value:tp?Math.min(99,cp/tp*100):0,indeterminate:!tp||h.phase===\"homing\"}}),t(\"div\",[e._v(e._s(cp)+\" / \"+e._s(tp||\"?\")+\" points\")]),t(\"div\",{style:{marginTop:\"12px\"}},[e._v(\"Estimated remaining: \"+e._s(tm(h.eta)))])],1):er?t(\"div\",{style:{padding:\"20px\",overflowWrap:\"anywhere\"}},[t(\"div\",{staticClass:\"error--text\",style:{fontSize:\"16px\",fontWeight:\"500\"}},[e._v(\"Screw adjustment failed\")]),t(\"div\",{style:{marginTop:\"12px\"}},[e._v(e._s(h.error_message||\"The adjustment did not complete. Check the printer console before retrying.\"))])]):t(qt,["
+  ],
+  [
+    "\"max-width\":\"500\"",
+    "\"max-width\":\"500\",persistent:!0"
+  ],
+  [
+    "e._s(tm(h.eta))",
+    "e._s(h.eta==null&&cp>=2?\"Updating estimate…\":tm(h.eta))"
+  ]
+]

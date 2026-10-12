@@ -73,14 +73,6 @@ def transform(data, enabled, original=None):
     return result
 
 
-def restore(data, original):
-    regular, _ = mesh.split(original)
-    _, generated = mesh.split(data)
-    result = (regular + generated).encode("utf-8")
-    validate(result)
-    return result
-
-
 def validate_includes(includes):
     for path, data in includes.items():
         regular, generated = mesh.split(data)

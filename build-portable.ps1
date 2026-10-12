@@ -24,9 +24,12 @@ $buildVersionInfo = Join-Path $PSScriptRoot 'build\version-info.txt'
 $buildOriginalPath = $env:PATH
 $buildAssets = (Join-Path $PSScriptRoot 'app\assets') + ':app/assets'
 $buildLicenses = (Join-Path $PSScriptRoot 'build\licenses') + ':licenses'
+$buildBedScrews = (Join-Path $PSScriptRoot 'References\screws_tilt_adjust') + ':app/assets/bed_screws'
 try {
     $env:PATH = @((Split-Path -Parent $buildPython), (Join-Path $env:SystemRoot 'System32'), $env:SystemRoot) -join ';'
-    & $buildPython -m PyInstaller --noconfirm --clean --onefile --windowed --name $buildName --icon $buildIcon --version-file $buildVersionInfo --distpath build\single-exe-release --workpath build\single-exe --specpath build --add-data $buildAssets --add-data $buildLicenses --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick --exclude-module PySide6.QtWebEngineCore --exclude-module tkinter Uncurser.py
+    & $buildPython tools\check_fonts.py
+    if ($LASTEXITCODE -ne 0) { throw 'Font validation failed.' }
+    & $buildPython -m PyInstaller --noconfirm --clean --onefile --windowed --name $buildName --icon $buildIcon --version-file $buildVersionInfo --distpath build\single-exe-release --workpath build\single-exe --specpath build --add-data $buildAssets --add-data $buildLicenses --add-data $buildBedScrews --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick --exclude-module PySide6.QtWebEngineCore --exclude-module tkinter Uncurser.py
     if ($LASTEXITCODE -ne 0) { throw 'Portable build failed.' }
 } finally {
     $env:PATH = $buildOriginalPath
@@ -48,6 +51,7 @@ $previousCheckDir = $env:UNCURSER_CHECK_DIR
 try {
     $env:UNCURSER_CHECK_DIR = $buildCheckDir
     $buildProcess = Start-Process -FilePath $buildExe -ArgumentList '--self-check' -WindowStyle Hidden -PassThru
+    $buildProcessHandle = $buildProcess.Handle
 } finally {
     $env:UNCURSER_CHECK_DIR = $previousCheckDir
 }
@@ -56,7 +60,7 @@ if (-not $buildProcess.WaitForExit(45000)) {
     throw 'The packaged app did not complete its startup check. Installed app not updated.'
 }
 if ($buildProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $buildCheckJson)) {
-    throw 'The packaged app failed its startup check. Installed app not updated.'
+    throw "The packaged app failed its startup check (exit code $($buildProcess.ExitCode)). Installed app not updated."
 }
 $buildCheck = Get-Content -LiteralPath $buildCheckJson -Raw | ConvertFrom-Json
 if (-not $buildCheck.bundled -or $buildCheck.ui -ne 'ready') { throw 'Invalid packaged startup check.' }

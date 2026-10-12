@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from app import engine, mods, network
-from app.remote import APPLY, APPLY_BATCH, Connection
+from app.remote import APPLY_BATCH, Connection
 
 
 SUPPORTED = {"native": {"model": "F008", "modelVersion":
@@ -51,12 +51,12 @@ class CompatibilityTests(unittest.TestCase):
                         engine.prepare_all(scanned, desired, mesh_desired=desired,
                                            temperature_desired=desired, restore=restore, full_risk=True)
 
-    def test_firmware_change_at_apply_rescan_blocks_both_write_paths(self):
+    def test_firmware_change_at_apply_rescan_blocks_with_or_without_mesh_mod(self):
         scanned = snapshot(SUPPORTED)
         fresh = copy.deepcopy(scanned)
         fresh.status = UNSUPPORTED
         for mesh_desired in (None, True):
-            with self.subTest(batch=mesh_desired is not None), \
+            with self.subTest(mesh_mod=mesh_desired is not None), \
                     patch.object(engine, "scan", return_value=fresh), \
                     patch.object(engine, "Remote") as remote:
                 with self.assertRaises(ValueError):
@@ -68,7 +68,7 @@ class CompatibilityTests(unittest.TestCase):
         scanned = snapshot(SUPPORTED)
         new = b"value = 2\n"
         for mesh_desired in (None, True):
-            with self.subTest(batch=mesh_desired is not None), \
+            with self.subTest(mesh_mod=mesh_desired is not None), \
                     patch.object(engine, "scan", return_value=scanned), \
                     patch.object(engine, "prepare", return_value=new), \
                     patch.object(engine, "prepare_all", return_value={mods.TARGET: new}), \
@@ -80,7 +80,7 @@ class CompatibilityTests(unittest.TestCase):
                     engine.apply(Connection("192.0.2.1"), Path("unused"), scanned, True,
                                  full_risk=True, mesh_desired=mesh_desired)
                 calls = remote.return_value.__enter__.return_value.python.call_args_list
-                self.assertTrue(all(call.args[0] not in (APPLY, APPLY_BATCH) for call in calls))
+                self.assertTrue(all(call.args[0] != APPLY_BATCH for call in calls))
 
 
 if __name__ == "__main__":

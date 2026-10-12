@@ -52,7 +52,7 @@ class MeshTests(unittest.TestCase):
             source = SOURCE.replace(b'speed: 5\n', b'speed: ' + speed + b'\n').replace(b'speed: 100\n', b'speed: 1000\n')
             modified = mesh.transform(source, True)
             self.assertIn(b'lift_speed: 50\n', modified)
-            self.assertEqual(mesh.Document(modified).raw[('bed_mesh', 'speed')], '700')
+            self.assertEqual(mesh.Document(modified).raw[('bed_mesh', 'speed')], '600')
             self.assertIn(b'speed: ' + speed + b'\n', modified)
             self.assertEqual(mesh.transform(modified, False, source), source)
 
@@ -84,7 +84,8 @@ class MeshTests(unittest.TestCase):
         restored = mesh.transform(modified, False, SOURCE)
         self.assertIn(b'slow_speed: 12', restored)
         self.assertIn(b'0.3, 0.4', restored)
-        full = mesh.restore(modified, SOURCE)
+        snapshot = engine.MeshSnapshot(modified, None, {}, original=SOURCE)
+        full = engine.prepare_mesh(snapshot, None, restore=True)
         self.assertIn(b'slow_speed: 10', full)
         self.assertIn(b'0.3, 0.4', full)
         self.assertEqual(mesh.stable_digest(SOURCE), mesh.stable_digest(SOURCE.replace(b'0.1, 0.2', b'9, 9')))
@@ -106,6 +107,22 @@ class MeshTests(unittest.TestCase):
         self.assertEqual(mesh.transform(mesh.transform(crlf, True), False, crlf), crlf)
         with self.assertRaises(ValueError):
             mesh.transform(SOURCE, False)
+
+    def test_complete_legacy_700_preset_is_recognized_without_accepting_partial_values(self):
+        latest = mesh.transform(SOURCE, True)
+        with patch.object(mesh, 'REFERENCE_HASH', mesh.fingerprint(SOURCE)):
+            self.assertFalse(mesh.inspect(latest, SOURCE)['legacy'])
+            for speed in (b'700', b'700.0', b'7e2'):
+                with self.subTest(speed=speed):
+                    old = latest.replace(b'speed: 600', b'speed: ' + speed)
+                    analysis = mesh.inspect(old, SOURCE)
+                    self.assertTrue(analysis['enabled'])
+                    self.assertTrue(analysis['known'])
+                    self.assertTrue(analysis['legacy'])
+                    self.assertEqual(mesh.Document(mesh.transform(old, True)).raw[('bed_mesh', 'speed')], '600')
+                    partial = old.replace(b'probe_count: 9,9', b'probe_count: 9,7')
+                    self.assertIsNone(mesh.inspect(partial, SOURCE)['enabled'])
+                    self.assertFalse(mesh.inspect(partial, SOURCE)['legacy'])
 
 
 class BatchTests(unittest.TestCase):

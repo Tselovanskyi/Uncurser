@@ -10,6 +10,13 @@
 !/tests/
 !/tools/
 !/third_party/
+!/References/
+/References/*
+!/References/screws_tilt_adjust/
+/References/screws_tilt_adjust/*
+!/References/screws_tilt_adjust/README.txt
+!/References/screws_tilt_adjust/screws_tilt_adjust.cfg
+!/References/screws_tilt_adjust/screws_tilt_adjust.py
 
 __pycache__/
 *.py[cod]

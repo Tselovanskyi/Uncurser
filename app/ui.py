@@ -3,26 +3,27 @@ import ipaddress
 import logging
 import re
 import threading
+import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRectF, QRunnable, QSignalBlocker, QSize, Qt, QThreadPool, QTimer, QUrl, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QLinearGradient, QPainter, QPen, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QLinearGradient, QPainter, QPen, QTextCharFormat, QTextCursor
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QDialogButtonBox,
-                               QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox,
-                               QPushButton, QPlainTextEdit, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
+                               QFrame, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox,
+                               QPushButton, QPlainTextEdit, QScrollArea, QSizePolicy, QStackedWidget, QStyle, QStyleOptionButton, QVBoxLayout, QWidget)
 
-from . import __version__, engine, mesh, mesh_temperature, mods, network, settings
+from . import __version__, engine, mesh, mesh_temperature, mods, network, screws, settings, smoothing
 from .remote import Connection, NewHostKey, trust_key
 
 
 STYLE = """
-QWidget { background: #000000; color: #ededed; font-family: 'Google Sans'; font-size: 10pt; }
+QWidget { background: #000000; color: #ededed; font-family: 'Google Sans'; font-size: 10pt; font-weight: 500; }
 QMainWindow { background: #000000; }
 QFrame#card { background: #0a0a0a; border: none; border-radius: 6px; }
 QFrame#card QLabel { background: transparent; }
 QWidget#modContent, QWidget#modBody, QWidget#modItem { background: transparent; }
-QWidget#fileStatuses, QWidget#fileStatusRow, QWidget#scanContent { background: transparent; }
+QWidget#fileStatuses, QWidget#fileStatusViewport, QWidget#fileStatusRow, QWidget#scanContent { background: transparent; }
 QWidget#scrollFade { background: transparent; }
 QFrame#printers { background: transparent; border: none; }
 QFrame#scanPanel { background: #071625; border: none; border-radius: 6px; }
@@ -35,44 +36,57 @@ QLabel#cyan { color: #42d9e8; font-weight: 600; }
 QLabel:disabled, QLabel#cyan:disabled, QLabel#muted:disabled { color: #858585; }
 QWidget#printerRow { background: transparent; }
 QPushButton { background: #161616; border: none; border-radius: 3.5px; padding: 9px 15px; }
-QPushButton:hover { background: #222222; }
+QPushButton:enabled:hover { background: #2b2b2b; }
+QPushButton:enabled:pressed { background: #404040; }
 QPushButton:disabled { color: #555555; background: #101010; }
 QPushButton#primary { background: #42d9e8; color: #082027; font-weight: 600; }
-QPushButton#primary:hover { background: #79eaf4; }
+QPushButton#primary:enabled:hover { background: #79eaf4; }
+QPushButton#primary:enabled:pressed { background: #20a9b9; }
 QPushButton#primary:disabled { background: #101010; color: #666666; }
 QPushButton[working="true"] { padding-right: 39px; color: #ededed; }
 QPushButton#primary[working="true"] { background: #42d9e8; color: #082027; }
 QPushButton#connected { background: #161616; color: #999999; }
-QPushButton#connected:hover { background: #804000; color: #ffe3cc; }
+QPushButton#connected:enabled:hover { background: #804000; color: #ffe3cc; }
+QPushButton#connected:enabled:pressed { background: #a65100; color: #ffffff; }
 QPushButton#connected:disabled { background: #101010; color: #555555; }
 QPushButton#scan { background: #13283b; color: #ffffff; }
-QPushButton#scan:hover { background: #1c344a; }
+QPushButton#scan:enabled:hover { background: #254762; }
+QPushButton#scan:enabled:pressed { background: #102030; }
 QPushButton#scan:disabled { background: #102130; color: #7b8996; }
 QPushButton#scan[working="true"] { background: #13283b; color: #ffffff; }
 QPushButton#restore, QPushButton#restore:hover, QPushButton#restore:pressed, QPushButton#restore:disabled { background: transparent; }
 QPushButton#restore { color: #ff7373; }
-QPushButton#restore:hover { color: #ffa0a0; }
+QPushButton#restore:enabled:hover { color: #ffa0a0; }
+QPushButton#restore:enabled:pressed { color: #f04f4f; }
 QPushButton#restore:disabled { color: #754040; }
 QPushButton#textOnly, QPushButton#textOnly:hover, QPushButton#textOnly:pressed, QPushButton#textOnly:disabled { background: transparent; border: none; }
 QPushButton#textOnly { color: #cccccc; }
-QPushButton#textOnly:hover { color: #ffffff; }
+QPushButton#textOnly:enabled:hover { color: #ffffff; }
+QPushButton#textOnly:enabled:pressed { color: #42d9e8; }
 QPushButton#textOnly:disabled { color: #555555; }
 QPushButton#support { background: transparent; color: #cccccc; font-weight: 700; min-height: 38px; padding: 0 10px; }
-QPushButton#support:hover { background: transparent; color: #ffffff; }
-QPushButton#support:pressed { background: transparent; color: #79eaf4; }
+QPushButton#support:enabled:hover { background: transparent; color: #ffffff; }
+QPushButton#support:enabled:pressed { background: transparent; color: #42d9e8; }
+QPushButton#support:disabled { background: transparent; color: #555555; }
 QPushButton#modDetails, QPushButton#modDetails:hover, QPushButton#modDetails:pressed, QPushButton#modDetails:disabled { background: transparent; border: none; }
 QPushButton#modDetails { text-align: left; padding: 6px 0; color: #999999; }
-QPushButton#modDetails:hover { color: #ededed; }
+QPushButton#modDetails:enabled:hover { color: #ededed; }
+QPushButton#modDetails:enabled:pressed { color: #42d9e8; }
 QPushButton#modDetails:disabled { color: #555555; }
-QPushButton#disclosure { background: transparent; border: none; padding: 6px 23px 6px 0; color: #999999; }
-QPushButton#disclosure:hover { color: #ededed; }
+QPushButton#disclosure, QPushButton#disclosure:hover, QPushButton#disclosure:pressed { background: transparent; border: none; padding: 6px 23px 6px 0; color: #999999; }
+QPushButton#disclosure:enabled:hover { color: #ededed; }
+QPushButton#disclosure:enabled:pressed { color: #42d9e8; }
 QPushButton#disclosure:disabled { color: #555555; }
 QPushButton#risk { background: transparent; color: #aaaaaa; border: none; font-size: 9pt; padding: 5px; }
+QPushButton#risk:enabled:hover { background: transparent; color: #ffffff; }
+QPushButton#risk:enabled:pressed { background: transparent; color: #42d9e8; }
+QPushButton#risk:disabled { background: transparent; color: #555555; }
 QPushButton#add { padding: 0 12px 0 30px; }
 QPushButton#remove { padding: 0; }
 QPushButton#remove, QPushButton#remove:hover, QPushButton#remove:pressed, QPushButton#remove:disabled { background: transparent; border: none; }
 QPushButton#remove { color: #999999; }
-QPushButton#remove:hover, QPushButton#remove:focus { color: #ffffff; }
+QPushButton#remove:enabled:hover, QPushButton#remove:enabled:focus { color: #ffffff; }
+QPushButton#remove:enabled:pressed { color: #ff7373; }
 QPushButton#remove:disabled { color: #444444; }
 QLineEdit, QComboBox { background: #161616; border: none; border-radius: 3px; padding: 8px; }
 QLineEdit:focus, QComboBox:focus { background: #202020; }
@@ -84,6 +98,9 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 QScrollBar#cardsScrollBar:vertical { background: #000000; }
 QScrollBar#cardsScrollBar:vertical:disabled, QScrollBar#cardsScrollBar::handle:vertical:disabled { background: transparent; }
+QScrollArea#fileStatuses QWidget#qt_scrollarea_vcontainer { background: transparent; }
+QScrollBar#fileStatusScrollBar:vertical { background: rgba(28, 56, 79, 40); }
+QScrollBar#fileStatusScrollBar::handle:vertical { background: #1c3a52; }
 QToolTip { background: #000000; color: #ededed; border: 1px solid #666666; }
 """
 
@@ -175,7 +192,12 @@ class SymbolButton(QPushButton):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = "#ededed" if self.symbol == "+" else "#ffffff" if self.underMouse() or self.hasFocus() else "#999999"
+        if self.isDown():
+            color = "#42d9e8" if self.symbol == "+" else "#ff7373"
+        elif self.underMouse() or self.hasFocus():
+            color = "#ffffff"
+        else:
+            color = "#ededed" if self.symbol == "+" else "#999999"
         painter.setPen(QPen(QColor(color if self.isEnabled() else "#444444"), 1.5,
                             Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         x, y = (15 if self.text() else self.width() / 2), self.height() / 2
@@ -332,12 +354,53 @@ class DetailsButton(QPushButton):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = "#555555" if not self.isEnabled() else "#ededed" if self.underMouse() else "#999999"
+        color = "#555555" if not self.isEnabled() else "#42d9e8" if self.isDown() else "#ededed" if self.underMouse() else "#999999"
         painter.setPen(QPen(QColor(color), 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         x, y = self.width() - 11, self.height() / 2
         direction = -1 if self.isChecked() else 1
         painter.drawLine(QPointF(x - 4, y - 2 * direction), QPointF(x, y + 2 * direction))
         painter.drawLine(QPointF(x, y + 2 * direction), QPointF(x + 4, y - 2 * direction))
+        painter.end()
+
+
+class ModFilesButton(QPushButton):
+    def __init__(self, text, slot):
+        super().__init__(text)
+        self.outdated = False
+        self.clicked.connect(slot)
+
+    def set_outdated(self, value):
+        if self.outdated != value:
+            self.outdated = value
+            self.updateGeometry()
+            self.update()
+        self.setAccessibleName(self.text() + (" · Outdated" if value else ""))
+
+    def badge_font(self):
+        font = QFont(self.font())
+        font.setBold(True)
+        return font
+
+    def sizeHint(self):
+        size = super().sizeHint()
+        if self.outdated:
+            size.setWidth(size.width() + QFontMetrics(self.badge_font()).horizontalAdvance(" · Outdated"))
+        return size
+
+    def paintEvent(self, event):
+        if not self.outdated:
+            super().paintEvent(event)
+            return
+        width = QFontMetrics(self.badge_font()).horizontalAdvance(" · Outdated")
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        option.rect.setWidth(self.width() - width)
+        painter = QPainter(self)
+        self.style().drawControl(QStyle.ControlElement.CE_PushButton, option, painter, self)
+        painter.setFont(self.badge_font())
+        painter.setPen(QColor("#ff0000" if self.isEnabled() else "#555555"))
+        painter.drawText(QRectF(self.width() - width, 0, width, self.height()),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, " · Outdated")
         painter.end()
 
 
@@ -347,6 +410,7 @@ class ModItem(QWidget):
         self.setObjectName("modItem")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.disclosure = disclosure
+        disclosure.installEventFilter(self)
         self._press = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -370,6 +434,9 @@ class ModItem(QWidget):
                 widget.installEventFilter(self)
 
     def eventFilter(self, widget, event):
+        if widget is self.disclosure and event.type() == QEvent.Type.EnabledChange:
+            self.setCursor(Qt.CursorShape.PointingHandCursor if self.disclosure.isEnabled() else Qt.CursorShape.ArrowCursor)
+            return False
         if event.type() not in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick,
                                 QEvent.Type.MouseButtonRelease):
             return False
@@ -402,6 +469,14 @@ class Switch(QAbstractButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAccessibleName("Heat before homing and calibration")
         self.applied = False
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.pressed.connect(self.update)
+        self.released.connect(self.update)
+
+    def event(self, event):
+        if event.type() in (QEvent.Type.Enter, QEvent.Type.Leave, QEvent.Type.EnabledChange):
+            self.update()
+        return super().event(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -409,7 +484,10 @@ class Switch(QAbstractButton):
         color = "#42d9e8" if self.applied and self.isEnabled() else "#666666"
         painter.setOpacity(1 if self.isEnabled() else 0.45)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(color if self.isChecked() else "#2a2a2a"))
+        fill = QColor(color if self.isChecked() else "#2a2a2a")
+        if self.isEnabled():
+            fill = fill.darker(130) if self.isDown() else fill.lighter(135) if self.underMouse() else fill
+        painter.setBrush(fill)
         painter.drawRoundedRect(1, 3, 50, 24, 12, 12)
         painter.setBrush(QColor("#001315" if self.isChecked() and self.applied and self.isEnabled() else "#e5e5e5"))
         painter.drawEllipse(29 if self.isChecked() else 5, 7, 16, 16)
@@ -423,14 +501,30 @@ class Signals(QObject):
     found = Signal(object)
 
 
+def operation_error_message(error):
+    message = str(error).strip()
+    if message:
+        return message
+    if isinstance(error, TimeoutError):
+        message = "The printer did not reply in time."
+    elif isinstance(error, EOFError):
+        message = "The connection to the printer closed unexpectedly."
+    else:
+        message = "The operation failed without an error message."
+    return message + " (" + type(error).__name__ + ")"
+
+
 class Task(QRunnable):
     def __init__(self, function):
         super().__init__()
         self.function, self.signals = function, Signals()
         self.cancelled = threading.Event()
+        self.last_progress = ""
+        self.error_details = ""
 
     def progress(self, message):
         if not self.cancelled.is_set():
+            self.last_progress = message
             self.signals.progress.emit(message)
 
     def run(self):
@@ -438,6 +532,7 @@ class Task(QRunnable):
             result = self.function(self.progress)
         except Exception as error:
             if not self.cancelled.is_set():
+                self.error_details = traceback.format_exc()
                 logging.exception("Operation failed")
                 self.signals.error.emit(error)
         else:
@@ -553,20 +648,37 @@ def file_summary(modified=0, added=0):
     return " · ".join(parts)
 
 
-class FileStatusList(QWidget):
-    def __init__(self):
+class FileStatusList(QScrollArea):
+    def __init__(self, parent=None):
         super().__init__()
         self.setObjectName("fileStatuses")
-        self.rows = QVBoxLayout(self)
+        self.viewport().setObjectName("fileStatusViewport")
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.verticalScrollBar().setObjectName("fileStatusScrollBar")
+        self.setWidgetResizable(False)
+        self.content = QWidget()
+        self.content.setObjectName("fileStatuses")
+        self.rows = QGridLayout(self.content)
         self.rows.setContentsMargins(0, 0, 0, 0)
-        self.rows.setSpacing(0)
+        self.rows.setVerticalSpacing(0)
+        self.rows.setHorizontalSpacing(40)
         self.rows.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+        self.file_rows = []
+        self.list_size = QSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.setWidget(self.content)
+        if parent is not None:
+            self.setParent(parent)
+            parent.installEventFilter(self)
+        self.set_files(())
 
     def set_files(self, entries):
         while self.rows.count():
             old = self.rows.takeAt(0).widget()
             old.hide()
             old.deleteLater()
+        self.file_rows = []
         for filename, status in entries:
             row = QWidget()
             row.setObjectName("fileStatusRow")
@@ -576,7 +688,53 @@ class FileStatusList(QWidget):
             layout.addWidget(label(filename, "muted"))
             layout.addStretch()
             layout.addWidget(label(status, "muted"))
-            self.rows.addWidget(row)
+            self.file_rows.append(row)
+        self.arrange_rows()
+
+    def sizeHint(self):
+        return self.list_size
+
+    def eventFilter(self, widget, event):
+        if widget is self.parentWidget() and (event.type() == QEvent.Type.Show or
+                event.type() == QEvent.Type.Resize and event.size().width() != event.oldSize().width()):
+            self.arrange_rows()
+        return super().eventFilter(widget, event)
+
+    def arrange_rows(self):
+        while self.rows.count():
+            self.rows.takeAt(0)
+        columns = 1
+        count = len(self.file_rows)
+        if count > 1 and self.parentWidget() is not None:
+            parent = self.parentWidget()
+            available = parent.contentsRect().width()
+            if parent.layout() is not None:
+                margins = parent.layout().contentsMargins()
+                available -= margins.left() + margins.right()
+            split = (count + 1) // 2
+            widths = [max(row.sizeHint().width() for row in group)
+                      for group in (self.file_rows[:split], self.file_rows[split:])]
+            gutter = self.verticalScrollBar().sizeHint().width() + 8 if split > 5 else 0
+            if sum(widths) + self.rows.horizontalSpacing() + gutter + 2 * self.frameWidth() <= available:
+                columns = 2
+        row_count = (count + columns - 1) // columns
+        heights = [0] * row_count
+        for index, row in enumerate(self.file_rows):
+            position = index % row_count
+            self.rows.addWidget(row, position, index // row_count)
+            row.show()
+            heights[position] = max(heights[position], row.sizeHint().height())
+        self.rows.activate()
+        size = self.content.sizeHint()
+        visible_height = sum(heights[:5])
+        scrollbar_width = self.verticalScrollBar().sizeHint().width() if size.height() > visible_height else 0
+        gap = 8 if scrollbar_width else 0
+        self.setViewportMargins(0, 0, gap, 0)
+        self.list_size = QSize(size.width() + gap + scrollbar_width + 2 * self.frameWidth(),
+                               visible_height + 2 * self.frameWidth())
+        self.setMaximumWidth(self.list_size.width())
+        self.setFixedHeight(self.list_size.height())
+        self.updateGeometry()
 
 
 class Window(QMainWindow):
@@ -600,9 +758,12 @@ class Window(QMainWindow):
         self.staged = None
         self.mesh_staged = None
         self.temperature_staged = None
+        self.screws_staged = None
+        self.smoothing_staged = None
         self.restore_pending = False
+        self.update_enabled = True
+        self.automatic_update_error = ""
         self.policy = "known"
-        self.access = False
         self.busy = False
         self.scanning = False
         self.active_task = None
@@ -636,7 +797,7 @@ class Window(QMainWindow):
         header.setSpacing(16)
         outer.addLayout(header)
         top = QHBoxLayout()
-        top.addWidget(label('UNCURSER <span style="font-size: 14pt; font-weight: 400; color: #999999;">for K2 Plus</span>', "title"))
+        top.addWidget(label('UNCURSER <span style="font-size: 14pt; font-weight: 500; color: #999999;">for K2 Plus</span>', "title"))
         top.addStretch()
         top.addWidget(label(f"v{__version__}", "muted"), alignment=Qt.AlignmentFlag.AlignVCenter)
         header.addLayout(top)
@@ -698,7 +859,7 @@ class Window(QMainWindow):
         self.compatibility_status = label("", "muted", True)
         self.compatibility_status.hide()
         layout.addWidget(self.compatibility_status)
-        self.files_status = FileStatusList()
+        self.files_status = FileStatusList(self.scan_content)
         layout.addWidget(self.files_status, alignment=Qt.AlignmentFlag.AlignLeft)
         self.files_errors = label("", "muted", True)
         self.files_errors.hide()
@@ -739,7 +900,7 @@ class Window(QMainWindow):
                                "<br>This will heat everything up even before the initial homing begins.</li>"
                                "<li>Doesn't affect manually triggered homing.</li></ul>", wrap=True))
         added_lines = sum(insertion.marked.count("\n") for insertion in mods.INSERTIONS)
-        self.heat_details = button(file_summary(modified=1) + f" · {added_lines} added lines",
+        self.heat_details = ModFilesButton(file_summary(modified=1) + f" · {added_lines} added lines",
                                    lambda: self.show_mod_code(mods.TARGET))
         self.heat_details.setObjectName("modDetails")
         self.heat_details.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -768,10 +929,10 @@ class Window(QMainWindow):
         pending_size = self.mesh_pending.sizePolicy()
         pending_size.setRetainSizeWhenHidden(True)
         self.mesh_pending.setSizePolicy(pending_size)
-        mesh_layout.addWidget(label("<ul><li>Set mesh travel to 700 mm/s and a 9×9 probe grid.</li>"
+        mesh_layout.addWidget(label("<ul><li>Set mesh travel to 600 mm/s and a 9×9 probe grid.</li>"
                                     "<li>Set Z movement limit, probe lift, and fast Z alignment to 50 mm/s, with a 0.9 fast-travel ratio.</li>"
                                     "<li>Applies to automatic and manually triggered mesh and Z operations.</li></ul>", wrap=True))
-        self.mesh_details = button(file_summary(modified=1) + f" · {len(mesh.VALUES)} settings",
+        self.mesh_details = ModFilesButton(file_summary(modified=1) + f" · {len(mesh.VALUES)} settings",
                                    lambda: self.show_mod_code(mesh.TARGET))
         self.mesh_details.setObjectName("modDetails")
         self.mesh_details.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -803,7 +964,7 @@ class Window(QMainWindow):
         temperature_layout.addWidget(label("<ul><li>Use the requested bed temperature for pre-print bed mesh, including below 50°C."
                                            "<br>A 42°C print will mesh at 42°C instead of heating to 50°C first.</li>"
                                            "<li>Manual G29 calibration and the fallback when no temperature is supplied stay unchanged.</li></ul>", wrap=True))
-        self.temperature_details = button(file_summary(modified=1) + " · 1 changed line",
+        self.temperature_details = ModFilesButton(file_summary(modified=1) + " · 1 changed line",
                                           lambda: self.show_mod_code(mesh_temperature.TARGET))
         self.temperature_details.setObjectName("modDetails")
         self.temperature_details.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -811,7 +972,88 @@ class Window(QMainWindow):
         self.temperature_item = ModItem(self.temperature_card, self.temperature_pending, self.temperature_toggle,
                                         self.temperature_details, self.temperature_expand)
         mod_list.addWidget(self.temperature_item)
-        self.details_buttons = (self.heat_expand, self.mesh_expand, self.temperature_expand)
+        self.smoothing_card = QWidget()
+        self.smoothing_card.setObjectName("modContent")
+        layout = QHBoxLayout(self.smoothing_card)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(label("Speed up homing", "section"))
+        self.smoothing_opacity = QGraphicsOpacityEffect(self.smoothing_card)
+        self.smoothing_card.setGraphicsEffect(self.smoothing_opacity)
+        self.smoothing_body = QWidget()
+        self.smoothing_body.setObjectName("modBody")
+        smoothing_layout = QVBoxLayout(self.smoothing_body)
+        smoothing_layout.setContentsMargins(0, 0, 0, 0)
+        smoothing_layout.setSpacing(12)
+        self.smoothing_expand = DetailsButton(self.smoothing_body)
+        self.smoothing_toggle = Switch()
+        self.smoothing_toggle.setAccessibleName("Speed up homing")
+        self.smoothing_toggle.toggled.connect(self.stage_smoothing_toggle)
+        self.smoothing_pending = label("Pending", "muted")
+        self.smoothing_pending.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pending_size = self.smoothing_pending.sizePolicy()
+        pending_size.setRetainSizeWhenHidden(True)
+        self.smoothing_pending.setSizePolicy(pending_size)
+        smoothing_layout.addWidget(label(
+            "Uses 5,000 mm/s² acceleration and motion smoothing for the first X/Y homing pass "
+            "and the move to the bed centre.\n\n"
+            "The second X/Y pass and the remaining homing moves keep their original settings. "
+            "Requested movement speeds stay unchanged.",
+            wrap=True))
+        self.smoothing_details = ModFilesButton(file_summary(modified=2), lambda: self.show_mod_code(smoothing.TARGET))
+        self.smoothing_details.setObjectName("modDetails")
+        self.smoothing_details.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.smoothing_details.setToolTip("View the code for the initial application of this mod")
+        self.smoothing_item = ModItem(self.smoothing_card, self.smoothing_pending, self.smoothing_toggle,
+                                      self.smoothing_details, self.smoothing_expand)
+        mod_list.addWidget(self.smoothing_item)
+        self.mod_version_rows = {
+            mods.TARGET: (self.heat_details, self.heat_details.text()),
+            mesh.TARGET: (self.mesh_details, self.mesh_details.text()),
+            mesh_temperature.TARGET: (self.temperature_details, self.temperature_details.text()),
+            smoothing.TARGET: (self.smoothing_details, self.smoothing_details.text()),
+        }
+        maintenance_section, maintenance_layout = card()
+        maintenance_layout.addWidget(label("HELPERS", "groupHeading"))
+        self.screws_card = QWidget()
+        self.screws_card.setObjectName("modContent")
+        layout = QHBoxLayout(self.screws_card)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(label("Bed screw adjustment helper", "section"))
+        self.screws_opacity = QGraphicsOpacityEffect(self.screws_card)
+        self.screws_card.setGraphicsEffect(self.screws_opacity)
+        self.screws_body = QWidget()
+        self.screws_body.setObjectName("modBody")
+        screws_layout = QVBoxLayout(self.screws_body)
+        screws_layout.setContentsMargins(0, 0, 0, 0)
+        screws_layout.setSpacing(12)
+        screws_layout.addWidget(label(
+            "<ol><li>After applying and power cycling, clear the bed, clean the nozzle, set the target bed temperature and home all axes.</li>"
+            "<li>Once the bed reaches the target temperature run <code>SCREWS_TILT_CALCULATE</code> macro in Fluidd "
+            "(find it either in TOOLS dropdown on the Tool panel or in the Macros list). "
+            "It probes a full bed mesh and calculates screw adjustments from its overall tilt. "
+            "The popup shows the actual bed temperature when probing starts, for example <b>PROBED AT 70°C</b>.</li>"
+            "<li>Leave the base screw unchanged, turn the others as shown, then run it again to check. "
+            "Use consistent temperatures between attempts.</li>"
+            "<li>After the final check, use <b>Save bed mesh</b> to save a temperature-named profile, "
+            "or <b>Save as default bed mesh</b> to replace the default profile.</li></ol>", wrap=True))
+        self.screws_expand = DetailsButton(self.screws_body)
+        self.screws_toggle = Switch()
+        self.screws_toggle.setAccessibleName("Bed screw adjustment helper")
+        self.screws_toggle.toggled.connect(self.stage_screws_toggle)
+        self.screws_pending = label("Pending", "muted")
+        self.screws_pending.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pending_size = self.screws_pending.sizePolicy()
+        pending_size.setRetainSizeWhenHidden(True)
+        self.screws_pending.setSizePolicy(pending_size)
+        self.screws_details = ModFilesButton(file_summary(modified=2, added=2), lambda: self.show_mod_code(screws.MOD_ID))
+        self.screws_details.setObjectName("modDetails")
+        self.screws_details.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.screws_details.setToolTip("View the code for the initial application of this mod")
+        self.mod_version_rows[screws.PYTHON] = (self.screws_details, self.screws_details.text())
+        self.screws_item = ModItem(self.screws_card, self.screws_pending, self.screws_toggle,
+                                  self.screws_details, self.screws_expand)
+        maintenance_layout.addWidget(self.screws_item)
+        self.details_buttons = (self.heat_expand, self.mesh_expand, self.temperature_expand, self.smoothing_expand, self.screws_expand)
         for disclosure in self.details_buttons:
             disclosure.toggled.connect(lambda expanded, active=disclosure: self.close_other_details(active, expanded))
         mods_and_footer = QVBoxLayout()
@@ -824,6 +1066,7 @@ class Window(QMainWindow):
         cards_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         cards_layout.addWidget(self.scan_card)
         cards_layout.addWidget(mod_section)
+        cards_layout.addWidget(maintenance_section)
         self.cards_scroll = SmoothScrollArea()
         self.cards_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.cards_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -839,6 +1082,19 @@ class Window(QMainWindow):
         footer_group.setContentsMargins(0, 0, 20, 0)
         footer_group.setSpacing(8)
         review_row = QHBoxLayout()
+        self.update_control = QWidget()
+        self.update_control.setObjectName("modContent")
+        update_row = QHBoxLayout(self.update_control)
+        update_row.setContentsMargins(0, 0, 0, 0)
+        update_row.setSpacing(12)
+        self.update_label = label("")
+        self.update_label.setTextFormat(Qt.TextFormat.PlainText)
+        update_row.addWidget(self.update_label)
+        self.update_toggle = Switch()
+        self.update_toggle.setAccessibleName("Update outdated mods")
+        self.update_toggle.toggled.connect(self.stage_update)
+        update_row.addWidget(self.update_toggle)
+        review_row.addWidget(self.update_control)
         review_row.addStretch()
         self.preview_button = button("Review changes", self.preview)
         self.preview_button.setObjectName("textOnly")
@@ -974,8 +1230,10 @@ class Window(QMainWindow):
             self.staged = None
             self.mesh_staged = None
             self.temperature_staged = None
+            self.screws_staged = None
+            self.smoothing_staged = None
             self.restore_pending = False
-            self.access = False
+            self.update_enabled = True
             self.policy = "known"
             self.scan_progress("")
             self.files_status.set_files(())
@@ -1003,8 +1261,10 @@ class Window(QMainWindow):
                 self.staged = None
                 self.mesh_staged = None
                 self.temperature_staged = None
+                self.screws_staged = None
+                self.smoothing_staged = None
                 self.restore_pending = False
-                self.access = False
+                self.update_enabled = True
                 self.scan_progress("Printer changed.")
             row.identity = identity
         if row is self.active_row and self.connected and self.snapshot:
@@ -1062,14 +1322,13 @@ class Window(QMainWindow):
             return
         if row is not self.active_row:
             if self.active_row is not None:
-                self.pending_by_row[self.active_row] = (self.staged, self.mesh_staged, self.temperature_staged, self.restore_pending)
-            self.staged, self.mesh_staged, self.temperature_staged, self.restore_pending = self.pending_by_row.get(row, (None, None, None, False))
+                self.pending_by_row[self.active_row] = (self.staged, self.mesh_staged, self.temperature_staged, self.screws_staged, self.smoothing_staged, self.restore_pending, self.update_enabled)
+            self.staged, self.mesh_staged, self.temperature_staged, self.screws_staged, self.smoothing_staged, self.restore_pending, self.update_enabled = self.pending_by_row.get(row, (None, None, None, None, None, False, True))
             self.active_row = row
             self.policy = "known"
         self.connected = False
         self.snapshot = None
         self.snapshot_connection = None
-        self.access = False
         self.files_status.set_files(())
         self.files_errors.hide()
         self.review_button.hide()
@@ -1131,10 +1390,19 @@ class Window(QMainWindow):
                 return
             if scan:
                 self.scan_button.setText("Scan failed")
-                self.scan_progress(str(error))
+                self.scan_progress(operation_error_message(error))
             else:
-                self.apply_button.setToolTip(str(error))
-            QMessageBox.warning(self, "Operation stopped", str(error))
+                self.apply_button.setToolTip(operation_error_message(error))
+            dialog = QMessageBox(QMessageBox.Icon.Warning, "Operation stopped",
+                                operation_error_message(error), QMessageBox.StandardButton.Ok, self)
+            dialog.setOption(QMessageBox.Option.DontUseNativeDialog, True)
+            dialog.setTextFormat(Qt.TextFormat.PlainText)
+            context = "Last step: " + task.last_progress if task.last_progress else ""
+            if not scan:
+                context += ("\n\n" if context else "") + "Scan the printer to check its current state before applying again."
+            dialog.setInformativeText(context)
+            dialog.setDetailedText(task.error_details or type(error).__name__ + ": " + repr(error))
+            dialog.exec()
         task.signals.done.connect(finish)
         task.signals.error.connect(fail)
         if scan:
@@ -1162,7 +1430,6 @@ class Window(QMainWindow):
         self.snapshot = result
         self.snapshot_connection = (connection.host, connection.username)
         supported = not network.compatibility_error(result.status)
-        self.access = supported and (self.policy == "all" or (self.policy == "known" and result.analysis["known"]))
         state = result.status
         reported_name = (state["info"].get("hostname") if state else None) or result.identity.get("hostname", "")
         if self.active_row is not None and not self.active_row.name.text().strip() and reported_name:
@@ -1173,9 +1440,14 @@ class Window(QMainWindow):
         for module, value in engine.file_entries(result):
             if value:
                 filename = module.TARGET.rsplit('/', 1)[-1]
-                statuses.append((filename, value.analysis['label']))
+                state_label = value.analysis['label']
+                if module is mesh and result.screws and result.screws.helper_enabled and value.analysis["known"]:
+                    state_label = "Uncursed"
+                statuses.append((filename, state_label))
                 if value.backup_error:
                     errors.append(filename + " · Original needs attention: " + value.backup_error)
+        if result.screws and result.screws.backup_error:
+            errors.append("Bed screw helper · " + result.screws.backup_error)
         self.files_status.set_files(statuses)
         self.files_errors.setText("\n".join(errors))
         self.files_errors.setVisible(bool(errors))
@@ -1204,7 +1476,8 @@ class Window(QMainWindow):
         dialog.setWindowTitle("Unknown printer file")
         dialog.setMinimumWidth(600)
         layout = QVBoxLayout(dialog)
-        layout.setSpacing(16)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(18)
         layout.addWidget(label("The printer files don’t match the known versions this app supports.", "section", True))
         for module, value in engine.file_entries(self.snapshot):
             if value and not value.analysis["known"]:
@@ -1212,6 +1485,7 @@ class Window(QMainWindow):
         layout.addWidget(label("Known versions only enables tools whose affected files are recognized. "
                                "Full risk allows tools on unknown files, but ambiguous edits and damaged originals still stop Apply.", "muted", True))
         row = QHBoxLayout()
+        row.setSpacing(12)
         cancel = button("Cancel")
         known = button("Proceed with known versions only", primary=True)
         row.addWidget(cancel); row.addWidget(known)
@@ -1221,12 +1495,10 @@ class Window(QMainWindow):
         layout.addWidget(risk, alignment=Qt.AlignmentFlag.AlignRight)
         def choose(policy):
             self.policy = policy
-            self.access = policy == "all" or (policy == "known" and self.snapshot.analysis["known"])
             dialog.accept()
         cancel.clicked.connect(lambda: choose("cancel"))
         known.clicked.connect(lambda: choose("known"))
         risk.clicked.connect(lambda: choose("all"))
-        self.access = False
         dialog.exec()
         self.refresh()
 
@@ -1248,7 +1520,16 @@ class Window(QMainWindow):
         self.staged = None
         self.mesh_staged = None
         self.temperature_staged = None
+        self.screws_staged = None
+        self.smoothing_staged = None
         self.restore_pending = False
+        self.update_enabled = False
+        self.refresh()
+
+    def stage_update(self, value):
+        if not self.connected or self.busy or self.snapshot is None or self.restore_pending:
+            return
+        self.update_enabled = bool(value)
         self.refresh()
 
     def stage_restore(self):
@@ -1265,6 +1546,8 @@ class Window(QMainWindow):
             self.staged = None
             self.mesh_staged = None
             self.temperature_staged = None
+            self.screws_staged = None
+            self.smoothing_staged = None
             self.refresh()
 
     def stage_temperature_toggle(self, value):
@@ -1274,8 +1557,32 @@ class Window(QMainWindow):
         self.temperature_staged = bool(value)
         self.refresh()
 
+    def stage_screws_toggle(self, value):
+        if self.snapshot is None or self.snapshot.screws is None:
+            return
+        self.restore_pending = False
+        self.screws_staged = bool(value)
+        self.refresh()
+
+    def stage_smoothing_toggle(self, value):
+        if self.snapshot is None or engine.mod_snapshot(self.snapshot, smoothing.TARGET) is None:
+            return
+        self.restore_pending = False
+        self.smoothing_staged = bool(value)
+        self.refresh()
+
     def refresh(self):
         snapshot = self.snapshot
+        for field, value in (
+            ("staged", snapshot),
+            ("mesh_staged", snapshot.mesh if snapshot else None),
+            ("temperature_staged", snapshot.mesh_temperature if snapshot else None),
+            ("screws_staged", snapshot.screws if snapshot else None),
+            ("smoothing_staged", engine.mod_snapshot(snapshot, smoothing.TARGET) if snapshot else None),
+        ):
+            staged = getattr(self, field)
+            if value and staged is not None and staged == value.analysis["enabled"]:
+                setattr(self, field, None)
         device_error = network.compatibility_error(snapshot.status if snapshot else None)
         supported = snapshot is not None and not device_error
         if snapshot:
@@ -1288,7 +1595,31 @@ class Window(QMainWindow):
         self.compatibility_status.setVisible(bool(snapshot and device_error))
         self.compatibility_status.setToolTip(snapshot.status_error if snapshot else "")
         restore_paths = engine.restorable(snapshot, self.policy == "all") if snapshot and self.restore_pending else set()
-        any_changed, permitted = False, supported
+        choices = {mods.TARGET: self.staged, mesh.TARGET: self.mesh_staged,
+                   mesh_temperature.TARGET: self.temperature_staged, screws.PYTHON: self.screws_staged,
+                   smoothing.TARGET: self.smoothing_staged}
+        update_statuses = engine.update_statuses(snapshot) if snapshot else {}
+        outdated_paths = {path for path, status in update_statuses.items() if status["needed"]}
+        update_targets = {path for path in outdated_paths if choices.get(path) is not False} if not self.restore_pending else set()
+        blocked_updates = []
+        for path in sorted(update_targets):
+            reason = update_statuses[path]["reason"] if not update_statuses[path]["available"] else ""
+            if not reason and self.policy != "all" and not engine.mod_snapshot(snapshot, path).analysis.get("known"):
+                reason = "Review compatibility before updating this mod."
+            if reason:
+                blocked_updates.append(path.rsplit("/", 1)[-1] + ": " + reason)
+        blocked_reason = "Update blocked:\n" + "\n".join(blocked_updates) if blocked_updates else ""
+        self.update_active = bool(self.update_enabled and update_targets)
+        update_paths = set(update_targets) if self.update_active else set()
+        update_error = blocked_reason if self.update_active else ""
+        mandatory_updates = set()
+        if snapshot and not self.restore_pending:
+            try:
+                mandatory_updates = engine.automatic_updates(snapshot, choices)
+                update_paths.update(mandatory_updates)
+            except ValueError as error:
+                update_error = str(error)
+        any_changed, permitted = False, supported and not update_error
         entries = (
             (mods.TARGET, snapshot, self.staged, self.toggle, self.pending_label,
              self.mod_card, self.mod_opacity),
@@ -1296,6 +1627,10 @@ class Window(QMainWindow):
              self.mesh_pending, self.mesh_card, self.mesh_opacity),
             (mesh_temperature.TARGET, snapshot.mesh_temperature if snapshot else None, self.temperature_staged,
              self.temperature_toggle, self.temperature_pending, self.temperature_card, self.temperature_opacity),
+            (screws.PYTHON, snapshot.screws if snapshot else None, self.screws_staged,
+             self.screws_toggle, self.screws_pending, self.screws_card, self.screws_opacity),
+            (smoothing.TARGET, engine.mod_snapshot(snapshot, smoothing.TARGET) if snapshot else None, self.smoothing_staged,
+             self.smoothing_toggle, self.smoothing_pending, self.smoothing_card, self.smoothing_opacity),
         )
         for path, value, staged, toggle, pending, panel, opacity in entries:
             applied = value.analysis["enabled"] if value else None
@@ -1305,21 +1640,30 @@ class Window(QMainWindow):
             toggle.setChecked(staged if staged is not None else applied is True)
             toggle.blockSignals(False)
             toggle.update()
-            changed = path in restore_paths or (staged is not None and staged != applied)
+            changed = path in restore_paths or (path in update_paths and staged is not False) or (staged is not None and staged != applied)
             any_changed |= changed
             pending.setVisible(bool(changed))
-            pending.setToolTip("Restore the initial on-printer original" if path in restore_paths else "Staged change")
+            pending.setToolTip("Restore the initial on-printer original" if path in restore_paths else
+                               "Update to latest" if path in update_paths and staged is not False else "Staged change")
             allowed = bool(self.connected and access and value.analysis.get("patchable", False) and not value.backup_error)
             if changed:
-                permitted &= allowed
+                permitted &= bool(self.connected and path in restore_paths) if self.restore_pending else allowed
             panel.setEnabled(bool(self.connected and value and access and not self.busy))
             opacity.setOpacity(1 if self.connected and value and access else 0.45)
             toggle.setEnabled(allowed and not self.busy and not self.restore_pending)
+            if path in self.mod_version_rows:
+                files, text = self.mod_version_rows[path]
+                version = engine.version_details(snapshot, path) if snapshot and applied is True else ""
+                files.setText(text + (" · " + version if version else ""))
+                files.set_outdated(path in outdated_paths)
         self.heat_details.setEnabled(self.connected)
         self.mesh_details.setEnabled(self.connected)
         self.temperature_details.setEnabled(self.connected)
+        self.screws_details.setEnabled(self.connected)
+        self.smoothing_details.setEnabled(self.connected)
         for widget in (self.heat_expand, self.mesh_expand, self.temperature_expand,
-                       self.heat_body, self.mesh_body, self.temperature_body):
+                       self.heat_body, self.mesh_body, self.temperature_body, self.screws_expand, self.screws_body,
+                       self.smoothing_expand, self.smoothing_body):
             widget.setEnabled(self.connected)
         for row in self.printer_rows:
             row.refresh(row is self.active_row and self.connected, self.busy)
@@ -1331,15 +1675,34 @@ class Window(QMainWindow):
         for widget in (self.add_button, self.review_button):
             widget.setEnabled(not self.busy)
         self.scan_button.setEnabled(self.connected and not self.busy)
-        self.cancel_button.setEnabled(not self.busy and (self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.restore_pending))
-        self.original_button.setEnabled(bool(self.connected and snapshot and self.policy != "cancel" and not self.busy
+        count = len(update_targets)
+        self.update_label.setText(f"Update {count} outdated {'mod' if count == 1 else 'mods'}")
+        self.update_toggle.setAccessibleName(self.update_label.text())
+        self.update_control.setVisible(bool(self.connected and update_targets))
+        self.update_toggle.blockSignals(True)
+        self.update_toggle.setChecked(bool(self.update_enabled or mandatory_updates))
+        self.update_toggle.blockSignals(False)
+        self.update_toggle.setEnabled(bool(supported and self.connected and self.policy != "cancel" and update_targets
+                                           and not self.busy and not mandatory_updates))
+        self.update_control.setToolTip(blocked_reason or ("Updates are required when enabling another mod." if mandatory_updates
+            else "Update active outdated mods in the same Apply batch; mods turned off will be removed instead."))
+        self.cancel_button.setEnabled(not self.busy and (self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.screws_staged is not None or self.smoothing_staged is not None or self.restore_pending or self.update_active))
+        self.original_button.setEnabled(bool(self.connected and snapshot and not self.busy
                                              and engine.restorable(snapshot, self.policy == "all")))
+        updates_only = bool(update_paths) and not self.restore_pending and all(value is None for value in choices.values())
+        self.apply_button.idle_text = "Update" if updates_only else "Apply"
+        self.apply_button.active_text = "Updating…" if updates_only else "Applying…"
+        self.apply_button.setText(self.apply_button.active_text if self.apply_button.running else self.apply_button.idle_text)
         self.apply_button.setEnabled(bool(permitted and any_changed and not self.busy))
         self.preview_button.setEnabled(self.apply_button.isEnabled())
+        if update_error or self.automatic_update_error:
+            self.apply_button.setToolTip(update_error)
+            self.preview_button.setToolTip(update_error or "Review all staged printer-file changes before applying")
+        self.automatic_update_error = update_error
 
     def preview(self):
         try:
-            diff = engine.difference_all(self.snapshot, self.staged, self.mesh_staged, self.restore_pending, self.policy == "all", self.temperature_staged)
+            diff = engine.difference_all(self.snapshot, self.staged, self.mesh_staged, self.restore_pending, self.policy == "all", self.temperature_staged, self.screws_staged, update=self.update_active, smoothing_desired=self.smoothing_staged)
         except (ValueError, SyntaxError) as error:
             QMessageBox.warning(self, "Cannot prepare changes", str(error))
             return
@@ -1349,7 +1712,8 @@ class Window(QMainWindow):
         if not self.connected:
             return
         name = {mods.TARGET: "Heat before homing & calibration", mesh.TARGET: "Speed up Bed mesh",
-                mesh_temperature.TARGET: "Mesh at print temperature"}[path]
+                mesh_temperature.TARGET: "Mesh at print temperature", screws.MOD_ID: "Bed screw adjustment helper",
+                smoothing.TARGET: "Speed up homing"}[path]
         try:
             diff, baseline = engine.initial_difference(self.snapshot, path)
         except (ValueError, SyntaxError, UnicodeError) as error:
@@ -1361,6 +1725,8 @@ class Window(QMainWindow):
         dialog.setWindowTitle(title)
         dialog.resize(960, 700)
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(18)
         layout.addWidget(label(description, "muted", True))
         view = QPlainTextEdit()
         view.setReadOnly(True)
@@ -1396,32 +1762,40 @@ class Window(QMainWindow):
             connection = self.connection()
             if self.snapshot_connection != (connection.host, connection.username):
                 raise ValueError("Scan the selected printer before Apply.")
-            engine.prepare_all(self.snapshot, self.staged, self.mesh_staged, self.restore_pending, self.policy == "all", self.temperature_staged)
+            engine.prepare_all(self.snapshot, self.staged, self.mesh_staged, self.restore_pending, self.policy == "all", self.temperature_staged, self.screws_staged, update=self.update_active, smoothing_desired=self.smoothing_staged)
         except (ValueError, SyntaxError) as error:
             QMessageBox.warning(self, "Cannot apply", str(error))
             return
         scanned, desired, restore, risk = self.snapshot, self.staged, self.restore_pending, self.policy == "all"
         mesh_desired = self.mesh_staged
         temperature_desired = self.temperature_staged
+        screws_desired = self.screws_staged
+        smoothing_desired = self.smoothing_staged
+        update = self.update_active
         def applied(result):
             self.staged = None
             self.mesh_staged = None
             self.temperature_staged = None
+            self.screws_staged = None
+            self.smoothing_staged = None
             self.restore_pending = False
             self.receive_scan(result["snapshot"], connection, review=False)
             self.apply_button.setToolTip(result["message"])
             if result.get("written"):
-                self.show_write_success()
+                if result.get("power_cycle", True):
+                    self.show_write_success()
+                else:
+                    QMessageBox.information(self, "Write successful", result["message"])
         self.run_task(lambda progress: engine.apply(connection, self.known_hosts, scanned, desired, restore, risk, progress,
-                                                   mesh_desired=mesh_desired, temperature_desired=temperature_desired), applied)
+                                                   mesh_desired=mesh_desired, temperature_desired=temperature_desired,
+                                                   screws_desired=screws_desired, update=update,
+                                                   smoothing_desired=smoothing_desired), applied)
 
     def show_write_success(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Write successful")
-        dialog.setStyleSheet("QWidget { font-family: 'Google Sans'; font-size: 16pt; }"
-                            "QLabel#powerCycle { font-size: 18pt; font-weight: 600; color: #ffffff; "
-                            "background: #b51f2a; border-radius: 0; padding: 4px 8px; }"
-                            "QPushButton { font-size: 14pt; min-width: 120px; padding: 12px 24px; }")
+        dialog.setStyleSheet("QLabel#powerCycle { font-size: 13pt; font-weight: 600; color: #ffffff; "
+                            "background: #123450; border-radius: 0; padding: 4px 8px; }")
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(20)
@@ -1513,14 +1887,12 @@ class Window(QMainWindow):
         if self.busy and not self.scanning:
             QMessageBox.information(self, "Write in progress", "Wait for the printer files to finish writing before closing the app.")
             event.ignore()
-        elif self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.restore_pending:
+        elif self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.screws_staged is not None or self.smoothing_staged is not None or self.restore_pending:
             dialog = QMessageBox(QMessageBox.Icon.Question, "Discard pending edits?",
                                 "Close without applying your pending edits?",
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
             dialog.setOption(QMessageBox.Option.DontUseNativeDialog, True)
             dialog.setDefaultButton(QMessageBox.StandardButton.No)
-            dialog.setStyleSheet("QWidget { font-family: 'Google Sans'; font-size: 14pt; }"
-                                "QPushButton { font-size: 12pt; min-width: 100px; padding: 12px 20px; }")
             reply = dialog.exec()
             event.accept() if reply == QMessageBox.StandardButton.Yes else event.ignore()
         else:

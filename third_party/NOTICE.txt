@@ -20,3 +20,13 @@ https://www.python.org/downloads/source/
 
 The application does not restrict modification or replacement of the LGPL
 libraries, or reverse engineering for debugging modifications to them.
+
+The optional bed screw adjustment helper includes modified Klipper
+screws_tilt_adjust.py by Rui Caridade and Matthew Lloyd, under GPLv3.
+Its source, copyright notices, and configuration are bundled as plain-text
+assets with the app. The GPL-3.0 license text is included in this directory.
+
+The Fluidd screw-dialog reference fragment and popup-local grid edits are
+derived from Fluidd (GPLv3): https://github.com/fluidd-core/fluidd
+The modification changes screw-result presentation and is supplied as
+plain-text source in app/assets/screws-grid-edits.json.

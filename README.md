@@ -26,8 +26,10 @@ Currently supports Creality K2 Plus, firmware 1.1.6.4 and tested only with lates
 >All mods are reversible.
 >Original backups are automatically created directly on the printer on first apply. Turn a mod off to undo it, or use **Restore original** to restore everything to pre-uncurser state.
 
+Every mod, including the bed screw helper, stores its version and verified uninstall instructions in `Uncurser_mods.json` on the printer. The update toggle stages installed mod updates; press Apply to save them. Enabling another mod also enrolls the three shipped unstamped v0.1.5 mods after verifying their code and original backups. Failed verification blocks Apply. Original backups remain unchanged.
+
 ## Roadmap
 
-- [ ] **Bed screw adjustment helper** — guide manual adjustment of the bed leveling screws.
+- [x] **Bed screw adjustment helper** — guide manual adjustment of the bed leveling screws. After enabling it and power cycling, run `SCREWS_TILT_CALCULATE` in Fluidd.
 - [ ] **Safe print stop** — lower the bed before moving the printhead when stopping or cancelling a print.
 - [ ] **Fluidd camera fix** — restore the camera feed in Fluidd.

@@ -3,6 +3,7 @@ import configparser
 import hashlib
 import re
 from decimal import Decimal
+from .config_blocks import strip_screws_include
 
 TARGET = "/mnt/UDISK/printer_data/config/printer.cfg"
 ORIGINAL = TARGET.removesuffix(".cfg") + ".cfn.Original.txt"
@@ -12,7 +13,7 @@ REFERENCE_HASH = "132af1084f7f07ae4c3ce6b3b9fecad8efd48c26a70735b63a464d7aa9ede5
 # Recognize the previous preset's 3mm travel height without modifying it.
 LEGACY_REFERENCE_HASH = "76c11afe5c8fb08e49c8c4c499aff80ad03596dc5632b7e4113b19fca273c1c5"
 VALUES = {
-    ("bed_mesh", "speed"): "700",
+    ("bed_mesh", "speed"): "600",
     ("bed_mesh", "probe_count"): "9,9",
     ("printer", "max_z_velocity"): "50",
     ("prtouch_v3", "lift_speed"): "50",
@@ -142,7 +143,7 @@ def stable_digest(data):
 
 
 def fingerprint(data):
-    doc = Document(data)
+    doc = Document(strip_screws_include(data.decode("utf-8"))[0].encode("utf-8"))
     indices = {index for index, match in doc.options.values()}
     text = "".join(line for index, line in enumerate(doc.lines) if index not in indices)
     return hashlib.sha256((text.replace("\r\n", "\n").rstrip() + "\n").encode()).hexdigest()
@@ -152,10 +153,15 @@ def inspect(data, original=None):
     try:
         doc = Document(data)
         applied = all(doc.values[key] == numeric(key, value) for key, value in VALUES.items())
+        # The shipped unstamped preset used 700; recognise the complete preset
+        # so it can be updated with verified original backups.
+        legacy = not applied and all(doc.values[key] == numeric(
+            key, "700" if key == ("bed_mesh", "speed") else value) for key, value in VALUES.items())
+        applied = applied or legacy
         original_values = Document(original).values if original is not None else None
         partial = original_values is not None and doc.values != original_values and not applied
         known = fingerprint(data) in (REFERENCE_HASH, LEGACY_REFERENCE_HASH)
-        return {"known": known, "enabled": None if partial else applied, "patchable": True,
+        return {"known": known, "enabled": None if partial else applied, "patchable": True, "legacy": legacy,
                 "label": ("Partial" if partial else "Uncursed" if applied else "Original") if known else "Unknown",
                 "reason": "" if known else "printer.cfg differs from the captured reference outside the mesh preset settings."}
     except (ValueError, UnicodeError) as error:
@@ -176,15 +182,6 @@ def transform(data, enabled, original=None):
         raise ValueError("Prepared mesh values do not exactly match the requested values.")
     if verified.generated != doc.generated or fingerprint(result) != fingerprint(data):
         raise ValueError("An unrelated setting or generated calibration was changed.")
-    return result
-
-
-def restore(data, original):
-    # A full config restoration still retains current generated calibration data.
-    regular, _ = split(original)
-    _, generated = split(data)
-    result = (regular + generated).encode("utf-8")
-    validate(result)
     return result
 
 

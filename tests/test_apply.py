@@ -12,9 +12,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from app import engine
+from app import engine, mod_versions, mods
 from app.mods import digest
-from app.remote import APPLY, Connection
+from app.remote import APPLY_BATCH, Connection
+from tests import test_mods
 
 
 class ApplyTests(unittest.TestCase):
@@ -34,9 +35,12 @@ class ApplyTests(unittest.TestCase):
         self.directory.cleanup()
 
     def apply(self, new=b"value = 2\n", expected=None, original_hash=None, restore=False):
-        request = {"path": str(self.path), "expected": expected or digest(self.path.read_bytes()),
-                   "data": base64.b64encode(new).decode(), "new_hash": digest(new),
-                   "original_hash": original_hash, "may_capture_original": True, "reference": "fixture", "restore": restore}
+        item = {"path": str(self.path), "backup": str(self.path.with_suffix(".ptn.Original.txt")),
+                "expected": expected or digest(self.path.read_bytes()),
+                "data": base64.b64encode(new).decode(), "new_hash": digest(new),
+                "original_hash": original_hash, "may_capture_original": True,
+                "reference": "fixture", "restore": restore, "kind": "python"}
+        request = {"files": [item]}
         original_open = os.open
         def portable_open(path, flags, *args, **kwargs):
             if Path(path).is_dir():
@@ -44,8 +48,9 @@ class ApplyTests(unittest.TestCase):
             return original_open(path, flags, *args, **kwargs)
         with patch("sys.stdin", io.StringIO(json.dumps(request))), contextlib.redirect_stdout(io.StringIO()), \
              patch("os.open", portable_open), patch("os.fsync", lambda fd: None), \
-             patch("os.chown", lambda *args: None, create=True):
-            exec(compile(APPLY, "<remote-apply>", "exec"), {})
+             patch("os.fchown", lambda *args: None, create=True), \
+             patch("os.fchmod", lambda *args: None, create=True):
+            exec(compile(APPLY_BATCH, "<remote-batch-apply>", "exec"), {})
 
     def test_initial_original_is_never_overwritten(self):
         first = self.path.read_bytes()
@@ -89,22 +94,29 @@ class ApplyTests(unittest.TestCase):
 
 class ApplyWithoutRestartTests(unittest.TestCase):
     def test_apply_verifies_saved_file_without_restart(self):
-        old, new = b"value = 1\n", b"value = 2\n"
+        old = test_mods.SOURCE
+        new = mods.transform(old, True)
         status = {"native": {"model": "F008", "modelVersion": "1.1.6.4"}}
-        before = engine.Snapshot(old, digest(old), {"enabled": False}, None, None, "",
+        before = engine.Snapshot(old, digest(old), {"enabled": False, "known": True, "patchable": True}, None, None, "",
                                  status, "", {"history": True}, 0)
         after = engine.Snapshot(new, digest(new), {"enabled": True}, old, digest(old), "",
                                 status, "", {"history": True}, 1)
+        ledger = engine.prepare_all(before, True)[mod_versions.TARGET]
+        after.versions = engine.MeshSnapshot(ledger, digest(ledger),
+            {"known": True, "enabled": True, "patchable": True},
+            original_hash=digest(b""), original_absent=True)
         with patch.object(engine, "scan", side_effect=[before, after]) as scan, \
-             patch.object(engine, "prepare", return_value=new), \
              patch.object(engine, "Remote") as remote, \
              patch.object(engine.network, "require_idle"), \
              patch.object(engine.network, "status", return_value=status), \
              patch.object(engine.network, "http") as http:
-            remote.return_value.__enter__.return_value.python.return_value = True
+            remote.return_value.__enter__.return_value.python.return_value = {
+                "saved": [mods.TARGET, mod_versions.TARGET], "cleared": []}
             result = engine.apply(Connection("192.0.2.1"), Path("unused"), before, True)
         self.assertEqual(scan.call_count, 2)
-        self.assertEqual(remote.return_value.__enter__.return_value.python.call_args.args[0], APPLY)
+        script, request = remote.return_value.__enter__.return_value.python.call_args.args
+        self.assertEqual(script, APPLY_BATCH)
+        self.assertEqual([item["path"] for item in request["files"]], [mods.TARGET, mod_versions.TARGET])
         http.assert_not_called()
         self.assertIs(result["snapshot"], after)
         self.assertFalse(result["restarted"])
