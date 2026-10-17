@@ -59,6 +59,7 @@ class FluiddTests(unittest.TestCase):
         self.assertTrue(current.mesh.analysis['patchable'])
         current.mesh.original = helper_tests.SOURCE
         current.mesh.original_hash = mods.digest(helper_tests.SOURCE)
+        current.mesh.original_identity = ("F008", "1.1.6.4")
         current.screws.analysis.update(known=False, patchable=False, enabled=None)
         self.assertIn(engine.mesh.TARGET, engine.restorable(current))
 

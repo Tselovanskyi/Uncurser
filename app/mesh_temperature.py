@@ -1,8 +1,8 @@
 """Use the requested bed temperature in the native print-start mesh macro."""
-from . import mesh, mods
+from . import mesh, mods, storage
 
 TARGET = "/mnt/UDISK/printer_data/config/gcode_macro.cfg"
-ORIGINAL = TARGET.removesuffix(".cfg") + ".cfn.Original.txt"
+ORIGINAL = storage.original(TARGET)
 MANIFEST = ORIGINAL + ".json"
 SECTION = "gcode_macro BED_MESH_CALIBRATE_START_PRINT"
 ORIGINAL_CONDITION = "{% if 'BED_TEMP' in params|upper and params.BED_TEMP|default(0)|int >= printer.custom_macro.default_bed_temp %}"

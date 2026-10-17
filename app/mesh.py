@@ -3,10 +3,11 @@ import configparser
 import hashlib
 import re
 from decimal import Decimal
+from . import storage
 from .config_blocks import strip_screws_include
 
 TARGET = "/mnt/UDISK/printer_data/config/printer.cfg"
-ORIGINAL = TARGET.removesuffix(".cfg") + ".cfn.Original.txt"
+ORIGINAL = storage.original(TARGET)
 MANIFEST = ORIGINAL + ".json"
 # Captured read-only from the owner's printer; excludes preset values and autosave.
 REFERENCE_HASH = "132af1084f7f07ae4c3ce6b3b9fecad8efd48c26a70735b63a464d7aa9ede5f4"

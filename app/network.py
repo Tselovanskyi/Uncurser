@@ -11,7 +11,7 @@ import websocket
 
 SUPPORTED_MODEL = "F008"
 SUPPORTED_MODEL_NAME = "K2 Plus"
-SUPPORTED_FIRMWARE = "1.1.6.4"
+SUPPORTED_FIRMWARES = ("1.1.6.4", "1.1.7.0")
 
 
 def device_identity(status):
@@ -30,19 +30,44 @@ def device_identity(status):
     return model, version if re.fullmatch(pattern, version) else ""
 
 
-def compatibility_error(status):
+def firmware_state(status):
+    """Distinguish tested K2 Plus firmware from newer untested releases."""
     model, firmware = device_identity(status)
-    if (model, firmware) == (SUPPORTED_MODEL, SUPPORTED_FIRMWARE):
+    if model == SUPPORTED_MODEL and firmware in SUPPORTED_FIRMWARES:
+        return "supported"
+    if (model == SUPPORTED_MODEL and firmware
+            and tuple(map(int, firmware.split("."))) > tuple(map(int, SUPPORTED_FIRMWARES[0].split(".")))):
+        return "untested"
+    return "unsupported"
+
+
+def is_untested(status):
+    return firmware_state(status) == "untested"
+
+
+def compatibility_error(status):
+    state = firmware_state(status)
+    model, firmware = device_identity(status)
+    if state == "supported":
         return ""
+    if state == "untested":
+        return f"Firmware {firmware} is not tested. Mod compatibility is not guaranteed."
     reason = ("Could not verify the printer model or firmware." if not model or not firmware
               else "This printer model or firmware is not supported.")
-    return reason + f" Mods require {SUPPORTED_MODEL_NAME} firmware {SUPPORTED_FIRMWARE}."
+    return reason + f" Mods require {SUPPORTED_MODEL_NAME} firmware {' or '.join(SUPPORTED_FIRMWARES)}."
 
 
-def require_supported(status):
+def require_supported(status, *, allow_untested=False):
+    if allow_untested and is_untested(status):
+        return
     reason = compatibility_error(status)
     if reason:
         raise ValueError(reason)
+
+
+def require_removal_supported(status):
+    if firmware_state(status) == "unsupported":
+        raise ValueError(compatibility_error(status))
 
 
 def parse_host(value):
@@ -87,9 +112,9 @@ def status(host):
     return {"info": info, "objects": objects["status"], "native": native_status(host)}
 
 
-def require_idle(value):
+def require_idle(value, *, allow_error=False):
     info, objects, native = value["info"], value["objects"], value["native"]
-    if info.get("state") != "ready":
+    if info.get("state") != "ready" and not (allow_error and info.get("state") == "error"):
         raise RuntimeError("Klipper must be ready before Apply. Scanning and preview remain available.")
     if objects.get("print_stats", {}).get("state") in ("printing", "paused"):
         raise RuntimeError("Finish or cancel the print before applying changes.")

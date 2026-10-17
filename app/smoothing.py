@@ -1,9 +1,9 @@
 """Temporarily raise XY first-pass and bed-centre homing motion limits."""
 import ast
-from . import mesh, mods
+from . import mesh, mods, storage
 
 TARGET = "/mnt/UDISK/printer_data/config/sensorless.cfg"
-ORIGINAL = TARGET.removesuffix(".cfg") + ".cfn.Original.txt"
+ORIGINAL = storage.original(TARGET)
 MANIFEST = ORIGINAL + ".json"
 SECTION = "gcode_macro _HOME_Z"
 ORIGINAL_LINE = "G1 x{x_park} y{y_park} F12000"
@@ -162,7 +162,7 @@ def _python_anchors(text):
 
 class HomingModule:
     TARGET = "/usr/share/klipper/klippy/extras/homing.py"
-    ORIGINAL = TARGET.removesuffix(".py") + ".ptn.Original.txt"
+    ORIGINAL = storage.original(TARGET)
     MANIFEST = ORIGINAL + ".json"
     REFERENCE_HASH = "cc847821cb60fb0a322e75685ea2c27e86d608a15ef4888a0cbe3dce16a2f765"
 

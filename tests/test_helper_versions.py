@@ -197,7 +197,7 @@ class HelperVersionTests(unittest.TestCase):
                 if name in (screws.PYTHON, screws.CONFIG):
                     files[name] += b"\n# user edit\n"
                 elif name == mesh.TARGET:
-                    files[name] = files[name].replace(b"include screws_tilt_adjust.cfg", b"include changed.cfg")
+                    files[name] = files[name].replace(screws.CONFIG.encode(), b"changed.cfg")
                 else:
                     files[name] = files[name].replace(fluidd_screws.GRID_RENDER.encode(), b"changed_popup")
                 with self.assertRaises(ValueError):

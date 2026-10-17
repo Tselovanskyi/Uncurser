@@ -10,7 +10,7 @@ from app.remote import APPLY_BATCH, Connection
 
 SUPPORTED = {"native": {"model": "F008", "modelVersion":
     "printer hw ver:;printer sw ver:;DWIN hw ver:CR0CN240110C10;DWIN sw ver:1.1.6.4;"}}
-UNSUPPORTED = {"native": {"model": "F008", "modelVersion": "1.1.6.40"}}
+UNSUPPORTED = {"native": {"model": "F008", "modelVersion": "1.1.6.3"}}
 
 
 def snapshot(status):
@@ -22,15 +22,20 @@ def snapshot(status):
 
 class CompatibilityTests(unittest.TestCase):
     def test_native_release_field_and_plain_release_are_supported(self):
-        self.assertEqual(network.device_identity(SUPPORTED), ("F008", "1.1.6.4"))
-        self.assertEqual(network.compatibility_error(SUPPORTED), "")
-        network.require_supported({"native": {"model": "F008", "modelVersion": "1.1.6.4"}})
+        for version in ("1.1.6.4", "1.1.7.0"):
+            for field in (version, f"printer hw ver:;DWIN hw ver:CR0CN240110C10;DWIN sw ver:{version};"):
+                with self.subTest(field=field):
+                    current = {"native": {"model": "F008", "modelVersion": field}}
+                    self.assertEqual(network.device_identity(current), ("F008", version))
+                    self.assertEqual(network.compatibility_error(current), "")
+                    network.require_supported(current)
 
     def test_missing_ambiguous_and_substring_matches_are_blocked(self):
-        invalid = [None, {}, {"native": None}, {"native": []},
-                   {"native": {"model": "F009", "modelVersion": "1.1.6.4"}}]
-        for version in (None, "", "1.1.6.40", "11.1.6.4", "x1.1.6.4",
-                        "DWIN hw ver:1.1.6.4;DWIN sw ver:1.1.7.0;",
+        invalid = [None, {}, {"native": None}, {"native": []}]
+        invalid.extend({"native": {"model": "F009", "modelVersion": version}}
+                       for version in ("1.1.6.4", "1.1.7.0"))
+        for version in (None, "", "1.1.6.40", "11.1.6.4", "x1.1.6.4", "1.1.7.1",
+                        "DWIN hw ver:1.1.6.4;DWIN sw ver:1.1.7.1;",
                         "DWIN sw ver:1.1.6.4;DWIN sw ver:1.1.7.0;",
                         "printer sw ver:1.1.6.4;DWIN sw ver:;"):
             invalid.append({"native": {"model": "F008", "modelVersion": version}})

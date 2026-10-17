@@ -3,9 +3,10 @@
 import ast
 import hashlib
 from dataclasses import dataclass
+from . import storage
 
 TARGET = "/usr/share/klipper/klippy/extras/pause_resume.py"
-ORIGINAL = TARGET.removesuffix(".py") + ".ptn.Original.txt"
+ORIGINAL = storage.original(TARGET)
 MANIFEST = ORIGINAL + ".json"
 REFERENCE_HASH = "a95b2348f0a65f19b9f64189cb97ea74926296db80411b3d3ce3b4626cb0ef91"
 MOD_ID = "early_heat_v1"

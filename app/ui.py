@@ -1,9 +1,11 @@
 import datetime
+import html
 import ipaddress
 import logging
 import re
 import threading
 import traceback
+import weakref
 from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRectF, QRunnable, QSignalBlocker, QSize, Qt, QThreadPool, QTimer, QUrl, QVariantAnimation, Signal
@@ -13,7 +15,7 @@ from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QDialogBu
                                QFrame, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox,
                                QPushButton, QPlainTextEdit, QScrollArea, QSizePolicy, QStackedWidget, QStyle, QStyleOptionButton, QVBoxLayout, QWidget)
 
-from . import __version__, engine, mesh, mesh_temperature, mods, network, screws, settings, smoothing
+from . import __version__, engine, mesh, mesh_temperature, mods, network, recovery, screws, settings, smoothing, storage, ui_checks
 from .remote import Connection, NewHostKey, trust_key
 
 
@@ -32,6 +34,7 @@ QLabel#title { font-size: 25pt; font-weight: 700; letter-spacing: 1px; }
 QLabel#section { font-size: 12pt; font-weight: 600; }
 QLabel#groupHeading { font-size: 9pt; font-weight: 600; letter-spacing: 1px; color: #999999; }
 QLabel#muted { color: #999999; }
+QLabel#compatibilityWarning { color: #ff0000; font-size: 13pt; font-weight: 600; }
 QLabel#cyan { color: #42d9e8; font-weight: 600; }
 QLabel:disabled, QLabel#cyan:disabled, QLabel#muted:disabled { color: #858585; }
 QWidget#printerRow { background: transparent; }
@@ -45,6 +48,11 @@ QPushButton#primary:enabled:pressed { background: #20a9b9; }
 QPushButton#primary:disabled { background: #101010; color: #666666; }
 QPushButton[working="true"] { padding-right: 39px; color: #ededed; }
 QPushButton#primary[working="true"] { background: #42d9e8; color: #082027; }
+QPushButton#fixIssuesAction { background: #b42323; color: #ffffff; font-weight: 600; }
+QPushButton#fixIssuesAction:enabled:hover { background: #cf3131; }
+QPushButton#fixIssuesAction:enabled:pressed { background: #8e1c1c; }
+QPushButton#fixIssuesAction:disabled { background: #3c1818; color: #9a6b6b; }
+QPushButton#fixIssuesAction[working="true"] { background: #b42323; color: #ffffff; }
 QPushButton#connected { background: #161616; color: #999999; }
 QPushButton#connected:enabled:hover { background: #804000; color: #ffe3cc; }
 QPushButton#connected:enabled:pressed { background: #a65100; color: #ffffff; }
@@ -107,6 +115,13 @@ QToolTip { background: #000000; color: #ededed; border: 1px solid #666666; }
 DEFAULT_PASSWORD = "creality_2024"
 PRINTER_ROW_HEIGHT = 48
 SUPPORT_URL = "https://donatello.to/uncurse"
+MOD_CONTROLS = (
+    (mods.TARGET, "staged", "Heat before homing & calibration"),
+    (mesh.TARGET, "mesh_staged", "Speed up Bed mesh"),
+    (mesh_temperature.TARGET, "temperature_staged", "Mesh at print temperature"),
+    (screws.PYTHON, "screws_staged", "Bed screw adjustment helper"),
+    (smoothing.TARGET, "smoothing_staged", "Speed up homing"),
+)
 
 
 class ActivityButton(QPushButton):
@@ -246,7 +261,7 @@ class SmoothScrollArea(QScrollArea):
         event.accept()
 
     def eventFilter(self, widget, event):
-        if widget is self.verticalScrollBar() and event.type() == QEvent.Type.Wheel:
+        if event.type() == QEvent.Type.Wheel and widget is self.verticalScrollBar():
             self.wheelEvent(event)
             return event.isAccepted()
         return super().eventFilter(widget, event)
@@ -530,6 +545,9 @@ class Task(QRunnable):
     def run(self):
         try:
             result = self.function(self.progress)
+            scanned = result.get("snapshot") if isinstance(result, dict) else result
+            if isinstance(scanned, engine.Snapshot):
+                ui_checks.populate(scanned)
         except Exception as error:
             if not self.cancelled.is_set():
                 self.error_details = traceback.format_exc()
@@ -648,6 +666,82 @@ def file_summary(modified=0, added=0):
     return " · ".join(parts)
 
 
+class FirmwareIssuesDialog(QDialog):
+    def __init__(self, issues, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Scan for issues")
+        self.setMinimumWidth(440)
+        self.issue_buttons = {}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(18)
+        can_fix = False
+        for path, _, name in MOD_CONTROLS:
+            status = issues.get(path)
+            if not status:
+                continue
+            row = QVBoxLayout()
+            row.setSpacing(4)
+            reason = ("Unknown firmware compatibility" if status.get("installed_firmware") is None else
+                      status.get("firmware_reason") or "Mod firmware differs from the current printer firmware.")
+            heading = label(html.escape(name) + '<br><span style="color: #ff0000;">' +
+                            html.escape(reason).replace("\n", "<br>") + '</span>', wrap=True)
+            heading.setTextFormat(Qt.TextFormat.RichText)
+            row.addWidget(heading)
+            if status.get("available"):
+                can_fix = True
+                if status.get("reinstall") and status.get("present"):
+                    action_row = QHBoxLayout()
+                    action_row.setSpacing(8)
+                    action_row.addWidget(label('<span style="color: #00ff00;">Solution:</span>'))
+                    action = button("Reinstall")
+                    action.setObjectName("issueSolution")
+                    action.setCheckable(True)
+                    action.setChecked(True)
+                    action.setAutoDefault(False)
+                    action.toggled.connect(lambda checked, target=action:
+                                           target.setText("Reinstall" if checked else "Remove"))
+                    self.issue_buttons[path] = action
+                    action_row.addWidget(action)
+                    action_row.addStretch()
+                    row.addLayout(action_row)
+                else:
+                    row.addWidget(label('<span style="color: #00ff00;">Solution: Remove</span>'))
+            else:
+                unresolved = "Unresolved: " + status.get("reason", "The changes could not be verified.")
+                text = label(unresolved, wrap=True)
+                text.setTextFormat(Qt.TextFormat.PlainText)
+                row.addWidget(text)
+            layout.addLayout(row)
+        storage_issue = issues.get(storage.ROOT)
+        if storage_issue:
+            obsolete = storage_issue.get("kind") == "cleanup"
+            solution = "remove unusable backups" if storage_issue.get("damaged") else "remove obsolete backups"
+            solution = solution + " and relocate current backups" if storage_issue.get("relocation") else solution
+            solution = solution if obsolete else "relocation"
+            problem = ("Obsolete or unusable backups." if storage_issue.get("damaged") else
+                       "Backups from older firmware.") if obsolete else "Stored in the old location."
+            action = ('<span style="color: #00ff00;">Solution: ' + solution + '</span>' if storage_issue["available"] else
+                      html.escape("Unresolved: " + storage_issue["reason"]).replace("\n", "<br>"))
+            text = label('Backups and uninstall records<br><span style="color: #ff0000;">' +
+                         problem + '</span><br>' + action, wrap=True)
+            text.setTextFormat(Qt.TextFormat.RichText)
+            layout.addWidget(text)
+            can_fix = bool(storage_issue["available"])
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.fix_button = button("Fix issues")
+        self.fix_button.setObjectName("fixIssues")
+        self.fix_button.setEnabled(can_fix)
+        buttons.addButton(self.fix_button, QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def reinstall_targets(self):
+        return tuple(path for path, action in self.issue_buttons.items() if action.isChecked())
+
+
 class FileStatusList(QScrollArea):
     def __init__(self, parent=None):
         super().__init__()
@@ -666,6 +760,10 @@ class FileStatusList(QScrollArea):
         self.rows.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
         self.file_rows = []
         self.list_size = QSize(0, 0)
+        self.layout_key = None
+        self.arrange_timer = QTimer(self)
+        self.arrange_timer.setSingleShot(True)
+        self.arrange_timer.timeout.connect(self.arrange_rows)
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         self.setWidget(self.content)
         if parent is not None:
@@ -674,6 +772,7 @@ class FileStatusList(QScrollArea):
         self.set_files(())
 
     def set_files(self, entries):
+        self.layout_key = None
         while self.rows.count():
             old = self.rows.takeAt(0).widget()
             old.hide()
@@ -695,14 +794,16 @@ class FileStatusList(QScrollArea):
         return self.list_size
 
     def eventFilter(self, widget, event):
-        if widget is self.parentWidget() and (event.type() == QEvent.Type.Show or
+        if (event.type() == QEvent.Type.Show or
                 event.type() == QEvent.Type.Resize and event.size().width() != event.oldSize().width()):
-            self.arrange_rows()
+            if widget is self.parentWidget():
+                # Changing size constraints inside the parent's resize handler
+                # can synchronously re-enter the scroll area's event filters.
+                self.arrange_timer.start(0)
         return super().eventFilter(widget, event)
 
     def arrange_rows(self):
-        while self.rows.count():
-            self.rows.takeAt(0)
+        self.arrange_timer.stop()
         columns = 1
         count = len(self.file_rows)
         if count > 1 and self.parentWidget() is not None:
@@ -717,6 +818,12 @@ class FileStatusList(QScrollArea):
             gutter = self.verticalScrollBar().sizeHint().width() + 8 if split > 5 else 0
             if sum(widths) + self.rows.horizontalSpacing() + gutter + 2 * self.frameWidth() <= available:
                 columns = 2
+        key = (columns, tuple((row.sizeHint().width(), row.sizeHint().height()) for row in self.file_rows))
+        if key == self.layout_key:
+            return
+        self.layout_key = key
+        while self.rows.count():
+            self.rows.takeAt(0)
         row_count = (count + columns - 1) // columns
         heights = [0] * row_count
         for index, row in enumerate(self.file_rows):
@@ -729,12 +836,16 @@ class FileStatusList(QScrollArea):
         visible_height = sum(heights[:5])
         scrollbar_width = self.verticalScrollBar().sizeHint().width() if size.height() > visible_height else 0
         gap = 8 if scrollbar_width else 0
-        self.setViewportMargins(0, 0, gap, 0)
-        self.list_size = QSize(size.width() + gap + scrollbar_width + 2 * self.frameWidth(),
-                               visible_height + 2 * self.frameWidth())
-        self.setMaximumWidth(self.list_size.width())
-        self.setFixedHeight(self.list_size.height())
-        self.updateGeometry()
+        if self.viewportMargins().right() != gap:
+            self.setViewportMargins(0, 0, gap, 0)
+        size = QSize(size.width() + gap + scrollbar_width + 2 * self.frameWidth(),
+                     visible_height + 2 * self.frameWidth())
+        if (size != self.list_size or self.maximumWidth() != size.width()
+                or self.minimumHeight() != size.height() or self.maximumHeight() != size.height()):
+            self.list_size = size
+            self.setMaximumWidth(size.width())
+            self.setFixedHeight(size.height())
+            self.updateGeometry()
 
 
 class Window(QMainWindow):
@@ -748,7 +859,6 @@ class Window(QMainWindow):
         self.printer_rows = []
         self.active_row = None
         self.connected = False
-        self.pending_by_row = {}
         self.reachability_task = None
         self.reachability_pending = False
         self.reachability_generation = 0
@@ -772,6 +882,14 @@ class Window(QMainWindow):
         self.discovery_ignored = set()
         self.closing = False
         self.pool = QThreadPool(self)
+        self.plan_key = None
+        self.plan_result = None
+        self.plan_request = None
+        self.plan_task = None
+        self.apply_waiting = None
+        self.plan_timer = QTimer(self)
+        self.plan_timer.setSingleShot(True)
+        self.plan_timer.timeout.connect(self.validate_pending)
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self.persist_settings)
@@ -856,7 +974,8 @@ class Window(QMainWindow):
         self.scan_button.setObjectName("scan")
         scan_heading.addWidget(self.scan_button)
         layout.addLayout(scan_heading)
-        self.compatibility_status = label("", "muted", True)
+        self.compatibility_status = label("", "compatibilityWarning", True)
+        self.compatibility_status.setTextFormat(Qt.TextFormat.PlainText)
         self.compatibility_status.hide()
         layout.addWidget(self.compatibility_status)
         self.files_status = FileStatusList(self.scan_content)
@@ -868,6 +987,10 @@ class Window(QMainWindow):
         self.review_button = button("Review compatibility", self.review_compatibility)
         self.review_button.hide()
         actions.addWidget(self.review_button)
+        self.repair_button = button("Fix issues", self.repair_startup)
+        self.repair_button.setObjectName("scan")
+        self.repair_button.hide()
+        actions.addWidget(self.repair_button)
         actions.addStretch()
         layout.addLayout(actions)
 
@@ -1113,6 +1236,9 @@ class Window(QMainWindow):
         footer.addStretch()
         self.original_button = button("Restore original…", self.stage_restore)
         self.original_button.setObjectName("restore")
+        self.original_button.setToolTip("Full restore requires original backups from this printer model and firmware. "
+                                       "Backups from another firmware or without verified identity cannot be used. "
+                                       "Verified mod removal remains available.")
         footer.addWidget(self.original_button)
         self.cancel_button = button("Cancel", self.cancel_staged)
         self.apply_button = ActivityButton("Apply", "Applying…", self.apply_clicked)
@@ -1122,7 +1248,9 @@ class Window(QMainWindow):
         footer_group.addLayout(footer)
         mods_and_footer.addLayout(footer_group)
         self.preview_button.ensurePolished()
-        action_width = max(110, self.preview_button.sizeHint().width())
+        self.apply_button.ensurePolished()
+        action_width = max(110, self.preview_button.sizeHint().width(),
+                           self.apply_button.fontMetrics().horizontalAdvance("Fixing issues…") + 54)
         self.preview_button.setFixedWidth(action_width)
         self.apply_button.setFixedWidth(action_width)
         QApplication.instance().focusChanged.connect(self.focus_changed)
@@ -1221,19 +1349,12 @@ class Window(QMainWindow):
             QMessageBox.warning(self, "Cannot remove saved printer", str(error))
             return
         self.save_timer.stop()
-        self.pending_by_row.pop(row, None)
         if row is self.active_row:
             self.active_row = None
             self.connected = False
             self.snapshot = None
             self.snapshot_connection = None
-            self.staged = None
-            self.mesh_staged = None
-            self.temperature_staged = None
-            self.screws_staged = None
-            self.smoothing_staged = None
-            self.restore_pending = False
-            self.update_enabled = True
+            self.clear_pending()
             self.policy = "known"
             self.scan_progress("")
             self.files_status.set_files(())
@@ -1252,19 +1373,12 @@ class Window(QMainWindow):
         self.settings_dirty = True
         identity = (row.host.text().strip(), row.username.text().strip())
         if identity != row.identity:
-            self.pending_by_row.pop(row, None)
             row.reachable = None
             if row is self.active_row:
                 self.connected = False
                 self.snapshot = None
                 self.snapshot_connection = None
-                self.staged = None
-                self.mesh_staged = None
-                self.temperature_staged = None
-                self.screws_staged = None
-                self.smoothing_staged = None
-                self.restore_pending = False
-                self.update_enabled = True
+                self.clear_pending()
                 self.scan_progress("Printer changed.")
             row.identity = identity
         if row is self.active_row and self.connected and self.snapshot:
@@ -1308,6 +1422,7 @@ class Window(QMainWindow):
                 row.reachable = results[host]
                 if row is self.active_row and self.connected and not row.reachable:
                     self.connected = False
+                    self.clear_pending()
                     self.scan_progress("Printer unreachable. Reconnect when it is available.")
         self.refresh()
 
@@ -1321,12 +1436,10 @@ class Window(QMainWindow):
             QMessageBox.warning(self, "Connection", str(error))
             return
         if row is not self.active_row:
-            if self.active_row is not None:
-                self.pending_by_row[self.active_row] = (self.staged, self.mesh_staged, self.temperature_staged, self.screws_staged, self.smoothing_staged, self.restore_pending, self.update_enabled)
-            self.staged, self.mesh_staged, self.temperature_staged, self.screws_staged, self.smoothing_staged, self.restore_pending, self.update_enabled = self.pending_by_row.get(row, (None, None, None, None, None, False, True))
             self.active_row = row
             self.policy = "known"
         self.connected = False
+        self.clear_pending()
         self.snapshot = None
         self.snapshot_connection = None
         self.files_status.set_files(())
@@ -1341,12 +1454,14 @@ class Window(QMainWindow):
         if self.busy or (row is not None and row is not self.active_row):
             return
         self.connected = False
+        self.clear_pending()
         self.scan_progress("Disconnected.")
         self.refresh()
 
     def run_task(self, function, done, *, scan=False):
         if self.busy or self.closing:
             return
+        self.apply_waiting = None
         self.reachability_generation += 1
         self.busy = True
         self.scanning = scan
@@ -1358,6 +1473,7 @@ class Window(QMainWindow):
         self.refresh()
         task = Task(function)
         self.active_task = task
+        task_ref = weakref.ref(task)
         def progress(message):
             if not self.closing:
                 (self.scan_progress if scan else self.apply_button.setToolTip)(message)
@@ -1378,6 +1494,7 @@ class Window(QMainWindow):
         def fail(error):
             if self.closing:
                 return
+            failed_task = task_ref()
             stop_progress()
             self.refresh()
             if isinstance(error, NewHostKey):
@@ -1397,11 +1514,12 @@ class Window(QMainWindow):
                                 operation_error_message(error), QMessageBox.StandardButton.Ok, self)
             dialog.setOption(QMessageBox.Option.DontUseNativeDialog, True)
             dialog.setTextFormat(Qt.TextFormat.PlainText)
-            context = "Last step: " + task.last_progress if task.last_progress else ""
+            context = "Last step: " + failed_task.last_progress if failed_task is not None and failed_task.last_progress else ""
             if not scan:
                 context += ("\n\n" if context else "") + "Scan the printer to check its current state before applying again."
             dialog.setInformativeText(context)
-            dialog.setDetailedText(task.error_details or type(error).__name__ + ": " + repr(error))
+            details = failed_task.error_details if failed_task is not None else ""
+            dialog.setDetailedText(details or type(error).__name__ + ": " + repr(error))
             dialog.exec()
         task.signals.done.connect(finish)
         task.signals.error.connect(fail)
@@ -1423,13 +1541,74 @@ class Window(QMainWindow):
         self.run_task(lambda progress: engine.scan(connection, self.known_hosts, progress),
                       lambda result: self.receive_scan(result, connection), scan=True)
 
+    def review_firmware_issues(self, result, connection):
+        issues = ui_checks.check(result, "issues")
+        if not issues:
+            return False
+        dialog = FirmwareIssuesDialog(issues, self)
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                selected = dialog.reinstall_targets()
+                QTimer.singleShot(0, lambda: self.fix_firmware_issues(result, connection, issues, reinstall_targets=selected))
+        finally:
+            dialog.deleteLater()
+        return True
+
+    def fix_firmware_issues(self, scanned, connection, issues, *, reinstall_targets=None):
+        if self.busy or not self.connected or self.closing:
+            return
+        try:
+            if self.snapshot is not scanned or self.snapshot_connection != (connection.host, connection.username):
+                raise ValueError("The printer scan changed. Scan again before fixing issues.")
+            relocation = issues.get(storage.ROOT)
+            if relocation and not relocation["available"]:
+                raise ValueError("Cannot fix backup storage: " + relocation["reason"])
+            targets = {path: False for path, _, _ in MOD_CONTROLS
+                       if issues.get(path, {}).get("present") and issues[path].get("available")}
+            reinstall_targets = tuple(path for path in targets if issues[path].get("reinstall") and
+                                      (reinstall_targets is None or path in reinstall_targets))
+            if not targets and not issues.get(storage.ROOT, {}).get("available"):
+                return
+            options = {"desired": targets.get(mods.TARGET), "mesh_desired": targets.get(mesh.TARGET),
+                       "temperature_desired": targets.get(mesh_temperature.TARGET),
+                       "screws_desired": targets.get(screws.PYTHON), "smoothing_desired": targets.get(smoothing.TARGET),
+                       "restore": False, "update": False, "full_risk": False}
+            engine.prepare_all(engine.cleanup_snapshot(scanned) if scanned.storage_cleanup else scanned, **options)
+        except (ValueError, TypeError, SyntaxError) as error:
+            QMessageBox.warning(self, "Cannot fix issues", str(error))
+            return
+
+        def fixed(result):
+            self.receive_scan(result["snapshot"], connection, review=False)
+            self.apply_button.setToolTip(result["message"])
+            if result.get("repair_error"):
+                message = result["message"] + "\n\n" + result["repair_error"]
+                if (result.get("written") or result.get("write_uncertain")) and result.get("power_cycle", True):
+                    message += "\n\nPhysically power cycle the printer before printing."
+                QMessageBox.warning(self, "Reinstallation incomplete", message)
+                return
+            if result.get("written"):
+                if result.get("power_cycle", True):
+                    self.show_write_success()
+                else:
+                    QMessageBox.information(self, "Write successful", result["message"])
+
+        # Repair excludes pending user edits, which remain available for Apply.
+        if reinstall_targets:
+            self.run_task(lambda progress: engine.fix_issues(connection, self.known_hosts, scanned,
+                                                            progress=progress, reinstall_targets=reinstall_targets), fixed)
+        else:
+            self.run_task(lambda progress: engine.apply(connection, self.known_hosts, scanned,
+                                                       progress=progress, **options,
+                                                       **({"retire_old_backups": True} if scanned.storage_cleanup else {})), fixed)
+
     def receive_scan(self, result, connection, review=True):
         self.connected = True
         if self.active_row is not None:
             self.active_row.reachable = True
         self.snapshot = result
         self.snapshot_connection = (connection.host, connection.username)
-        supported = not network.compatibility_error(result.status)
+        can_review = not network.compatibility_error(result.status) or network.is_untested(result.status)
         state = result.status
         reported_name = (state["info"].get("hostname") if state else None) or result.identity.get("hostname", "")
         if self.active_row is not None and not self.active_row.name.text().strip() and reported_name:
@@ -1443,19 +1622,73 @@ class Window(QMainWindow):
                 state_label = value.analysis['label']
                 if module is mesh and result.screws and result.screws.helper_enabled and value.analysis["known"]:
                     state_label = "Uncursed"
-                statuses.append((filename, state_label))
+                if module.TARGET != screws.LEGACY_CONFIG or value.data is not None:
+                    statuses.append((filename, state_label))
                 if value.backup_error:
                     errors.append(filename + " · Original needs attention: " + value.backup_error)
         if result.screws and result.screws.backup_error:
             errors.append("Bed screw helper · " + result.screws.backup_error)
+        if result.storage_error:
+            errors.append(result.storage_error)
+        else:
+            obsolete = {entry["path"] for pair in getattr(result, "storage_cleanup", ())
+                        for entry in pair.get("files", ())}
+            if any(move["source"] not in obsolete for move in result.storage_moves):
+                errors.append("Current backups and uninstall records will move to /mnt/UDISK/Uncurser/ on Apply.")
         self.files_status.set_files(statuses)
         self.files_errors.setText("\n".join(errors))
         self.files_errors.setVisible(bool(errors))
         unknown = any(value and not value.analysis["known"] for module, value in engine.file_entries(result))
-        self.review_button.setVisible(unknown and supported)
+        self.review_button.setVisible(unknown and can_review)
         self.refresh()
-        if unknown and review and supported:
+        if review and self.review_firmware_issues(result, connection):
+            return
+        if review and result.recovery:
+            if result.recovery.get("available"):
+                self.repair_startup()
+            else:
+                dialog = QMessageBox(QMessageBox.Icon.Warning, "Cannot fix issues",
+                                    result.recovery["message"], QMessageBox.StandardButton.Ok, self)
+                dialog.setOption(QMessageBox.Option.DontUseNativeDialog, True)
+                dialog.setTextFormat(Qt.TextFormat.PlainText)
+                dialog.exec()
+        elif unknown and review and can_review:
             self.review_compatibility()
+
+    def repair_startup(self):
+        if (self.busy or not self.connected or self.snapshot is None
+                or not self.snapshot.recovery or not self.snapshot.recovery.get("available")):
+            return
+        try:
+            connection = self.connection()
+            if self.snapshot_connection != (connection.host, connection.username):
+                raise ValueError("Scan the selected printer before fixing issues.")
+        except (ValueError, OSError) as error:
+            QMessageBox.warning(self, "Cannot fix issues", str(error))
+            return
+        scanned = self.snapshot.recovery
+        dialog = QMessageBox(QMessageBox.Icon.Warning, "Fix issues",
+                            scanned["message"], QMessageBox.StandardButton.Cancel, self)
+        dialog.setOption(QMessageBox.Option.DontUseNativeDialog, True)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        repair_button = dialog.addButton("Fix issues", QMessageBox.ButtonRole.AcceptRole)
+        repair_button.setObjectName("fixIssues")
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        dialog.exec()
+        if dialog.clickedButton() is not repair_button:
+            return
+
+        def repair(progress):
+            result = recovery.repair(connection, self.known_hosts, scanned, progress)
+            result["snapshot"] = engine.scan(connection, self.known_hosts, progress)
+            return result
+
+        def repaired(result):
+            self.receive_scan(result["snapshot"], connection, review=False)
+            if result.get("written"):
+                self.show_write_success()
+
+        self.run_task(repair, repaired)
 
     def scan_progress(self, message):
         self.scan_button.setToolTip(message)
@@ -1470,7 +1703,7 @@ class Window(QMainWindow):
                            + ("  ·  Status unavailable" if not self.snapshot.status else ""))
 
     def review_compatibility(self):
-        if not self.snapshot or network.compatibility_error(self.snapshot.status):
+        if not self.snapshot or (network.compatibility_error(self.snapshot.status) and not network.is_untested(self.snapshot.status)):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("Unknown printer file")
@@ -1503,39 +1736,74 @@ class Window(QMainWindow):
         self.refresh()
 
     def stage_toggle(self, value):
-        if self.snapshot is None:
-            return
-        self.restore_pending = False
-        self.staged = bool(value)
-        self.refresh()
+        self.stage_mod_toggle(mods.TARGET, "staged", value)
 
     def stage_mesh_toggle(self, value):
-        if self.snapshot is None or self.snapshot.mesh is None:
+        self.stage_mod_toggle(mesh.TARGET, "mesh_staged", value)
+
+    def stage_mod_toggle(self, path, field, value):
+        if self.snapshot is None or not self.connected or self.busy:
             return
+        if ui_checks.check(self.snapshot, "issues") or self.snapshot.recovery:
+            return
+        status = ui_checks.check(self.snapshot, "removals").get(path, {})
+        if network.is_untested(self.snapshot.status) or status.get("recovery"):
+            if network.compatibility_error(self.snapshot.status) and not network.is_untested(self.snapshot.status):
+                return
+            if status.get("present"):
+                if not status.get("available"):
+                    return
+                desired = None if value else False
+            else:
+                if not self.can_install_mod(engine.mod_snapshot(self.snapshot, path)):
+                    return
+                desired = True if value else None
+        else:
+            if engine.mod_snapshot(self.snapshot, path) is None:
+                return
+            desired = bool(value)
         self.restore_pending = False
-        self.mesh_staged = bool(value)
+        setattr(self, field, desired)
         self.refresh()
 
-    def cancel_staged(self):
+    def can_install_mod(self, value):
+        return bool(value and value.analysis.get("enabled") is False and value.analysis.get("patchable")
+                    and not value.backup_error and (self.policy == "all"
+                    or (self.policy == "known" and value.analysis.get("known"))))
+
+    def clear_pending(self, *, update_enabled=True):
+        self.apply_waiting = None
+        self.plan_timer.stop()
+        self.plan_key = self.plan_request = self.plan_result = None
+        if self.plan_task is not None:
+            self.plan_task.cancelled.set()
+            self.plan_task = None
         self.staged = None
         self.mesh_staged = None
         self.temperature_staged = None
         self.screws_staged = None
         self.smoothing_staged = None
         self.restore_pending = False
-        self.update_enabled = False
+        self.update_enabled = update_enabled
+        self.update_active = False
+        self.automatic_update_error = ""
+
+    def cancel_staged(self):
+        self.clear_pending(update_enabled=False)
         self.refresh()
 
     def stage_update(self, value):
         if not self.connected or self.busy or self.snapshot is None or self.restore_pending:
             return
+        if ui_checks.check(self.snapshot, "issues") or self.snapshot.recovery:
+            return
         self.update_enabled = bool(value)
         self.refresh()
 
     def stage_restore(self):
-        if self.snapshot is None:
+        if self.snapshot is None or not self.connected or self.busy:
             return
-        paths = engine.restorable(self.snapshot, self.policy == "all")
+        paths = ui_checks.check(self.snapshot, ("restore", self.policy == "all"))
         if not paths:
             return
         names = "\n".join(path.rsplit("/", 1)[-1] for path in sorted(paths))
@@ -1551,37 +1819,88 @@ class Window(QMainWindow):
             self.refresh()
 
     def stage_temperature_toggle(self, value):
-        if self.snapshot is None or self.snapshot.mesh_temperature is None:
-            return
-        self.restore_pending = False
-        self.temperature_staged = bool(value)
-        self.refresh()
+        self.stage_mod_toggle(mesh_temperature.TARGET, "temperature_staged", value)
 
     def stage_screws_toggle(self, value):
-        if self.snapshot is None or self.snapshot.screws is None:
-            return
-        self.restore_pending = False
-        self.screws_staged = bool(value)
-        self.refresh()
+        self.stage_mod_toggle(screws.PYTHON, "screws_staged", value)
 
     def stage_smoothing_toggle(self, value):
-        if self.snapshot is None or engine.mod_snapshot(self.snapshot, smoothing.TARGET) is None:
+        self.stage_mod_toggle(smoothing.TARGET, "smoothing_staged", value)
+
+    def pending_plan(self, choices, needed):
+        scope = (id(self.snapshot), self.snapshot_connection, self.policy, self.restore_pending)
+        if self.apply_waiting != scope:
+            self.apply_waiting = None
+        if not needed or not self.connected or self.snapshot is None:
+            self.apply_waiting = None
+            self.plan_key = self.plan_request = self.plan_result = None
+            self.plan_timer.stop()
+            return None
+        options = {"desired": self.staged, "mesh_desired": self.mesh_staged,
+                   "temperature_desired": self.temperature_staged, "screws_desired": self.screws_staged,
+                   "smoothing_desired": self.smoothing_staged, "restore": self.restore_pending,
+                   "full_risk": self.policy == "all", "update": self.update_active}
+        key = (id(self.snapshot), self.snapshot_connection, self.policy, tuple(options.items()))
+        if key != self.plan_key:
+            self.plan_key, self.plan_result = key, None
+            self.plan_request = (key, self.snapshot, options, choices.copy())
+        if self.plan_result is None and self.plan_task is None and not self.busy and not self.plan_timer.isActive():
+            self.plan_timer.start(35)
+        return self.plan_result
+
+    def validate_pending(self):
+        if self.closing or self.busy or self.plan_task is not None or self.plan_request is None:
             return
-        self.restore_pending = False
-        self.smoothing_staged = bool(value)
-        self.refresh()
+        key, scanned, options, choices = self.plan_request
+
+        def validate(progress):
+            required = set()
+            storage_changed = False
+            try:
+                view, retire, moves = engine.storage_plan(scanned, choices, options["restore"])
+                storage_changed = bool(retire or moves)
+                if not options["restore"] and any(choice is True for choice in choices.values()):
+                    required = engine.automatic_updates(view, choices)
+                engine.prepare_all(view, **options)
+            except (ValueError, SyntaxError, TypeError, UnicodeError) as error:
+                return {"mandatory": required, "error": operation_error_message(error), "storage_changed": storage_changed}
+            return {"mandatory": required, "error": "", "storage_changed": storage_changed}
+
+        task = Task(validate)
+        self.plan_task = task
+        task_ref = weakref.ref(task)
+
+        def finished(result):
+            completed_task = task_ref()
+            if completed_task is None or self.plan_task is not completed_task:
+                return
+            self.plan_task = None
+            if self.closing:
+                return
+            if key == self.plan_key:
+                self.plan_result = result
+            self.refresh()
+            if key == self.plan_key and self.apply_waiting is not None:
+                QTimer.singleShot(0, self.resume_apply)
+
+        task.signals.done.connect(finished)
+        task.signals.error.connect(lambda error: finished({"mandatory": set(), "error": operation_error_message(error),
+                                                         "storage_changed": False}))
+        # Local planning is read-only and must not block editing or closing.
+        threading.Thread(target=task.run, daemon=True, name="pending-changes").start()
 
     def refresh(self):
         snapshot = self.snapshot
-        for field, value in (
-            ("staged", snapshot),
-            ("mesh_staged", snapshot.mesh if snapshot else None),
-            ("temperature_staged", snapshot.mesh_temperature if snapshot else None),
-            ("screws_staged", snapshot.screws if snapshot else None),
-            ("smoothing_staged", engine.mod_snapshot(snapshot, smoothing.TARGET) if snapshot else None),
-        ):
+        untested = bool(snapshot and network.is_untested(snapshot.status))
+        removals = ui_checks.check(snapshot, "removals")
+        issues = ui_checks.check(snapshot, "issues")
+        issues_found = bool(issues or (snapshot and snapshot.recovery))
+        for path, field, name in MOD_CONTROLS:
+            value = engine.mod_snapshot(snapshot, path) if snapshot else None
+            removal = removals.get(path, {})
+            applied = removal.get("present") if untested or removal.get("recovery") else value.analysis["enabled"] if value else None
             staged = getattr(self, field)
-            if value and staged is not None and staged == value.analysis["enabled"]:
+            if not issues_found and applied is not None and staged is not None and staged == applied:
                 setattr(self, field, None)
         device_error = network.compatibility_error(snapshot.status if snapshot else None)
         supported = snapshot is not None and not device_error
@@ -1594,32 +1913,36 @@ class Window(QMainWindow):
         self.compatibility_status.setText(device_error)
         self.compatibility_status.setVisible(bool(snapshot and device_error))
         self.compatibility_status.setToolTip(snapshot.status_error if snapshot else "")
-        restore_paths = engine.restorable(snapshot, self.policy == "all") if snapshot and self.restore_pending else set()
+        restore_paths = ui_checks.check(snapshot, ("restore", self.policy == "all")) if self.restore_pending else set()
         choices = {mods.TARGET: self.staged, mesh.TARGET: self.mesh_staged,
                    mesh_temperature.TARGET: self.temperature_staged, screws.PYTHON: self.screws_staged,
                    smoothing.TARGET: self.smoothing_staged}
-        update_statuses = engine.update_statuses(snapshot) if snapshot else {}
-        outdated_paths = {path for path, status in update_statuses.items() if status["needed"]}
+        update_statuses = ui_checks.check(snapshot, "updates")
+        outdated_paths = engine.outdated_mods(snapshot, update_statuses, issues)
         update_targets = {path for path in outdated_paths if choices.get(path) is not False} if not self.restore_pending else set()
-        blocked_updates = []
-        for path in sorted(update_targets):
-            reason = update_statuses[path]["reason"] if not update_statuses[path]["available"] else ""
-            if not reason and self.policy != "all" and not engine.mod_snapshot(snapshot, path).analysis.get("known"):
-                reason = "Review compatibility before updating this mod."
-            if reason:
-                blocked_updates.append(path.rsplit("/", 1)[-1] + ": " + reason)
-        blocked_reason = "Update blocked:\n" + "\n".join(blocked_updates) if blocked_updates else ""
-        self.update_active = bool(self.update_enabled and update_targets)
+        self.update_active = bool(self.connected and self.update_enabled and update_targets)
         update_paths = set(update_targets) if self.update_active else set()
-        update_error = blocked_reason if self.update_active else ""
-        mandatory_updates = set()
-        if snapshot and not self.restore_pending:
-            try:
-                mandatory_updates = engine.automatic_updates(snapshot, choices)
-                update_paths.update(mandatory_updates)
-            except ValueError as error:
-                update_error = str(error)
-        any_changed, permitted = False, supported and not update_error
+        update_error = ""
+        needs_plan = bool(snapshot and not issues_found and (self.restore_pending or self.update_active or snapshot.storage_moves
+                                       or getattr(snapshot, "storage_cleanup", ())
+                                       or any(choice is not None for choice in choices.values())))
+        plan = self.pending_plan(choices, needs_plan)
+        mandatory_updates = plan["mandatory"] if plan else set()
+        update_paths.update(mandatory_updates)
+        if plan and plan["error"]:
+            update_error = plan["error"]
+        plan_ready = not needs_plan or plan is not None
+        storage_error = snapshot.storage_error if snapshot else ""
+        if (storage_error == engine.INCLUDE_STORAGE_ERROR and self.screws_staged is False
+                and removals.get(screws.PYTHON, {}).get("available") and not self.restore_pending
+                and not self.update_active and not any(choice is True for choice in choices.values())):
+            storage_error = ""
+        any_changed = bool(snapshot and (snapshot.storage_moves or getattr(snapshot, "storage_cleanup", ())))
+        if plan is not None:
+            any_changed = plan.get("storage_changed", False)
+        permitted = self.connected and (supported or untested) and self.policy != "cancel" and not update_error and not storage_error
+        if untested and self.restore_pending:
+            permitted = False
         entries = (
             (mods.TARGET, snapshot, self.staged, self.toggle, self.pending_label,
              self.mod_card, self.mod_opacity),
@@ -1633,8 +1956,21 @@ class Window(QMainWindow):
              self.smoothing_toggle, self.smoothing_pending, self.smoothing_card, self.smoothing_opacity),
         )
         for path, value, staged, toggle, pending, panel, opacity in entries:
-            applied = value.analysis["enabled"] if value else None
-            access = bool(supported and value and (self.policy == "all" or (self.policy == "known" and value.analysis["known"])))
+            removal = removals.get(path, {})
+            recovery_mode = bool(removal.get("recovery") and removal.get("present"))
+            maintenance = untested or recovery_mode
+            applied = removal.get("present", False) if maintenance else value.analysis["enabled"] if value else None
+            removable = bool(removal.get("available") and applied)
+            updatable = bool(untested and applied and value and value.analysis.get("enabled") is True
+                             and not removal.get("recovery")
+                             and value.analysis.get("patchable") and not value.backup_error
+                             and update_statuses.get(path, {}).get("available")
+                             and (self.policy == "all" or (self.policy == "known" and value.analysis.get("known"))))
+            if recovery_mode:
+                access = bool((supported or untested) and removable)
+            else:
+                access = (removable or updatable if applied else self.can_install_mod(value)) if untested else bool(
+                    supported and value and (self.policy == "all" or (self.policy == "known" and value.analysis["known"])))
             toggle.applied = applied is True
             toggle.blockSignals(True)
             toggle.setChecked(staged if staged is not None else applied is True)
@@ -1645,15 +1981,18 @@ class Window(QMainWindow):
             pending.setVisible(bool(changed))
             pending.setToolTip("Restore the initial on-printer original" if path in restore_paths else
                                "Update to latest" if path in update_paths and staged is not False else "Staged change")
-            allowed = bool(self.connected and access and value.analysis.get("patchable", False) and not value.backup_error)
+            allowed = bool(self.connected and access and (removable if maintenance and applied else
+                           maintenance or (value.analysis.get("patchable", False) and not value.backup_error)))
             if changed:
-                permitted &= bool(self.connected and path in restore_paths) if self.restore_pending else allowed
-            panel.setEnabled(bool(self.connected and value and access and not self.busy))
-            opacity.setOpacity(1 if self.connected and value and access else 0.45)
-            toggle.setEnabled(allowed and not self.busy and not self.restore_pending)
+                change_allowed = bool(self.connected and updatable) if maintenance and path in update_paths and staged is not False else allowed
+                permitted &= bool(self.connected and path in restore_paths) if self.restore_pending else change_allowed
+            panel.setEnabled(bool(self.connected and access and not self.busy))
+            opacity.setOpacity(1 if self.connected and access else 0.45)
+            panel.setToolTip(removal.get("reason", "") if maintenance else "")
+            toggle.setEnabled(allowed and not self.busy and not self.restore_pending and not issues_found)
             if path in self.mod_version_rows:
                 files, text = self.mod_version_rows[path]
-                version = engine.version_details(snapshot, path) if snapshot and applied is True else ""
+                version = ui_checks.check(snapshot, ("version", path)) if snapshot and applied is True else ""
                 files.setText(text + (" · " + version if version else ""))
                 files.set_outdated(path in outdated_paths)
         self.heat_details.setEnabled(self.connected)
@@ -1675,6 +2014,9 @@ class Window(QMainWindow):
         for widget in (self.add_button, self.review_button):
             widget.setEnabled(not self.busy)
         self.scan_button.setEnabled(self.connected and not self.busy)
+        repair_available = bool(snapshot and snapshot.recovery and snapshot.recovery.get("available"))
+        self.repair_button.setVisible(repair_available)
+        self.repair_button.setEnabled(self.connected and not self.busy and repair_available)
         count = len(update_targets)
         self.update_label.setText(f"Update {count} outdated {'mod' if count == 1 else 'mods'}")
         self.update_toggle.setAccessibleName(self.update_label.text())
@@ -1682,23 +2024,33 @@ class Window(QMainWindow):
         self.update_toggle.blockSignals(True)
         self.update_toggle.setChecked(bool(self.update_enabled or mandatory_updates))
         self.update_toggle.blockSignals(False)
-        self.update_toggle.setEnabled(bool(supported and self.connected and self.policy != "cancel" and update_targets
-                                           and not self.busy and not mandatory_updates))
-        self.update_control.setToolTip(blocked_reason or ("Updates are required when enabling another mod." if mandatory_updates
-            else "Update active outdated mods in the same Apply batch; mods turned off will be removed instead."))
+        self.update_toggle.setEnabled(bool((supported or untested) and self.connected and self.policy != "cancel" and update_targets
+                                           and not self.busy and not mandatory_updates and not issues_found))
+        self.update_control.setToolTip("Updates are required when enabling another mod." if mandatory_updates
+            else "Update active outdated mods in the same Apply batch; mods turned off will be removed instead.")
         self.cancel_button.setEnabled(not self.busy and (self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.screws_staged is not None or self.smoothing_staged is not None or self.restore_pending or self.update_active))
         self.original_button.setEnabled(bool(self.connected and snapshot and not self.busy
-                                             and engine.restorable(snapshot, self.policy == "all")))
+                                             and ui_checks.check(snapshot, ("restore", self.policy == "all"))))
         updates_only = bool(update_paths) and not self.restore_pending and all(value is None for value in choices.values())
-        self.apply_button.idle_text = "Update" if updates_only else "Apply"
-        self.apply_button.active_text = "Updating…" if updates_only else "Applying…"
+        action_name = "fixIssuesAction" if issues_found else "primary"
+        if self.apply_button.objectName() != action_name:
+            self.apply_button.setObjectName(action_name)
+            self.apply_button.style().unpolish(self.apply_button)
+            self.apply_button.style().polish(self.apply_button)
+            self.apply_button.update()
+        self.apply_button.idle_text = "Fix issues" if issues_found else "Update" if updates_only else "Apply"
+        self.apply_button.active_text = "Fixing issues…" if issues_found else "Updating…" if updates_only else "Applying…"
         self.apply_button.setText(self.apply_button.active_text if self.apply_button.running else self.apply_button.idle_text)
-        self.apply_button.setEnabled(bool(permitted and any_changed and not self.busy))
-        self.preview_button.setEnabled(self.apply_button.isEnabled())
-        if update_error or self.automatic_update_error:
-            self.apply_button.setToolTip(update_error)
-            self.preview_button.setToolTip(update_error or "Review all staged printer-file changes before applying")
-        self.automatic_update_error = update_error
+        self.apply_button.setEnabled(bool(self.connected and not self.busy) if issues_found else bool(permitted and any_changed and not self.busy))
+        self.preview_button.setEnabled(not issues_found and self.apply_button.isEnabled() and plan_ready)
+        if not self.apply_button.isEnabled():
+            self.apply_waiting = None
+        apply_error = ("Review detected issues before changing mods." if issues_found else
+                       update_error or storage_error or ("Checking changes…" if needs_plan and not plan_ready else ""))
+        if apply_error or self.automatic_update_error:
+            self.apply_button.setToolTip(apply_error)
+            self.preview_button.setToolTip(apply_error or "Review all staged printer-file changes before applying")
+        self.automatic_update_error = apply_error
 
     def preview(self):
         try:
@@ -1755,14 +2107,42 @@ class Window(QMainWindow):
         layout.addWidget(close)
         dialog.exec()
 
+    def resume_apply(self):
+        scope = (id(self.snapshot), self.snapshot_connection, self.policy, self.restore_pending)
+        if self.apply_waiting == scope and self.plan_result is not None:
+            self.apply_waiting = None
+            if (not self.plan_result["error"] and not ui_checks.check(self.snapshot, "issues")
+                    and not getattr(self.snapshot, "recovery", None)):
+                self.apply_clicked()
+
     def apply_clicked(self):
-        if self.snapshot is None or not self.connected:
+        if self.snapshot is None or not self.connected or self.closing or self.busy or not self.apply_button.isEnabled():
             return
+        issues = ui_checks.check(self.snapshot, "issues")
+        if issues or self.snapshot.recovery:
+            self.apply_waiting = None
+            try:
+                connection = self.connection()
+                if self.snapshot_connection != (connection.host, connection.username):
+                    raise ValueError("Scan the selected printer before fixing issues.")
+            except (ValueError, SyntaxError) as error:
+                QMessageBox.warning(self, "Cannot fix issues", str(error))
+                return
+            if issues:
+                self.review_firmware_issues(self.snapshot, connection)
+            else:
+                self.repair_startup()
+            return
+        if self.plan_key is not None and self.plan_result is None:
+            self.apply_waiting = (id(self.snapshot), self.snapshot_connection, self.policy, self.restore_pending)
+            self.plan_timer.stop()
+            self.validate_pending()
+            return
+        self.apply_waiting = None
         try:
             connection = self.connection()
             if self.snapshot_connection != (connection.host, connection.username):
                 raise ValueError("Scan the selected printer before Apply.")
-            engine.prepare_all(self.snapshot, self.staged, self.mesh_staged, self.restore_pending, self.policy == "all", self.temperature_staged, self.screws_staged, update=self.update_active, smoothing_desired=self.smoothing_staged)
         except (ValueError, SyntaxError) as error:
             QMessageBox.warning(self, "Cannot apply", str(error))
             return
@@ -1906,6 +2286,10 @@ class Window(QMainWindow):
                 event.ignore()
                 return
             self.closing = True
+            self.apply_waiting = None
+            self.plan_timer.stop()
+            if self.plan_task is not None:
+                self.plan_task.cancelled.set()
             if self.scanning and self.active_task is not None:
                 self.active_task.cancelled.set()
             self.discovery_stop.set()

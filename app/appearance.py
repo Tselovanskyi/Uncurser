@@ -19,6 +19,10 @@ QDialog QPushButton#primary { background: #42d9e8; color: #082027; font-weight: 
 QDialog QPushButton#primary:enabled:hover { background: #79eaf4; }
 QDialog QPushButton#primary:enabled:pressed { background: #20a9b9; }
 QDialog QPushButton#primary:disabled { background: #101010; color: #666666; }
+QDialog QPushButton#fixIssues { background: #238636; color: #ffffff; font-weight: 600; }
+QDialog QPushButton#fixIssues:enabled:hover { background: #2ea043; }
+QDialog QPushButton#fixIssues:enabled:pressed { background: #196c2e; }
+QDialog QPushButton#fixIssues:disabled { background: #101010; color: #555555; }
 QDialog QPushButton#risk { font-size: 10pt; min-width: 0; padding: 6px 10px; background: transparent; color: #aaaaaa; }
 QDialog QPushButton#risk:enabled:hover { background: transparent; color: #ffffff; }
 QDialog QPushButton#risk:enabled:pressed { background: transparent; color: #42d9e8; }

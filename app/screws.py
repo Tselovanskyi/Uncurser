@@ -4,12 +4,14 @@ import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import mesh, mods
-from .config_blocks import SCREWS_INCLUDE, strip_screws_include
+from . import mesh, mods, storage
+from .config_blocks import (SCREWS_CONFIG, LEGACY_SCREWS_CONFIG, SCREWS_INCLUDE,
+                            screws_include_path, strip_screws_include)
 
 MOD_ID = "bed_screws_v1"
 PYTHON = "/usr/share/klipper/klippy/extras/screws_tilt_adjust.py"
-CONFIG = "/mnt/UDISK/printer_data/config/screws_tilt_adjust.cfg"
+CONFIG = SCREWS_CONFIG
+LEGACY_CONFIG = LEGACY_SCREWS_CONFIG
 
 
 @dataclass(frozen=True)
@@ -18,8 +20,7 @@ class HelperFile:
 
     @property
     def ORIGINAL(self):
-        stem, suffix = self.TARGET.rsplit(".", 1)
-        return stem + (".ptn" if suffix == "py" else ".cfn") + ".Original.txt"
+        return storage.original(self.TARGET)
 
     @property
     def MANIFEST(self):
@@ -31,6 +32,8 @@ class HelperFile:
 
 
 FILES = (HelperFile(PYTHON), HelperFile(CONFIG))
+LEGACY_FILE = HelperFile(LEGACY_CONFIG)
+SCAN_FILES = (*FILES, LEGACY_FILE)
 
 
 def recognized(path, data):
@@ -60,7 +63,7 @@ def validate(path, data):
 def edit_include(data, enabled):
     regular, generated = mesh.split(data)
     base, current = strip_screws_include(regular)
-    if enabled == current:
+    if enabled == current and (not enabled or screws_include_path(regular) == CONFIG):
         return data
     newline = "\r\n" if "\r\n" in regular else "\n"
     result = ((SCREWS_INCLUDE.replace("\n", newline) if enabled else "") + base + generated).encode()
@@ -70,24 +73,27 @@ def edit_include(data, enabled):
 
 def inspect(root, files, included, patterns):
     try:
-        _, enabled = strip_screws_include(mesh.split(root.data)[0])
+        active_config = screws_include_path(mesh.split(root.data)[0])
+        enabled = active_config is not None
         sections = {"screws_tilt_adjust", "gcode_macro SCREWS_TILT_CALCULATE",
                     "gcode_macro _ORIGIN_SCREWS_TILT_CALCULATE"}
         for path, data in included.items():
-            if path == CONFIG and enabled:
+            if path == active_config:
                 continue
             regular, generated = mesh.split(data)
             if sections.intersection(mesh.parser(regular).sections()) or sections.intersection(mesh.generated_parser(generated).sections()):
                 raise ValueError("A bed screw helper is already defined in " + path)
-        if enabled != (CONFIG in included):
+        if enabled and active_config not in included:
             raise ValueError("The helper include and active configuration do not agree.")
         for pattern in patterns:
-            if fnmatch.fnmatchcase(CONFIG, pattern) and (not enabled or pattern != CONFIG):
+            if any(fnmatch.fnmatchcase(path, pattern) and path != active_config
+                   for path in (CONFIG, LEGACY_CONFIG)) or (active_config is not None
+                   and fnmatch.fnmatchcase(active_config, pattern) and pattern != active_config):
                 raise ValueError("An existing include would also load the helper: " + pattern)
         for path, value in files.items():
             if path in included and included[path] != value.data:
                 raise ValueError("A helper file changed during the scan; scan again: " + path)
-            expected = payload(path) if enabled else None
+            expected = payload(path) if enabled and path in (PYTHON, active_config) else None
             actual = value.data.replace(b"\r\n", b"\n") if value.data is not None else None
             if actual != expected:
                 raise ValueError("An existing, edited, or incomplete helper needs review: " + path)

@@ -22,7 +22,8 @@ def snapshot(enabled=False):
         original = originals()[module.TARGET]
         data = module.transform(original, True) if enabled else original
         setattr(current, name, engine.MeshSnapshot(data, mods.digest(data), module.inspect(data, original),
-            original if enabled else None, mods.digest(original) if enabled else None))
+            original if enabled else None, mods.digest(original) if enabled else None,
+            original_identity=("F008", "1.1.6.4") if enabled else None))
     return current
 
 
@@ -33,6 +34,7 @@ def install_records(current, prepared):
         value.sha256 = mods.digest(value.data)
         value.original = originals()[module.TARGET]
         value.original_hash = mods.digest(value.original)
+        value.original_identity = ("F008", "1.1.6.4")
         value.analysis = module.inspect(value.data, value.original)
     ledger = prepared[mod_versions.TARGET]
     current.versions = engine.MeshSnapshot(ledger, mods.digest(ledger),

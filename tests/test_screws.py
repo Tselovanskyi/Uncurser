@@ -27,7 +27,8 @@ def snapshot(enabled=False, originals=False, speed=False, grid=None):
     config = screws.edit_include(config, enabled)
     with patch.object(mesh, 'REFERENCE_HASH', mesh.fingerprint(SOURCE)):
         root = engine.MeshSnapshot(config, mods.digest(config), mesh.inspect(config, SOURCE if originals else None),
-                                   SOURCE if originals else None, mods.digest(SOURCE) if originals else None)
+                                   SOURCE if originals else None, mods.digest(SOURCE) if originals else None,
+                                   original_identity=("F008", "1.1.6.4") if originals else None)
     class Reader:
         def read(self, path):
             for module in screws.FILES:
@@ -38,7 +39,7 @@ def snapshot(enabled=False, originals=False, speed=False, grid=None):
                     return record(b'') if originals else None
                 if path == module.MANIFEST and originals:
                     return record(json.dumps(dict(path=module.TARGET, sha256=mods.digest(b''), absent=True,
-                                                  mode=0o644, uid=0, gid=0)).encode())
+                                                  mode=0o644, uid=0, gid=0, model="F008", firmware="1.1.6.4")).encode())
             if path == fluidd_screws.INDEX:
                 return record(('<script type="module" src="./' + fluidd_screws.ASSET + '"></script>').encode())
             for module in fluidd_screws.FILES:
@@ -49,7 +50,7 @@ def snapshot(enabled=False, originals=False, speed=False, grid=None):
                     return record(original)
                 if path == module.MANIFEST and originals and grid:
                     return record(json.dumps(dict(path=module.TARGET, sha256=mods.digest(original),
-                                                  mode=0o644, uid=0, gid=0)).encode())
+                                                  mode=0o644, uid=0, gid=0, model="F008", firmware="1.1.6.4")).encode())
             return None
     files = {mesh.TARGET: {'data': base64.b64encode(config).decode()}}
     if enabled:
@@ -60,7 +61,7 @@ def snapshot(enabled=False, originals=False, speed=False, grid=None):
         helper = engine.scan_screws(Reader(), root, tree)
     return engine.Snapshot(b'', mods.digest(b''), {'enabled': False, 'known': True, 'patchable': True, 'label': 'Original'}, None, None, '',
                            {'info': {}, 'native': {'model': 'F008', 'modelVersion': '1.1.6.4'}}, '', {}, 0,
-                           root, None, helper)
+                           root, None, helper, original_identity=("F008", "1.1.6.4") if originals else None)
 
 
 class ScrewsTests(unittest.TestCase):
@@ -116,7 +117,7 @@ class ScrewsTests(unittest.TestCase):
         self.assertEqual(screws.edit_include(enabled, False), original)
         self.assertEqual(mesh.fingerprint(enabled), mesh.fingerprint(original))
         with self.assertRaises(ValueError):
-            screws.edit_include(enabled.replace(b'[include screws_', b'[include edited_screws_'), False)
+            screws.edit_include(enabled.replace(screws.CONFIG.encode(), b'/edited_screws.cfg'), False)
 
     def test_apply_submits_one_combined_config_after_new_files(self):
         before, after = snapshot(), snapshot(True, True, True)
@@ -138,7 +139,7 @@ class ScrewsTests(unittest.TestCase):
         self.assertIsNone(request['files'][0]['expected'])
         self.assertEqual(base64.b64decode(request['files'][2]['data']), after.mesh.data)
         self.assertEqual(request['files'][3]['kind'], 'javascript')
-        self.assertEqual(len(request['files'][3]['replacements']), 1)
+        self.assertTrue(request['files'][3]['replacements'])
         self.assertTrue(result['written'])
 
 

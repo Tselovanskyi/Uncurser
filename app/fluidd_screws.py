@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import mods
+from . import mods, storage
 
 TARGET = "/usr/share/fluidd/assets/index-DAJGCJUz.js"
 INDEX = "/usr/share/fluidd/index.html"
@@ -28,7 +28,7 @@ class FluiddFile:
 
     @property
     def ORIGINAL(self):
-        return self.TARGET.removesuffix(".js") + ".jfn.Original.txt"
+        return storage.original(self.TARGET)
 
     @property
     def MANIFEST(self):

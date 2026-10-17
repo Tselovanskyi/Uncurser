@@ -27,19 +27,19 @@ def installed_snapshot():
         analysis = {"known": True, "enabled": True, "patchable": True,
                     "label": "Uncursed", "reason": ""}
         files[path] = engine.MeshSnapshot(data, mods.digest(data), analysis,
-                                         original, mods.digest(original))
+                                         original, mods.digest(original), original_identity=("F008", "1.1.6.4"))
     heating = files[mods.TARGET]
     return engine.Snapshot(heating.data, heating.sha256, heating.analysis,
                            heating.original, heating.original_hash, "", STATUS, "",
                            {"history": True}, 0, files[mesh.TARGET],
-                           files[mesh_temperature.TARGET])
+                           files[mesh_temperature.TARGET], original_identity=("F008", "1.1.6.4"))
 
 
 def helper_ready_snapshot(stamped=False):
     current = installed_snapshot()
     current.screws = test_screws.snapshot().screws
     if stamped:
-        records = {path: mod_versions.capture(path, original, engine.file_snapshot(current, path).data)
+        records = {path: mod_versions.capture(path, original, engine.file_snapshot(current, path).data, firmware="1.1.6.4")
                    for path, original in SOURCES.items()}
         ledger = mod_versions.dump(records)
         current.versions = engine.MeshSnapshot(ledger, mods.digest(ledger),
@@ -71,8 +71,7 @@ class ModVersionTests(unittest.TestCase):
                     self.assertTrue(status["needed"])
                     self.assertFalse(status["available"])
                     self.assertIn("backup", status["reason"])
-                    with self.assertRaisesRegex(ValueError, "Cannot update"):
-                        engine.prepare_all(broken, None, update=True)
+                    self.assertEqual(engine.prepare_all(broken, None, update=True), {})
         helper = test_screws.snapshot(True, True)
         self.assertEqual(engine.update_statuses(helper)[screws.PYTHON],
                          {"needed": True, "available": True, "reason": ""})
@@ -97,9 +96,10 @@ class ModVersionTests(unittest.TestCase):
         unknown.mesh.analysis["known"] = False
         unknown.mesh.analysis["reason"] = "Unrecognised manual changes"
         self.assertTrue(engine.update_statuses(unknown)[mesh.TARGET]["available"])
+        self.assertEqual(engine.prepare_all(unknown, None, update=True), {})
         with self.assertRaisesRegex(ValueError, "unknown files"):
-            engine.prepare_all(unknown, None, update=True)
-        updated = engine.prepare_all(unknown, None, update=True, full_risk=True)
+            engine.prepare_all(unknown, None, mesh_desired=True)
+        updated = engine.prepare_all(unknown, None, mesh_desired=True, full_risk=True)
         self.assertEqual(mod_versions.load(updated[mod_versions.TARGET])[mesh.TARGET]["version"], mod_versions.VERSIONS[mesh.TARGET])
         disabled = engine.prepare_all(unknown, None, mesh_desired=False, update=True, full_risk=True)
         self.assertEqual(disabled[mesh.TARGET], test_mesh.SOURCE)
@@ -111,8 +111,7 @@ class ModVersionTests(unittest.TestCase):
         self.assertTrue(status["needed"])
         self.assertFalse(status["available"])
         self.assertIn("differs from its undo record", status["reason"])
-        with self.assertRaisesRegex(ValueError, "Cannot update printer.cfg"):
-            engine.prepare_all(current, None, update=True)
+        self.assertEqual(engine.prepare_all(current, None, update=True), {})
 
         helper = test_screws.snapshot(True, True)
         record = engine.capture_helper(engine.helper_baseline(helper), engine.helper_current(helper))
@@ -122,8 +121,7 @@ class ModVersionTests(unittest.TestCase):
             {"known": True, "enabled": True, "patchable": True},
             original_hash=mods.digest(b""), original_absent=True)
         helper.screws.analysis.update(patchable=False, reason="Latest helper code needs review")
-        with self.assertRaisesRegex(ValueError, "Cannot update screws_tilt_adjust.py"):
-            engine.prepare_all(helper, None, update=True)
+        self.assertEqual(engine.prepare_all(helper, None, update=True), {})
         # Explicitly turning a blocked update off still uses its valid saved undo.
         removed = engine.prepare_all(helper, None, screws_desired=False, update=True)
         self.assertIsNone(removed[screws.PYTHON])
@@ -141,8 +139,9 @@ class ModVersionTests(unittest.TestCase):
             self.assertIn("version records need attention", status["reason"])
         self.assertFalse(any(status["needed"] and status["available"]
                              for status in engine.update_statuses(current).values()))
-        with self.assertRaisesRegex(ValueError, "version records need attention"):
-            engine.prepare_all(current, None, update=True)
+        self.assertEqual(engine.prepare_all(current, None, update=True), {})
+        with self.assertRaisesRegex(ValueError, "version records do not match"):
+            engine.prepare_all(current, True)
         current.analysis["known"] = False
         current.analysis["reason"] = "Unknown printer code"
         unknown = engine.update_statuses(current)[mods.TARGET]
@@ -215,7 +214,7 @@ class ModVersionTests(unittest.TestCase):
         current = installed_snapshot()
         removal_only = engine.prepare_all(current, False, update=False)
         self.assertEqual(removal_only, {mods.TARGET: test_mods.SOURCE})
-        combined = engine.prepare_all(current, False, update=True)
+        combined = engine.prepare_all(current, False, mesh_desired=True, temperature_desired=True, update=True)
         self.assertEqual(combined[mods.TARGET], test_mods.SOURCE)
         records = mod_versions.load(combined[mod_versions.TARGET])
         self.assertEqual(set(records), {mesh.TARGET, mesh_temperature.TARGET})
@@ -229,7 +228,7 @@ class ModVersionTests(unittest.TestCase):
                           if status["needed"] and status["available"]}, set(SOURCES))
         for path in SOURCES:
             self.assertEqual(engine.version_details(current, path), "v0.1.5")
-        pending = engine.prepare_all(current, None, update=True)
+        pending = engine.prepare_all(current, True, mesh_desired=True, temperature_desired=True)
         self.assertEqual(set(pending), {*SOURCES, mod_versions.TARGET})
         records = mod_versions.load(pending[mod_versions.TARGET])
         self.assertEqual(set(records), set(SOURCES))
@@ -255,7 +254,7 @@ class ModVersionTests(unittest.TestCase):
                     current.versions = engine.MeshSnapshot(ledger, mods.digest(ledger),
                         {'known': True, 'enabled': True, 'patchable': True},
                         original_hash=mods.digest(b''), original_absent=True)
-                pending = engine.prepare_all(current, None, update=True)
+                pending = engine.prepare_all(current, None, mesh_desired=True, update=True)
                 record = mod_versions.load(pending[mod_versions.TARGET])[mesh.TARGET]
                 self.assertEqual(mesh.Document(pending[mesh.TARGET]).raw[('bed_mesh', 'speed')], '600')
                 self.assertEqual(record['version'], mod_versions.VERSIONS[mesh.TARGET])
@@ -426,7 +425,8 @@ class ModVersionTests(unittest.TestCase):
                     patch.object(engine, "Remote", return_value=remote), \
                     patch.object(engine.network, "status", return_value=STATUS), \
                     patch.object(engine.network, "require_idle"):
-                result = engine.apply(Connection("192.0.2.1"), harness.root / "unused", current, None, update=True)
+                result = engine.apply(Connection("192.0.2.1"), harness.root / "unused", current, True,
+                                      mesh_desired=True, temperature_desired=True)
             self.assertEqual([item["path"] for item in requests[0]["files"]], [mod_versions.TARGET])
             self.assertEqual(requests[0]["guards"][dependency], dependency_hash)
             self.assertEqual(requests[0]["patterns"][pattern], members)
@@ -443,7 +443,7 @@ class ModVersionTests(unittest.TestCase):
         baseline = test_mesh.SOURCE.replace(b"horizontal_move_z: 5", b"horizontal_move_z: 4")
         current.mesh.data = mesh.transform(baseline, True)
         current.mesh.sha256 = mods.digest(current.mesh.data)
-        old_record = mod_versions.capture(mesh.TARGET, baseline, current.mesh.data)
+        old_record = mod_versions.capture(mesh.TARGET, baseline, current.mesh.data, firmware="1.1.6.4")
         ledger = mod_versions.dump({mesh.TARGET: old_record})
         current.versions = engine.MeshSnapshot(ledger, mods.digest(ledger),
             {"known": True, "enabled": True, "patchable": True},

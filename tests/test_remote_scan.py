@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app.mods import digest
-from app.remote import Connection, READ, READ_MANY, Remote
+from app.remote import CONFIG_TREE, Connection, READ, READ_MANY, Remote
 
 
 def local_command(program, payload):
@@ -86,6 +86,22 @@ class RemoteScanTests(unittest.TestCase):
         self.assertIn("supported size", records[str(large)]["error"])
         if link:
             self.assertIn("regular file", records[str(link)]["error"])
+
+    def test_config_tree_allows_only_the_owned_external_helper_path(self):
+        config = self.root / "config"
+        config.mkdir()
+        root = config / "printer.cfg"
+        helper = self.root / "screws_tilt_adjust.cfg"
+        helper.write_text("[screws_tilt_adjust]\nscrew1: 10, 10\n", encoding="utf-8")
+        program = CONFIG_TREE.replace('"/usr/share/klipper/klippy/extras/screws_tilt_adjust.cfg"', repr(str(helper)))
+        root.write_text("[include " + str(helper) + "]\n[printer]\nkinematics: corexy\n", encoding="utf-8")
+        result = local_command(program, {"path": str(root)})
+        self.assertEqual(set(result["files"]), {str(root), str(helper)})
+        unrelated = self.root / "other.cfg"
+        unrelated.write_bytes(helper.read_bytes())
+        root.write_text("[include " + str(unrelated) + "]\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "outside"):
+            local_command(program, {"path": str(root)})
 
     def test_prefetch_cache_is_fresh_per_call_and_unknown_paths_use_normal_read(self):
         good, missing, extra = (self.root / name for name in ("good.cfg", "missing.cfg", "extra.cfg"))
