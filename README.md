@@ -4,6 +4,8 @@
 **[Download latest release](https://github.com/Tselovanskyi/Uncurser/releases/latest)**  
 (No installation needed)
 
+You might need to enable Root access on your printer.
+
 Currently supports Creality K2 Plus firmware 1.1.6.4 and 1.1.7.0. Tested only with the latest Orca.
 > [!TIP]
 >Erase "G-code thumbnails" field in Orca's printer settings so the printer firmware can reach the values needed for Adaptive Bed Mesh, otherwise they're burried too deep in generated G-Code behind the thumbnail code.
