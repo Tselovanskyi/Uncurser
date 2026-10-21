@@ -101,12 +101,13 @@ class EmptyRecordBatchTests(unittest.TestCase):
             "original_absent": False, "may_capture_original": False,
             "reference": "fixture", "restore": False, "kind": "json", "recovery": "records"}]}
 
-    def test_deletion_preserves_recovery_copy_without_inventing_an_original_proof(self):
+    def test_deletion_cleans_recovery_copy_without_inventing_an_original_proof(self):
         request = self.request({})
         result = self.batch.run_request(request)
         self.assertEqual(result["saved"], [str(self.path)])
         self.assertFalse(self.path.exists())
-        self.assertEqual(self.backup.read_bytes(), self.before)
+        self.assertFalse(self.backup.exists())
+        self.assertIn(str(self.backup), result["recovery_removed"])
         self.assertFalse(list(self.batch.root.rglob("*.Original.txt*")))
         self.batch.assert_no_candidates()
 
@@ -136,11 +137,11 @@ class EmptyRecordBatchTests(unittest.TestCase):
                                   record_targets=[mesh.TARGET])
         return request, records
 
-    def test_update_adds_only_new_mod_and_preserves_other_records_without_creating_proofs(self):
+    def test_update_adds_only_new_mod_and_cleans_recovery_without_creating_proofs(self):
         request, records = self.update_request()
         self.batch.run_request(request)
         self.assertEqual(mod_versions.load(self.path.read_bytes()), records)
-        self.assertEqual(self.backup.read_bytes(), self.before)
+        self.assertFalse(self.backup.exists())
         self.assertFalse(list(self.batch.root.rglob("*.Original.txt*")))
         self.batch.assert_no_candidates()
 

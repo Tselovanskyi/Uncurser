@@ -9,13 +9,13 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from app import engine, fluidd_categories, mod_versions, mods, network, screws
+from app import engine, fluidd_categories, fluidd_screws, mod_versions, mods, network, removal, screws
 from tests.test_screws import snapshot
 from tests import test_storage_batch as storage_tests
 
 
 PREFERENCES = {"categories": [{"id": "tools", "name": "Tools"}],
-               "stored": [{"name": "screws_tilt_calculate", "categoryId": "tools",
+               "stored": [{"name": "bed_screw_helper", "categoryId": "tools",
                            "visible": False, "alias": "Alignment", "order": 4}], "expanded": [0]}
 
 
@@ -77,6 +77,107 @@ class CategoryApplyTests(unittest.TestCase):
         updated = mod_versions.load(prepared.get(mod_versions.TARGET, current.versions.data))
         self.assertEqual(updated[screws.PYTHON]["fluidd_category"],
                          engine.installed_records(current)[screws.PYTHON]["fluidd_category"])
+
+    def test_old_same_revision_wrapper_and_category_update_from_saved_undo(self):
+        current = installed()
+        records = engine.installed_records(current)
+        helper = records[screws.PYTHON]
+        helper["fluidd_category"].pop("macro")
+        # Represent the previous 0.1.17 installation, using its recorded
+        # contents rather than adding an old implementation to app code.
+        config = engine.file_snapshot(current, screws.CONFIG)
+        config.data = config.data.replace(
+            ("[gcode_macro BED_SCREW_HELPER]\ngcode:\n  " + screws.COMMAND + " {rawparams}").encode(),
+            b"[gcode_macro SCREWS_TILT_CALCULATE]\nrename_existing: _ORIGIN_SCREWS_TILT_CALCULATE\ngcode:\n  _ORIGIN_SCREWS_TILT_CALCULATE {rawparams}")
+        config.sha256 = mods.digest(config.data)
+        helper["files"][screws.CONFIG]["created"] = config.data.decode()
+        frontend = engine.file_snapshot(current, fluidd_screws.TARGET)
+        frontend.data = frontend.data.replace(b'sendGcode("BED_SCREW_HELPER"', b'sendGcode("SCREWS_TILT_CALCULATE"')
+        frontend.sha256 = mods.digest(frontend.data)
+        for change in helper["files"][fluidd_screws.TARGET]["undo"]:
+            change["after"] = change["after"].replace('sendGcode("BED_SCREW_HELPER"', 'sendGcode("SCREWS_TILT_CALCULATE"')
+        current.fluidd_macros["stored"][0]["name"] = fluidd_categories.LEGACY_MACRO
+        data = mod_versions.dump(records)
+        current.versions.data, current.versions.sha256 = data, mods.digest(data)
+        self.assertTrue(engine.update_statuses(current)[screws.PYTHON]["needed"])
+        prepared = engine.prepare_all(current, None, update=True)
+        self.assertIn(b"[gcode_macro BED_SCREW_HELPER]", prepared[screws.CONFIG])
+        self.assertNotIn(b"rename_existing", prepared[screws.CONFIG])
+        pairs = engine.helper_js_replacements(current, prepared[fluidd_screws.TARGET])
+        body = frontend.data.decode()
+        for before, after in pairs:
+            self.assertEqual(body.count(before), 1)
+            body = body.replace(before, after, 1)
+        self.assertEqual(body.encode(), prepared[fluidd_screws.TARGET])
+        change = engine.category_change(current, prepared)
+        previous = deepcopy(PREFERENCES["stored"][0])
+        previous["name"] = fluidd_categories.LEGACY_MACRO
+        self.assertEqual(change["value"]["stored"][0], previous)
+        self.assertEqual(change["value"]["stored"][1],
+                         {"name": "bed_screw_helper", "categoryId": "uncurser"})
+        updated = mod_versions.load(prepared[mod_versions.TARGET])[screws.PYTHON]
+        self.assertEqual(updated["fluidd_category"]["macro"], "bed_screw_helper")
+        verified = deepcopy(current)
+        for path, content in prepared.items():
+            value = engine.file_snapshot(verified, path)
+            value.data, value.sha256 = content, mods.digest(content) if content is not None else None
+        verified.fluidd_macros = change["value"]
+        self.assertFalse(engine.update_statuses(verified)[screws.PYTHON]["needed"])
+
+    def test_same_revision_public_handler_updates_without_changing_macro_preferences(self):
+        current = installed()
+        records = engine.installed_records(current)
+        helper = records[screws.PYTHON]
+        source = engine.file_snapshot(current, screws.PYTHON)
+        source.data = source.data.replace(('"' + screws.COMMAND + '"').encode(), b'"SCREWS_TILT_CALCULATE"')
+        source.data = source.data.replace(b"cmd__UNCURSER_BED_SCREW_HELPER", b"cmd_SCREWS_TILT_CALCULATE")
+        source.data = source.data.replace(('"' + screws.SAVE_COMMAND + '"').encode(), b'"SCREWS_TILT_SAVE_MESH"')
+        source.data = source.data.replace(b"cmd__UNCURSER_BED_SCREW_SAVE_MESH", b"cmd_SCREWS_TILT_SAVE_MESH")
+        source.sha256 = mods.digest(source.data)
+        helper["files"][screws.PYTHON]["created"] = source.data.decode()
+        config = engine.file_snapshot(current, screws.CONFIG)
+        config.data = config.data.replace(screws.COMMAND.encode(), b"SCREWS_TILT_CALCULATE")
+        config.sha256 = mods.digest(config.data)
+        helper["files"][screws.CONFIG]["created"] = config.data.decode()
+        frontend = engine.file_snapshot(current, fluidd_screws.TARGET)
+        entry = helper["files"][fluidd_screws.TARGET]
+        for before, after in fluidd_screws.DIALOG_EDITS:
+            if "t.push" in before or before.startswith("show_screws_tilt_adjust_dialog_automatically:"):
+                frontend.data = frontend.data.replace(after.encode(), before.encode())
+                entry["undo"] = [change for change in entry["undo"] if change["after"] != after]
+        frontend.data = frontend.data.replace(screws.SAVE_COMMAND.encode(), b"SCREWS_TILT_SAVE_MESH")
+        frontend.sha256 = mods.digest(frontend.data)
+        for change in entry["undo"]:
+            change["after"] = change["after"].replace(screws.SAVE_COMMAND, "SCREWS_TILT_SAVE_MESH")
+        data = mod_versions.dump(records)
+        current.versions.data, current.versions.sha256 = data, mods.digest(data)
+        status = engine.update_statuses(current)[screws.PYTHON]
+        self.assertTrue(status["needed"])
+        self.assertTrue(status["available"], status["reason"])
+        prepared = engine.prepare_all(current, None, update=True)
+        self.assertIn(('register_command("' + screws.COMMAND + '"').encode(), prepared[screws.PYTHON])
+        self.assertNotIn(b'register_command("SCREWS_TILT_CALCULATE"', prepared[screws.PYTHON])
+        self.assertIn(screws.COMMAND.encode() + b" {rawparams}", prepared[screws.CONFIG])
+        self.assertIsNone(engine.category_change(current, prepared))
+        updated = mod_versions.load(prepared[mod_versions.TARGET])[screws.PYTHON]
+        self.assertEqual(updated["version"], helper["version"])
+        self.assertEqual(updated["fluidd_category"], helper["fluidd_category"])
+        body = frontend.data.decode()
+        for before, after in engine.helper_js_replacements(current, prepared[fluidd_screws.TARGET]):
+            self.assertEqual(body.count(before), 1)
+            body = body.replace(before, after, 1)
+        self.assertEqual(body.encode(), prepared[fluidd_screws.TARGET])
+        for path, content in prepared.items():
+            value = engine.file_snapshot(current, path)
+            value.data, value.sha256 = content, mods.digest(content) if content is not None else None
+        self.assertFalse(engine.update_statuses(current)[screws.PYTHON]["needed"])
+        removed = engine.prepare_all(current, None, screws_desired=False)
+        self.assertIsNone(removed[screws.PYTHON])
+        self.assertIsNone(removed[screws.CONFIG])
+
+    def test_bare_source_with_private_commands_is_still_detected_as_a_leftover(self):
+        value = engine.MeshSnapshot(screws.payload(screws.PYTHON), None, {})
+        self.assertTrue(removal.inspect({screws.PYTHON: value}, {})[screws.PYTHON]["present"])
 
     def test_failed_preferences_read_blocks_helper_install_without_making_network_calls(self):
         current = snapshot()

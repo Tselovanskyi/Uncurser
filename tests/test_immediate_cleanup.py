@@ -15,7 +15,7 @@ PENDING_FIELDS = ("staged", "mesh_staged", "temperature_staged", "screws_staged"
 class ImmediateCleanupTests(unittest.TestCase):
     def window(self):
         scanned = SimpleNamespace(status={"native": {"model": "F008", "modelVersion": "1.1.7.0"}},
-                                  _ui_checks={"removals": {}}, storage_moves=(), storage_cleanup=(), storage_error="")
+                                  _ui_checks={"removals": {}}, storage_moves=(), storage_cleanup=(), recovery_cleanup=(), storage_error="")
         connection = Connection("192.0.2.1")
         window = SimpleNamespace(busy=False, connected=True, closing=False, snapshot=scanned,
                                  snapshot_connection=(connection.host, connection.username), known_hosts=Path("unused"),

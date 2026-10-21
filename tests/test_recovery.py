@@ -148,6 +148,8 @@ class RecoveryWriteTests(unittest.TestCase):
         self.request = {"files": [self.item], "guards": {str(self.missing): None}}
         self.program = APPLY_BATCH.replace('ROOT="/mnt/UDISK/Uncurser"', 'ROOT=' + repr(str(self.root)), 1).replace(
             json.dumps(mesh.TARGET), repr(str(self.path)))
+        self.program = self.program.replace('ROOT+"/recovery"+stem+marker+"."',
+            'os.path.join(ROOT,"recovery",os.path.basename(stem)+marker+".")')
 
     def tearDown(self):
         for path in self.root.rglob("*"):
@@ -155,7 +157,7 @@ class RecoveryWriteTests(unittest.TestCase):
                 path.chmod(0o600)
         self.directory.cleanup()
 
-    def run_write(self, replace=None, deny_create=None):
+    def run_write(self, replace=None, deny_create=None, unlink=None):
         original_open = os.open
         def portable_open(path, flags, *args, **kwargs):
             if flags & os.O_CREAT and deny_create is not None and deny_create():
@@ -168,19 +170,18 @@ class RecoveryWriteTests(unittest.TestCase):
         with patch("sys.stdin", io.StringIO(json.dumps(self.request))), contextlib.redirect_stdout(io.StringIO()), \
                 patch("os.open", portable_open), patch("os.fsync", lambda fd: None), \
                 patch("os.fchown", lambda *args: None, create=True), patch("os.fchmod", lambda *args: None, create=True), \
-                patch("os.replace", replace or os.replace):
+                patch("os.replace", replace or os.replace), patch("os.unlink", unlink or os.unlink):
             exec(compile(self.program, "<local-startup-recovery>", "exec"), {})
 
     def assert_no_temporary_files(self):
         self.assertFalse(list(self.root.rglob("*.uncursed-pending-*.txt")))
         self.assertFalse(list(self.root.rglob("*.rollback.txt")))
-        if self.backups.exists():
-            self.assertEqual([path.name for path in self.backups.iterdir()], [self.backup.name])
 
-    def test_atomic_repair_saves_recovery_copy_without_originals_or_records(self):
+    def test_atomic_repair_removes_temporary_recovery_without_originals_or_records(self):
         self.run_write()
         self.assertEqual(self.path.read_bytes(), self.after)
-        self.assertEqual(next(self.backups.iterdir()).read_bytes(), self.before)
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(list(self.backups.iterdir()))
         self.assertFalse(list(self.root.rglob("*.Original.txt")))
         self.assertFalse(list(self.root.rglob("Uncurser_mods.json")))
         self.assertFalse(list(self.root.rglob("*.json")))
@@ -210,6 +211,7 @@ class RecoveryWriteTests(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "replacement failed"):
             self.run_write(fail)
         self.assertEqual(self.path.read_bytes(), self.before)
+        self.assertEqual(self.backup.read_bytes(), self.before)
         self.assert_no_temporary_files()
 
     def test_postwrite_failure_rolls_back_without_leftover_scripts_or_candidates(self):
@@ -224,6 +226,7 @@ class RecoveryWriteTests(unittest.TestCase):
             self.run_write(replace)
         self.assertEqual(self.path.read_bytes(), self.before)
         self.assertEqual(len(calls), 2)
+        self.assertEqual(self.backup.read_bytes(), self.before)
         self.assert_no_temporary_files()
 
     def test_prepared_rollback_survives_no_new_file_creation_after_replacement(self):
@@ -240,6 +243,7 @@ class RecoveryWriteTests(unittest.TestCase):
         self.assertTrue(blocked[0])
         self.assertEqual(self.path.read_bytes(), self.before)
         self.assertEqual(len(calls), 2)
+        self.assertEqual(self.backup.read_bytes(), self.before)
         self.assert_no_temporary_files()
 
     def test_damaged_existing_recovery_copy_blocks_repair(self):
@@ -248,6 +252,7 @@ class RecoveryWriteTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "damaged"):
             self.run_write()
         self.assertEqual(self.path.read_bytes(), self.before)
+        self.assertEqual(self.backup.read_bytes(), b"damaged")
         self.assert_no_temporary_files()
 
     def test_shared_batch_preserves_existing_originals_and_rejects_unrelated_edits(self):
@@ -266,6 +271,7 @@ class RecoveryWriteTests(unittest.TestCase):
         self.run_write()
         self.assertEqual(original.read_bytes(), b"unrelated immutable original")
         self.assertEqual(manifest.read_bytes(), b'{"keep":"unchanged"}')
+        self.assertFalse(self.backup.exists())
         self.assert_no_temporary_files()
 
 

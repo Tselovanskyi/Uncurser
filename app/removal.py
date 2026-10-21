@@ -34,7 +34,8 @@ def _present(files, path):
     if path == screws.PYTHON:
         if b"UNCURSER BEGIN bed_screws" in (_data(files, mesh.TARGET) or b""):
             return True
-        if b"SCREWS_TILT_SAVE_MESH" in (_data(files, screws.PYTHON) or b""):
+        if any(marker in (_data(files, screws.PYTHON) or b"") for marker in
+               (b"SCREWS_TILT_SAVE_MESH", screws.COMMAND.encode(), screws.SAVE_COMMAND.encode())):
             return True
         for filename in (screws.CONFIG, screws.LEGACY_CONFIG):
             if b"Screws Tilt Adjust for K2 Plus" in (_data(files, filename) or b""):

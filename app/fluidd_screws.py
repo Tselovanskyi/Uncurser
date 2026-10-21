@@ -96,6 +96,71 @@ def replacements(path, before, after):
             for values in blocks(path) if old_enabled != new_enabled]
 
 
+def _recovery_values(path, data):
+    """Recognize known command renames without retaining old UI templates."""
+    mod_comments.read(data)
+    text = data.decode("utf-8")
+    values, states = [], []
+    pairs = blocks(path)
+    for original, replacement in pairs:
+        forms = {original, replacement}
+        if replacement == GRID_RENDER:
+            forms.add(replacement.replace("_UNCURSER_BED_SCREW_SAVE_MESH", "SCREWS_TILT_SAVE_MESH"))
+        elif replacement.startswith("retry(){"):
+            forms.add(replacement.replace('"BED_SCREW_HELPER"', '"SCREWS_TILT_CALCULATE"'))
+        for candidate in sorted(forms, key=len, reverse=True):
+            if candidate not in text:
+                continue
+            if text.count(candidate) != 1 or any(form in text.replace(candidate, "", 1) for form in forms):
+                raise ValueError("The Fluidd screw dialog is duplicated.")
+            values.append(candidate)
+            states.append(candidate != original)
+            break
+        else:
+            raise ValueError("The Fluidd screw dialog is unsupported, edited, or duplicated.")
+
+    # These two additions followed the original helper. Older installations
+    # legitimately retain their stock forms; all earlier blocks must agree.
+    optional = {index for index, (original, _) in enumerate(pairs)
+                if original.startswith(('this.printerSupportsBedScrewsCalculate&&',
+                                        'show_screws_tilt_adjust_dialog_automatically:'))}
+    core = [state for index, state in enumerate(states) if index not in optional]
+    if any(core) != all(core) or (not any(core) and any(states)):
+        raise ValueError("The Fluidd screw helper is only partially modified.")
+    normalized = text
+    for index, (original, replacement) in enumerate(pairs):
+        target = replacement if all(core) else original
+        normalized = normalized.replace(values[index], target, 1)
+    strip_mod(path, normalized.encode("utf-8"))
+    return values
+
+
+def recovery_replacements(path, before, after):
+    """Return verified owned edits for recovery, preserving all other bytes."""
+    old, new = _recovery_values(path, before), _recovery_values(path, after)
+    pairs = [[source, target] for source, target in zip(old, new) if source != target]
+    text = before.decode("utf-8")
+    for source, target in pairs:
+        if text.count(source) != 1:
+            raise ValueError("The Fluidd screw-dialog edit is not unique.")
+        text = text.replace(source, target, 1)
+    if mod_comments.strip(text.encode("utf-8")) != mod_comments.strip(after):
+        raise ValueError("Unrelated Fluidd code would change.")
+    return pairs
+
+
+def recovery_undo(path, data, reference):
+    """Restore known interface blocks to the active firmware's own forms."""
+    old, new = _recovery_values(path, data), _recovery_values(path, reference)
+    text = data.decode("utf-8")
+    for source, target in zip(old, new):
+        if source != target:
+            if text.count(source) != 1:
+                raise ValueError("The Fluidd screw-dialog edit is not unique.")
+            text = text.replace(source, target, 1)
+    return text.encode("utf-8")
+
+
 def difference(path, before, after, fromfile, tofile):
     # Minified bundles are one very long line. Show the exact changed function
     # when the rest is identical; never hide unrelated changes.

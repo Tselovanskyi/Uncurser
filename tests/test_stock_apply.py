@@ -1,6 +1,7 @@
 """Recovery integration uses synthetic snapshots and the existing local batch harness."""
 import base64
 import copy
+import os
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -96,12 +97,12 @@ class StockBatchTests(unittest.TestCase):
         fixture.item.update(recovery="stock", backup=str(fixture.backup), stock_source=str(self.source), stock_hash=mods.digest(fixture.after))
         fixture.request["guards"][str(self.source)] = mods.digest(fixture.after)
 
-    def test_stock_batch_keeps_separate_copy_and_clears_candidates(self):
+    def test_stock_batch_removes_verified_recovery_copy_and_clears_candidates(self):
         fixture = self.fixture
         fixture.request["verify_config"] = True
         fixture.run_write()
         self.assertEqual(fixture.path.read_bytes(), fixture.after)
-        self.assertEqual(fixture.backup.read_bytes(), fixture.before)
+        self.assertFalse(fixture.backup.exists())
         self.assertFalse(list(fixture.root.rglob("*.Original.txt*")))
         fixture.assert_no_temporary_files()
 
@@ -139,7 +140,7 @@ class StockBatchTests(unittest.TestCase):
         fixture.run_write()
         self.assertFalse(fixture.path.exists())
         self.assertFalse(cache.exists())
-        self.assertEqual(fixture.backup.read_bytes(), fixture.before)
+        self.assertFalse(fixture.backup.exists())
         fixture.assert_no_temporary_files()
 
     def test_changed_rom_source_blocks_before_replacement(self):
@@ -164,6 +165,125 @@ class StockBatchTests(unittest.TestCase):
             fixture.run_write(replace)
         self.assertEqual(fixture.path.read_bytes(), fixture.before)
         fixture.assert_no_temporary_files()
+
+    def test_only_verified_recovery_copies_for_affected_targets_are_removed(self):
+        fixture = self.fixture
+        fixture.backups.mkdir()
+        old_data = b"previously modified printer configuration\n"
+        old = fixture.backups / ("printer.cfn." + mods.digest(old_data) + ".txt")
+        legacy = fixture.backups / ("printer." + mods.digest(old_data) + ".txt")
+        old.write_bytes(old_data)
+        legacy.write_bytes(old_data)
+        preserved = {
+            fixture.backups / ("other.cfn." + mods.digest(old_data) + ".txt"): old_data,
+            fixture.backups / ("printer.cfn." + "0" * 64 + ".txt"): b"checksum does not match",
+            fixture.backups / "printer.cfn.invalid-checksum.txt": old_data,
+            fixture.backups / ("fluidd-category-" + mods.digest(old_data) + ".txt"): old_data,
+            fixture.root / "originals" / "printer.cfn.Original.txt": b"immutable original",
+            fixture.root / "originals" / "printer.cfn.Original.txt.json": b'{"proof":"retained"}',
+        }
+        for path, data in preserved.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        fixture.run_write()
+        self.assertEqual(fixture.path.read_bytes(), fixture.after)
+        for path in (fixture.backup, old, legacy):
+            self.assertFalse(path.exists(), str(path))
+        for path, data in preserved.items():
+            self.assertEqual(path.read_bytes(), data, str(path))
+        fixture.assert_no_temporary_files()
+
+    def test_guarded_unchanged_dependency_recovery_is_removed(self):
+        fixture = self.fixture
+        dependency = fixture.root / "screws_tilt_adjust.py"
+        fixture.request["guards"][str(dependency)] = None
+        fixture.request["recovery_targets"] = {str(dependency): None}
+        fixture.backups.mkdir()
+        old_data = b"# previously removed helper\n"
+        old = fixture.backups / ("screws_tilt_adjust.ptn." + mods.digest(old_data) + ".txt")
+        old.write_bytes(old_data)
+        fixture.run_write()
+        self.assertFalse(old.exists())
+        self.assertFalse(dependency.exists())
+        self.assertEqual(fixture.path.read_bytes(), fixture.after)
+        fixture.assert_no_temporary_files()
+
+    def test_recovery_cleanup_preserves_symlinks_and_their_targets(self):
+        fixture = self.fixture
+        fixture.backups.mkdir()
+        data = b"linked recovery data must not be removed\n"
+        target = fixture.root / "keep.txt"
+        target.write_bytes(data)
+        link = fixture.backups / ("printer.cfn." + mods.digest(data) + ".txt")
+        try:
+            link.symlink_to(target)
+        except OSError as error:
+            self.skipTest("Symlink creation is unavailable: " + str(error))
+        fixture.run_write()
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.read_bytes(), data)
+        self.assertEqual(target.read_bytes(), data)
+        self.assertFalse(fixture.backup.exists())
+        fixture.assert_no_temporary_files()
+
+    def test_recovery_unlink_failure_restores_deleted_copies_and_working_file(self):
+        fixture = self.fixture
+        fixture.backups.mkdir()
+        copies = {}
+        for data in (b"older config one\n", b"older config two\n"):
+            path = fixture.backups / ("printer.cfn." + mods.digest(data) + ".txt")
+            path.write_bytes(data)
+            copies[path] = data
+        native_unlink = os.unlink
+        removed = []
+        def unlink(path, *args, **kwargs):
+            candidate = Path(path)
+            if candidate in copies:
+                if len(removed) == 1:
+                    raise OSError("recovery cleanup denied")
+                removed.append(candidate)
+            return native_unlink(path, *args, **kwargs)
+        with self.assertRaisesRegex(OSError, "recovery cleanup denied"):
+            fixture.run_write(unlink=unlink)
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(fixture.path.read_bytes(), fixture.before)
+        self.assertEqual(fixture.backup.read_bytes(), fixture.before)
+        for path, data in copies.items():
+            self.assertEqual(path.read_bytes(), data, str(path))
+        fixture.assert_no_temporary_files()
+
+    def test_failed_recovery_restore_keeps_and_reports_last_intact_copy(self):
+        fixture = self.fixture
+        fixture.backups.mkdir()
+        copies = {}
+        for data in (b"older config one\n", b"older config two\n"):
+            path = fixture.backups / ("printer.cfn." + mods.digest(data) + ".txt")
+            path.write_bytes(data)
+            copies[path] = data
+        native_unlink, native_link = os.unlink, os.link
+        removed = []
+        def unlink(path, *args, **kwargs):
+            candidate = Path(path)
+            if candidate in copies:
+                if removed:
+                    raise OSError("recovery cleanup denied")
+                removed.append(candidate)
+            return native_unlink(path, *args, **kwargs)
+        def link(source, target, *args, **kwargs):
+            if removed and Path(target) == removed[0]:
+                raise OSError("recovery restoration denied")
+            return native_link(source, target, *args, **kwargs)
+        with patch("os.link", link), self.assertRaisesRegex(ValueError, "some changes may remain") as result:
+            fixture.run_write(unlink=unlink)
+        self.assertEqual(len(removed), 1)
+        self.assertFalse(removed[0].exists())
+        retained = list(fixture.backups.glob(removed[0].name + ".uncursed-pending-*.txt"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), copies[removed[0]])
+        self.assertIn(str(retained[0]), str(result.exception))
+        self.assertEqual(fixture.path.read_bytes(), fixture.before)
+        self.assertEqual(fixture.backup.read_bytes(), fixture.before)
+        self.assertFalse(list(fixture.root.rglob("*.rollback.txt")))
 
 
 if __name__ == "__main__":

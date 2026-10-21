@@ -98,8 +98,8 @@ assert.ok(buttons.every(button => button.props.attrs.disabled === false));
 buttons[0].props.on.click();
 buttons[1].props.on.click();
 assert.deepEqual(commands, [
-  {command: 'SCREWS_TILT_SAVE_MESH', wait: 'onBedScrewsCalculate'},
-  {command: 'SCREWS_TILT_SAVE_MESH DEFAULT=1', wait: 'onBedScrewsCalculate'},
+  {command: '_UNCURSER_BED_SCREW_SAVE_MESH', wait: 'onBedScrewsCalculate'},
+  {command: '_UNCURSER_BED_SCREW_SAVE_MESH DEFAULT=1', wait: 'onBedScrewsCalculate'},
 ]);
 const actions = render().props.scopedSlots.find(item => item.key === 'actions').fn();
 assert.equal(actions[0].props.style.flexWrap, 'wrap');
@@ -178,6 +178,20 @@ assert.ok(all(render()).some(node => node.tag === 'table'));
 
 // Popup-only hooks keep progress/results open, honor explicit dismissal and retain live status.
 const dialogEdits = JSON.parse(fs.readFileSync(path.join(__dirname, '../app/assets/screws-dialog-edits.json'), 'utf8'));
+// The native Tools entry must call the public wrapper after the old command is removed.
+const toolsEdit = dialogEdits.find(([before]) => before.startsWith('this.printerSupportsBedScrewsCalculate&&'));
+assert.ok(toolsEdit);
+const screwTools = new Function('t', toolsEdit[1] + ';return t');
+for (const supported of [false, true]) {
+  for (const allHomed of [false, true]) {
+    for (const isManualProbeActive of [false, true]) {
+      const items = screwTools.call({printerSupportsBedScrewsCalculate: supported, allHomed,
+                                    isManualProbeActive, $waits: context.$waits}, []);
+      assert.deepEqual(items, supported ? [{name: 'BED_SCREW_HELPER',
+        disabled: !allHomed || isManualProbeActive, wait: 'onBedScrewsCalculate'}] : []);
+    }
+  }
+}
 const hookSandbox = {f: (target, key, value) => {target[key] = value;}};
 vm.createContext(hookSandbox);
 vm.runInContext('this.Tool=class{constructor(){' + dialogEdits[0][1] + '}' +
@@ -237,7 +251,7 @@ Object.assign(popup, saved, {screwsTiltAdjust: complete(), $waits: context.$wait
 let count = commands.length;
 popup.retry();
 assert.equal(commands.length, count + 1);
-assert.equal(commands.at(-1).command, 'SCREWS_TILT_CALCULATE');
+assert.equal(commands.at(-1).command, 'BED_SCREW_HELPER');
 assert.equal(popup.open, true);
 popup.screwsTiltAdjust = complete({phase: 'probing', running: true});
 popup.$store.state.printer.printer.screws_tilt_adjust = popup.screwsTiltAdjust;

@@ -21,7 +21,7 @@
   ],
   [
     "retry(){this.sendGcode(\"SCREWS_TILT_CALCULATE\",this.$waits.onBedScrewsCalculate),this.open=!1}",
-    "retry(){!this.screwsTiltAdjust.running&&!this.printerBusy&&!this.hasWaits&&this.klippyReady&&this.socketConnected&&this.sendGcode(\"SCREWS_TILT_CALCULATE\",this.$waits.onBedScrewsCalculate)}"
+    "retry(){!this.screwsTiltAdjust.running&&!this.printerBusy&&!this.hasWaits&&this.klippyReady&&this.socketConnected&&this.sendGcode(\"BED_SCREW_HELPER\",this.$waits.onBedScrewsCalculate)}"
   ],
   [
     "destroyed(){this.$store.commit(\"printer/setClearScrewsTiltAdjust\")}",
@@ -30,5 +30,13 @@
   [
     "\"screws_tilt_adjust\"in s&&(s.screws_tilt_adjust={}),",
     "\"screws_tilt_adjust\"in s&&(!s.screws_tilt_adjust||s.screws_tilt_adjust.running!==!0)&&Object.assign(s.screws_tilt_adjust||(s.screws_tilt_adjust={}),{results:{},phase:\"idle\",error:!1,error_message:\"\",can_save_mesh:!1}),"
+  ],
+  [
+    "this.printerSupportsBedScrewsCalculate&&t.push({name:\"SCREWS_TILT_CALCULATE\",disabled:!this.allHomed||this.isManualProbeActive,wait:this.$waits.onBedScrewsCalculate})",
+    "this.printerSupportsBedScrewsCalculate&&t.push({name:\"BED_SCREW_HELPER\",disabled:!this.allHomed||this.isManualProbeActive,wait:this.$waits.onBedScrewsCalculate})"
+  ],
+  [
+    "show_screws_tilt_adjust_dialog_automatically:\"Automatically shows helper dialog if running SCREWS_TILT_CALCULATE tool\"",
+    "show_screws_tilt_adjust_dialog_automatically:\"Automatically shows helper dialog if running BED_SCREW_HELPER tool\""
   ]
 ]

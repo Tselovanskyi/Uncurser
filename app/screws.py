@@ -10,6 +10,8 @@ from .config_blocks import (SCREWS_CONFIG, LEGACY_SCREWS_CONFIG, SCREWS_INCLUDE,
                             strip_screws_include as _strip_include)
 
 MOD_ID = "bed_screws_v1"
+COMMAND = "_UNCURSER_BED_SCREW_HELPER"
+SAVE_COMMAND = "_UNCURSER_BED_SCREW_SAVE_MESH"
 PYTHON = "/usr/share/klipper/klippy/extras/screws_tilt_adjust.py"
 CONFIG = SCREWS_CONFIG
 LEGACY_CONFIG = LEGACY_SCREWS_CONFIG
@@ -57,6 +59,31 @@ def recognized(path, data):
     return normalized == payload(path)
 
 
+def recovery_recognized(path, data):
+    """Verify the complete current helper, allowing only known command renames."""
+    normalized = mod_comments.strip(data).replace(b"\r\n", b"\n")
+    if path == PYTHON:
+        for old, new in ((b'"SCREWS_TILT_CALCULATE"', ('"' + COMMAND + '"').encode()),
+                         (b'"SCREWS_TILT_SAVE_MESH"', ('"' + SAVE_COMMAND + '"').encode()),
+                         (b"cmd_SCREWS_TILT_CALCULATE", ("cmd_" + COMMAND).encode()),
+                         (b"cmd_SCREWS_TILT_SAVE_MESH", ("cmd_" + SAVE_COMMAND).encode()),
+                         (b"Adjust screws and run SCREWS_TILT_CALCULATE again.",
+                          b"Adjust screws and run BED_SCREW_HELPER again.")):
+            normalized = normalized.replace(old, new)
+    elif path in (CONFIG, LEGACY_CONFIG):
+        wrapper = (b"[gcode_macro BED_SCREW_HELPER]\ngcode:\n  "
+                   + COMMAND.encode() + b" {rawparams}\n")
+        old_wrapper = (b"[gcode_macro SCREWS_TILT_CALCULATE]\n"
+                       b"rename_existing: _ORIGIN_SCREWS_TILT_CALCULATE\ngcode:\n"
+                       b"  _ORIGIN_SCREWS_TILT_CALCULATE {rawparams}\n")
+        normalized = normalized.replace(old_wrapper, wrapper)
+        normalized = normalized.replace(wrapper.replace(COMMAND.encode(), b"SCREWS_TILT_CALCULATE"),
+                                        wrapper)
+    else:
+        return False
+    return normalized == payload(path)
+
+
 def payload(path):
     folder = Path(__file__).resolve().parent / "assets" / "bed_screws"
     if not folder.is_dir():
@@ -92,7 +119,7 @@ def inspect(root, files, included, patterns):
     try:
         active_config = screws_include_path(mesh.split(root.data)[0])
         enabled = active_config is not None
-        sections = {"screws_tilt_adjust", "gcode_macro SCREWS_TILT_CALCULATE",
+        sections = {"screws_tilt_adjust", "gcode_macro BED_SCREW_HELPER", "gcode_macro SCREWS_TILT_CALCULATE",
                     "gcode_macro _ORIGIN_SCREWS_TILT_CALCULATE"}
         for path, data in included.items():
             if path == active_config:

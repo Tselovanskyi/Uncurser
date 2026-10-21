@@ -149,14 +149,7 @@ def chamber(files, stock, entries):
 
 def ui_undo(data, reference, entry):
     if entry is None:
-        fluidd_screws.strip_mod(fluidd_screws.TARGET, data)
-        _, native = fluidd_screws.strip_mod(fluidd_screws.TARGET, reference)
-        if native:
-            return data
-        for before, _ in fluidd_screws.blocks(fluidd_screws.TARGET):
-            if reference.decode().count(before) != 1:
-                raise ValueError("The firmware's native helper interface has changed.")
-        return fluidd_screws.transform(fluidd_screws.TARGET, data, False)
+        return fluidd_screws.recovery_undo(fluidd_screws.TARGET, data, reference)
     text, stock_text = data.decode("utf-8"), reference.decode("utf-8")
     if text == stock_text:
         return data
@@ -214,7 +207,7 @@ def helper(files, stock, entries, *, partial=False):
                 raise ValueError("Another mod still owns the added helper file: " + path)
             entry = entries.get(path)
             if ((entry is not None and not mod_versions.created_matches(current, entry.get("created", ""), screws.PYTHON))
-                    or (entry is None and not screws.recognized(path, mod_comments.strip(current)))):
+                    or (entry is None and not screws.recovery_recognized(path, current))):
                 raise ValueError("An added helper file was edited or cannot be recognized: " + path)
             applied = True
         result[path] = None
@@ -273,7 +266,8 @@ def header_plan(files, path, stock=None, *, identity=None):
     if not headers:
         raise ValueError("Verified uninstall instructions and source comments are missing.")
     stamp = headers[0]
-    if any(value != stamp for value in headers) or stamp["version"] != mod_versions.VERSIONS[path]:
+    if (any(value != stamp for value in headers)
+            or (path != screws.PYTHON and stamp["version"] != mod_versions.VERSIONS[path])):
         raise ValueError("Source comments have conflicting or unsupported mod revisions.")
     if identity is None:
         current = (stock or {}).get("identity", {})

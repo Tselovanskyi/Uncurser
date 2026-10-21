@@ -73,16 +73,16 @@ class ScrewsTiltAdjust:
         # Register command
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_output_handler(self._handle_output)
-        self.gcode.register_command("SCREWS_TILT_CALCULATE",
-                                    self.cmd_SCREWS_TILT_CALCULATE,
-                                    desc=self.cmd_SCREWS_TILT_CALCULATE_help)
-        self.gcode.register_command("SCREWS_TILT_SAVE_MESH", self.cmd_SCREWS_TILT_SAVE_MESH,
+        self.gcode.register_command("_UNCURSER_BED_SCREW_HELPER",
+                                    self.cmd__UNCURSER_BED_SCREW_HELPER,
+                                    desc=self.cmd__UNCURSER_BED_SCREW_HELPER_help)
+        self.gcode.register_command("_UNCURSER_BED_SCREW_SAVE_MESH", self.cmd__UNCURSER_BED_SCREW_SAVE_MESH,
                                     desc="Save the latest successful bed screw helper mesh")
-    cmd_SCREWS_TILT_CALCULATE_help = "Tool to help adjust bed leveling " \
+    cmd__UNCURSER_BED_SCREW_HELPER_help = "Tool to help adjust bed leveling " \
                                      "screws by calculating the number " \
                                      "of turns to level it."
 
-    def cmd_SCREWS_TILT_CALCULATE(self, gcmd):
+    def cmd__UNCURSER_BED_SCREW_HELPER(self, gcmd):
         self._require_available(gcmd)
         self._reset_progress()
         try:
@@ -280,7 +280,7 @@ class ScrewsTiltAdjust:
         return (not self._busy and self._mesh is not None and current is self._mesh
                 and self._mesh_values(current) == self._signature)
 
-    def cmd_SCREWS_TILT_SAVE_MESH(self, gcmd):
+    def cmd__UNCURSER_BED_SCREW_SAVE_MESH(self, gcmd):
         self._require_available(gcmd)
         self.printer.lookup_object('toolhead').wait_moves()
         self._require_available(gcmd)
@@ -435,7 +435,7 @@ class ScrewsTiltAdjust:
             self.max_diff_error = True
             raise self.gcode.error(
                 "bed level exceeds configured limits ({}mm)! " \
-                "Adjust screws and run SCREWS_TILT_CALCULATE again.".format(
+                "Adjust screws and run BED_SCREW_HELPER again.".format(
                     self.max_diff))
 
 def load_config(config):

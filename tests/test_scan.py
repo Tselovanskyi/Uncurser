@@ -85,6 +85,8 @@ class ScanTests(unittest.TestCase):
         self.prefetch_hook = None
         self.connection = Connection("192.0.2.1")
         self.enterContext(patch.object(engine, "Remote", side_effect=self.remote))
+        self.enterContext(patch.object(storage, "recovery_copies", return_value=()))
+        self.enterContext(patch.object(engine.network, "fluidd_macros", return_value=None))
         self.enterContext(patch.object(mods, "REFERENCE_HASH", mods.digest(test_mod_versions.SOURCES[mods.TARGET])))
         self.enterContext(patch.object(mesh, "REFERENCE_HASH", mesh.fingerprint(test_mesh.SOURCE)))
         self.enterContext(patch.object(fluidd_screws, "FILES", tuple(

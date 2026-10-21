@@ -43,6 +43,74 @@ def recovery(target, digest):
     return ROOT + "/recovery" + stem + _MARKERS[suffix] + "." + digest + ".txt"
 
 
+_RECOVERY_COPIES = '''import os,sys,json,glob,stat,hashlib,re
+plans=json.load(sys.stdin); result=[]
+def safe_parent(path):
+ folder=os.path.dirname(path)
+ while True:
+  try:
+   if not stat.S_ISDIR(os.lstat(folder).st_mode): return False
+  except OSError: return False
+  parent=os.path.dirname(folder)
+  if folder==parent: return True
+  folder=parent
+for plan in plans:
+ for prefix in plan["prefixes"]:
+  if not safe_parent(prefix): continue
+  for path in sorted(glob.glob(glob.escape(prefix)+"*.txt")):
+   checksum=path[len(prefix):-4]
+   if not re.fullmatch(r"[0-9a-f]{64}",checksum): continue
+   try:
+    before=os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or before.st_size>2097152: continue
+    fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    with os.fdopen(fd,"rb") as source:
+     opened=os.fstat(source.fileno())
+     if (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino): continue
+     data=source.read(2097153)
+     finished=os.fstat(source.fileno())
+    after=os.lstat(path)
+    fields=("st_dev","st_ino","st_mode","st_uid","st_gid","st_size","st_mtime_ns","st_ctime_ns")
+    if any(getattr(before,key)!=getattr(value,key) for value in (opened,finished,after) for key in fields): continue
+    if len(data)>2097152 or hashlib.sha256(data).hexdigest()!=checksum or not safe_parent(path): continue
+    result.append(dict(target=plan["target"],path=path,sha256=checksum,
+     attrs=dict(mode=stat.S_IMODE(after.st_mode),uid=after.st_uid,gid=after.st_gid)))
+   except OSError: continue
+print(json.dumps(result))
+'''
+
+
+def recovery_copies(remote, targets):
+    """Read only verified content-addressed safeguards for the selected files."""
+    plans = []
+    for target in sorted(set(targets)):
+        prefix = recovery(target, "0" * 64)[:-68]
+        prefixes = [prefix]
+        if target == "/mnt/UDISK/printer_data/config/printer.cfg":
+            prefixes.append(ROOT + "/recovery/printer.")
+        plans.append({"target": target, "prefixes": prefixes})
+    if not plans:
+        return ()
+    result = remote.python(_RECOVERY_COPIES, plans)
+    allowed = {plan["target"]: plan["prefixes"] for plan in plans}
+    if not isinstance(result, list):
+        raise ValueError("Invalid recovery-copy inventory.")
+    seen = set()
+    for copy in result:
+        if not isinstance(copy, dict) or set(copy) != {"target", "path", "sha256", "attrs"}:
+            raise ValueError("Invalid recovery-copy metadata.")
+        target, path, digest, attrs = (copy[key] for key in ("target", "path", "sha256", "attrs"))
+        if (not isinstance(target, str) or target not in allowed
+                or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not isinstance(path, str) or path not in {prefix + digest + ".txt" for prefix in allowed[target]}
+                or path in seen or not isinstance(attrs, dict) or set(attrs) != set(_ATTRS)
+                or any(type(attrs[key]) is not int or attrs[key] < 0 for key in _ATTRS)
+                or attrs["mode"] > 0o7777):
+            raise ValueError("Invalid recovery-copy metadata.")
+        seen.add(path)
+    return tuple(sorted(result, key=lambda copy: (copy["target"], copy["path"])))
+
+
 def legacy_path(canonical):
     """Return only the old storage location corresponding to a canonical path."""
     _absolute(canonical)

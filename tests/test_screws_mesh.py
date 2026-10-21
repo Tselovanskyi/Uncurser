@@ -42,6 +42,44 @@ class Command:
         return value
 
 
+class CommandRegistrationTests(unittest.TestCase):
+    def test_private_commands_preserve_existing_klipper_command(self):
+        stock_command = Mock()
+        registered = {'SCREWS_TILT_CALCULATE': stock_command}
+
+        def register(name, handler, **kwargs):
+            self.assertNotIn(name, registered)
+            registered[name] = handler
+
+        gcode = SimpleNamespace(register_command=register, register_output_handler=Mock())
+        printer = SimpleNamespace(lookup_object=lambda name: gcode)
+        values = {'screw1': (0., 0.), 'screw2': (20., 0.), 'screw3': (20., 20.),
+                  'mesh_min': (0., 0.), 'mesh_max': (20., 20.)}
+        config = SimpleNamespace(get_printer=lambda: printer,
+            get=lambda name, default=None: values.get(name, default),
+            getfloatlist=lambda name, **kwargs: values[name],
+            getfloat=lambda name, default, **kwargs: default,
+            getintlist=lambda name, **kwargs: (3, 3),
+            getchoice=lambda name, choices, default: choices[default],
+            error=ValueError)
+        config.getsection = lambda name: config
+
+        helper = Helper(config)
+
+        self.assertEqual(set(registered), {'SCREWS_TILT_CALCULATE',
+            '_UNCURSER_BED_SCREW_HELPER', '_UNCURSER_BED_SCREW_SAVE_MESH'})
+        self.assertIs(registered['SCREWS_TILT_CALCULATE'], stock_command)
+        self.assertEqual(registered['_UNCURSER_BED_SCREW_HELPER'],
+                         helper.cmd__UNCURSER_BED_SCREW_HELPER)
+        self.assertEqual(registered['_UNCURSER_BED_SCREW_SAVE_MESH'],
+                         helper.cmd__UNCURSER_BED_SCREW_SAVE_MESH)
+        config_text = (ROOT / 'References/screws_tilt_adjust/screws_tilt_adjust.cfg').read_text()
+        self.assertIn('[gcode_macro BED_SCREW_HELPER]', config_text)
+        self.assertIn('_UNCURSER_BED_SCREW_HELPER {rawparams}', config_text)
+        self.assertNotIn('SCREWS_TILT_CALCULATE', config_text)
+        self.assertNotIn('rename_existing:', config_text)
+
+
 class Mesh:
     def __init__(self, flat=False):
         self.params = dict(min_x=0., min_y=0., max_x=20., max_y=20., x_count=3, y_count=3)
@@ -184,7 +222,7 @@ class Fixture:
             raise AssertionError(command)
 
     def calculate(self):
-        self.helper.cmd_SCREWS_TILT_CALCULATE(Command())
+        self.helper.cmd__UNCURSER_BED_SCREW_HELPER(Command())
 
 
 class MeshScrewTests(unittest.TestCase):
@@ -361,7 +399,7 @@ class MeshScrewTests(unittest.TestCase):
         self.fx = Fixture(self.temp.name)
         self.fx.calculate()
         with self.assertRaisesRegex(CommandError, 'MAX_DEVIATION'):
-            self.fx.helper.cmd_SCREWS_TILT_CALCULATE(Command(MAX_DEVIATION=float('nan')))
+            self.fx.helper.cmd__UNCURSER_BED_SCREW_HELPER(Command(MAX_DEVIATION=float('nan')))
         status = self.fx.helper.get_status(self.fx.now)
         self.assertEqual((status['phase'], status['running'], status['completed_points']), ('error', False, 0))
         self.assertEqual(status['elapsed'], 0.)
@@ -457,21 +495,23 @@ class MeshScrewTests(unittest.TestCase):
         self.assertIsNone(self.fx.helper.probed_temperature)
         self.assertFalse(self.fx.helper.get_status(1.)['can_save_mesh'])
         with self.assertRaisesRegex(CommandError, 'no longer current'):
-            self.fx.helper.cmd_SCREWS_TILT_SAVE_MESH(Command())
+            self.fx.helper.cmd__UNCURSER_BED_SCREW_SAVE_MESH(Command())
         self.fx.gcode.run_script_from_command.assert_called_once_with('G28')
         config = (ROOT / 'References/screws_tilt_adjust/screws_tilt_adjust.cfg').read_text()
         self.assertNotIn('G28', config)
-        self.assertIn('_ORIGIN_SCREWS_TILT_CALCULATE {rawparams}', config)
+        self.assertIn('[gcode_macro BED_SCREW_HELPER]', config)
+        self.assertIn('_UNCURSER_BED_SCREW_HELPER {rawparams}', config)
+        self.assertNotIn('rename_existing:', config)
 
     def test_named_and_explicit_default_save_are_persisted_without_restart(self):
         old_default = copy.deepcopy(self.fx.profiles.profiles['default'])
         self.fx.calculate()
-        self.fx.helper.cmd_SCREWS_TILT_SAVE_MESH(Command())
-        self.fx.helper.cmd_SCREWS_TILT_SAVE_MESH(Command())
+        self.fx.helper.cmd__UNCURSER_BED_SCREW_SAVE_MESH(Command())
+        self.fx.helper.cmd__UNCURSER_BED_SCREW_SAVE_MESH(Command())
         self.assertEqual(set(self.fx.profiles.profiles), {'default', 'screws_70C'})
         self.assertEqual(self.fx.profiles.profiles['default'], old_default)
         self.assertIn('[bed_mesh screws_70C]', self.fx.path.read_text())
-        self.fx.helper.cmd_SCREWS_TILT_SAVE_MESH(Command(DEFAULT=1))
+        self.fx.helper.cmd__UNCURSER_BED_SCREW_SAVE_MESH(Command(DEFAULT=1))
         self.assertEqual(self.fx.profiles.profiles['default']['points'], self.fx.next_mesh.matrix)
         self.assertEqual(self.fx.commands.count('CXSAVE_CONFIG'), 3)
         self.assertNotIn('SAVE_CONFIG', self.fx.commands)
@@ -481,23 +521,23 @@ class MeshScrewTests(unittest.TestCase):
         previous = self.fx.mesh.matrix[0][0]
         self.fx.mesh.matrix[0][0] += .1
         with self.assertRaisesRegex(CommandError, 'no longer current'):
-            self.fx.helper.cmd_SCREWS_TILT_SAVE_MESH(Command())
+            self.fx.helper.cmd__UNCURSER_BED_SCREW_SAVE_MESH(Command())
         self.fx.mesh.matrix[0][0] = previous
         self.fx.configfile.autosave.fileconfig.add_section('prtouch_v3')
         self.fx.configfile.autosave.fileconfig.set('prtouch_v3', 'z_offset', '0.1')
         self.fx.configfile.status_save_pending['prtouch_v3'] = {'z_offset': '0.1'}
         with self.assertRaisesRegex(CommandError, 'Other configuration'):
-            self.fx.helper.cmd_SCREWS_TILT_SAVE_MESH(Command())
+            self.fx.helper.cmd__UNCURSER_BED_SCREW_SAVE_MESH(Command())
         self.fx.configfile.status_save_pending.clear()
         self.fx.configfile.autosave.fileconfig.remove_section('prtouch_v3')
         self.fx.configfile.autosave.fileconfig.set('bed_mesh default', 'version', '2')
         self.fx.configfile.status_save_pending['bed_mesh default'] = {'version': '2'}
         with self.assertRaisesRegex(CommandError, 'Another mesh profile'):
-            self.fx.helper.cmd_SCREWS_TILT_SAVE_MESH(Command())
+            self.fx.helper.cmd__UNCURSER_BED_SCREW_SAVE_MESH(Command())
         self.assertNotIn('screws_70C', self.fx.profiles.profiles)
         self.assertNotIn('CXSAVE_CONFIG', self.fx.commands)
         self.fx.configfile.autosave.fileconfig.set('bed_mesh default', 'version', '1')
-        self.fx.helper.cmd_SCREWS_TILT_SAVE_MESH(Command())
+        self.fx.helper.cmd__UNCURSER_BED_SCREW_SAVE_MESH(Command())
         self.assertIn('screws_70C', self.fx.profiles.profiles)
 
     def test_saved_unrelated_pending_flags_do_not_block_mesh_saves(self):
@@ -509,7 +549,7 @@ class MeshScrewTests(unittest.TestCase):
         self.fx.calculate()
         self.assertTrue(self.fx.helper.get_status(1.)['can_save_mesh'])
         for command in (Command(), Command(DEFAULT=1)):
-            self.fx.helper.cmd_SCREWS_TILT_SAVE_MESH(command)
+            self.fx.helper.cmd__UNCURSER_BED_SCREW_SAVE_MESH(command)
         written = self.fx.helper._saved_config(self.fx.configfile)
         self.assertEqual(dict(written.items('input_shaper')), {'shaper_freq_x': '50.0'})
         self.assertEqual(self.fx.configfile.status_save_pending['input_shaper'], {'shaper_freq_x': '50.0'})
@@ -527,7 +567,7 @@ class MeshScrewTests(unittest.TestCase):
                 old_pending = copy.deepcopy(self.fx.configfile.status_save_pending)
                 setattr(self.fx, failure, True)
                 with self.assertRaises(CommandError):
-                    self.fx.helper.cmd_SCREWS_TILT_SAVE_MESH(Command())
+                    self.fx.helper.cmd__UNCURSER_BED_SCREW_SAVE_MESH(Command())
                 self.assertEqual(self.fx.profiles.profiles['screws_70C'], old_profile)
                 self.assertEqual(dict(self.fx.configfile.autosave.fileconfig.items('bed_mesh screws_70C')), old_section)
                 self.assertEqual(self.fx.configfile.status_save_pending, old_pending)

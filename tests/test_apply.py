@@ -101,7 +101,10 @@ class ApplyWithoutRestartTests(unittest.TestCase):
                                  status, "", {"history": True}, 0)
         after = engine.Snapshot(new, digest(new), {"enabled": True}, old, digest(old), "",
                                 status, "", {"history": True}, 1)
-        ledger = engine.prepare_all(before, True)[mod_versions.TARGET]
+        prepared = engine.prepare_all(before, True)
+        after.data = prepared[mods.TARGET]
+        after.sha256 = digest(after.data)
+        ledger = prepared[mod_versions.TARGET]
         after.versions = engine.MeshSnapshot(ledger, digest(ledger),
             {"known": True, "enabled": True, "patchable": True},
             original_hash=digest(b""), original_absent=True)
@@ -117,6 +120,7 @@ class ApplyWithoutRestartTests(unittest.TestCase):
         script, request = remote.return_value.__enter__.return_value.python.call_args.args
         self.assertEqual(script, APPLY_BATCH)
         self.assertEqual([item["path"] for item in request["files"]], [mods.TARGET, mod_versions.TARGET])
+        self.assertEqual(request["recovery_targets"], {path: digest(data) for path, data in prepared.items()})
         http.assert_not_called()
         self.assertIs(result["snapshot"], after)
         self.assertFalse(result["restarted"])

@@ -77,6 +77,7 @@ class Snapshot:
     warmup: MeshSnapshot | None = None
     fluidd_macros: dict | None = None
     fluidd_error: str = ""
+    recovery_cleanup: tuple = ()
 
 
 def version_snapshot(snapshot):
@@ -189,6 +190,13 @@ def update_statuses(snapshot):
                 revision = mod_versions.version(record["version"])
                 current = mod_versions.version(latest)
                 status["needed"] = revision < current
+                if path == screws.PYTHON:
+                    category = record.get("fluidd_category")
+                    status["needed"] |= category is None or fluidd_categories.record_macro(category) != fluidd_categories.MACRO
+                    # Local builds can share a revision; verify the installed
+                    # implementation as well as its version and macro category.
+                    status["needed"] |= any(not screws.recognized(filename, entry["created"].encode())
+                        for filename, entry in record["files"].items() if "created" in entry)
                 if revision > current:
                     raise ValueError("This mod was installed by a newer app; use that app or Restore original.")
             elif value and value.analysis.get("enabled") is True and value.analysis.get("known"):
@@ -649,6 +657,7 @@ def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods
             progress("Checking stock firmware recovery files…")
             stock_snapshot = stock.scan(remote, state, **({"extra_paths": tuple(sorted(added_paths))} if added_paths else {}))
         storage_moves = tuple(remote.moves)
+        recovery_candidates = storage.recovery_copies(remote, known_paths | {mod_versions.TARGET})
     analysis = mods.inspect(current["data"]) if current else {
         "known": True, "enabled": False, "patchable": False, "label": "Not installed",
         "reason": "The native print module is missing: " + mods.TARGET}
@@ -744,6 +753,7 @@ def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods
                                          "label": "Conflict", "reason": str(error)}
     if result.storage_moves and result.mesh and result.mesh.analysis.get("include_error"):
         result.storage_error = result.storage_error or INCLUDE_STORAGE_ERROR
+    result.recovery_cleanup = orphan_recovery_copies(result, recovery_candidates)
     return result
 
 
@@ -815,6 +825,41 @@ def removal_statuses(snapshot):
                             if value is not None}, records, metadata_error=error, stock=snapshot.stock,
                            identity=network.device_identity(snapshot.status),
                            header_fallback=version_snapshot(snapshot).data is None and version_snapshot(snapshot).sha256 is None)
+
+
+def recovery_owners(target):
+    if target == mod_versions.TARGET:
+        return set(mod_versions.VERSIONS)
+    owners = {owner for owner, scope in mod_versions.FILES.items() if target in scope}
+    return owners | ({screws.PYTHON} if target == screws.LEGACY_CONFIG else set())
+
+
+def orphan_recovery_copies(snapshot, candidates):
+    """Select safeguards whose owning mods are verifiably absent."""
+    if not candidates or network.firmware_state(snapshot.status) == "unsupported":
+        return ()
+    try:
+        records = installed_records(snapshot)
+        scopes = record_scopes(records)
+        states = removal_statuses(snapshot)
+        absent = {owner for owner in mod_versions.VERSIONS if owner not in records
+                  and not states.get(owner, {}).get("present", True)
+                  and (value := mod_snapshot(snapshot, owner)) is not None
+                  and value.analysis.get("known") and value.analysis.get("enabled") is False}
+        result = []
+        for entry in candidates:
+            target = entry["target"]
+            owners = recovery_owners(target)
+            if (not owners or not owners.issubset(absent)
+                    or any(scope is None or target in scope for owner, scope in scopes.items()
+                           if owner not in mod_versions.VERSIONS)):
+                continue
+            value = file_snapshot(snapshot, target)
+            if value is not None and value.sha256 == (mods.digest(value.data) if value.data is not None else None):
+                result.append(entry)
+        return tuple(result)
+    except (ValueError, TypeError, KeyError, AttributeError, StopIteration, UnicodeError):
+        return ()
 
 
 def cleanup_snapshot(snapshot, pairs=None):
@@ -898,7 +943,7 @@ def firmware_issues(snapshot, *, removals=None):
                                                 "Installed firmware is unknown." if installed is None else
                                                 "Installed on firmware " + installed + "; current firmware is " + current + "." if installed != current else
                                                 "Its original backup belongs to older firmware.")}
-    if snapshot.storage_moves or snapshot.storage_cleanup:
+    if snapshot.storage_moves or snapshot.storage_cleanup or snapshot.recovery_cleanup:
         error = deferred_storage_view(view, deferred).storage_error
         if error == INCLUDE_STORAGE_ERROR:
             unknown_repairs = tuple(path for path, issue in result.items()
@@ -913,12 +958,14 @@ def firmware_issues(snapshot, *, removals=None):
                 verified = result.get(owner, states.get(owner, {}) if pair["target"] in deferred else {})
                 if owns and states.get(owner, {}).get("present") and not verified.get("available"):
                     error = error or "An active mod still requires the backup for " + pair["target"] + "."
-        if cleanup or moves or error:
-            status = {"kind": "cleanup" if cleanup else "relocation", "present": True,
+        if cleanup or moves or error or snapshot.recovery_cleanup:
+            status = {"kind": "cleanup" if cleanup or snapshot.recovery_cleanup else "relocation", "present": True,
                       "available": not error, "reason": error}
             if cleanup:
                 status["relocation"] = bool(moves)
                 status["damaged"] = any(pair.get("reason", "obsolete") != "obsolete" for pair in cleanup)
+            if snapshot.recovery_cleanup:
+                status.update(recovery=True, originals=bool(cleanup), relocation=bool(moves))
             result[storage.ROOT] = status
     if result:
         from . import reinstall
@@ -1144,7 +1191,8 @@ def helper_js_replacements(snapshot, data, *, tolerant=False):
     pairs = []
     text = current.decode("utf-8")
     if record is None:
-        pairs = fluidd_screws.replacements(fluidd_screws.TARGET, current, data)
+        pairs = (fluidd_screws.recovery_replacements(fluidd_screws.TARGET, current, data) if tolerant
+                 else fluidd_screws.replacements(fluidd_screws.TARGET, current, data))
     elif tolerant or network.is_untested(snapshot.status):
         entry = record["files"][fluidd_screws.TARGET]
         text, pairs = current.decode("utf-8"), []
@@ -1509,10 +1557,10 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
             else:
                 if path == screws.PYTHON:
                     category = records.get(path, {}).get("fluidd_category")
-                    if category is None:
+                    if category is None or fluidd_categories.record_macro(category) != fluidd_categories.MACRO:
                         if snapshot.fluidd_error:
                             raise ValueError("Cannot read Fluidd macro preferences: " + snapshot.fluidd_error)
-                        _, category = fluidd_categories.enable(snapshot.fluidd_macros)
+                        _, category = fluidd_categories.enable(snapshot.fluidd_macros, category)
                     records[path] = capture_helper(baselines[path], {name: results[name] for name in mod_versions.FILES[path]}, firmware=firmware)
                     records[path]["fluidd_category"] = category
                 elif path == smoothing.TARGET:
@@ -1712,7 +1760,7 @@ def unknown_startup_repair(snapshot, targets):
         return False
 
 
-def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore, full_risk, progress, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None, unknown_removals=(), *, warmup_desired=None):
+def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore, full_risk, progress, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None, unknown_removals=(), *, warmup_desired=None, cleanup_recovery=False):
     progress("Checking fresh file contents and printer activity…")
     fresh = rescan(connection, known_hosts, scanned, progress)
     if fresh.status is None:
@@ -1720,6 +1768,13 @@ def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore,
     choices = (desired, mesh_desired, temperature_desired, screws_desired, smoothing_desired, warmup_desired)
     selected = dict(zip((mods.TARGET, mesh.TARGET, mesh_temperature.TARGET, screws.PYTHON, smoothing.TARGET, warmup.TARGET), choices))
     selected.update({path: False for path in unknown_removals})
+    orphan_copies = ()
+    if cleanup_recovery:
+        if restore or update or full_risk or any(choice is True for choice in choices):
+            raise ValueError("Recovery cleanup cannot be combined with installing, updating or restoring mods.")
+        orphan_copies = orphan_recovery_copies(fresh, fresh.recovery_cleanup)
+        if orphan_copies != scanned.recovery_cleanup or orphan_copies != fresh.recovery_cleanup:
+            raise RuntimeError("Recovery copies or their ownership changed after scan. Scan again before fixing issues.")
     if repair is not None:
         allowed = set(repair["targets"])
         if (restore or update or full_risk or retire_old_backups or not allowed
@@ -1817,9 +1872,13 @@ def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore,
                      if path.endswith(".py")
                      and (restore or path in recovered or path in removed_python or network.is_untested(fresh.status)
                           or data is None or data != file_snapshot(fresh, path).data)}
+    recovery_targets = {path: mods.digest(data) if data is not None else None for path, data in pending.items()}
+    recovery_targets.update({entry["target"]: (mods.digest(pending[entry["target"]]) if pending[entry["target"]] is not None else None)
+                            if entry["target"] in pending else file_snapshot(fresh, entry["target"]).sha256
+                            for entry in orphan_copies})
     pending = {path: data for path, data in pending.items()
                if data != file_snapshot(fresh, path).data}
-    if not pending and not python_caches and not moves and not retire and not category:
+    if not pending and not python_caches and not moves and not retire and not category and not recovery_targets:
         return {"snapshot": fresh, "message": "Printer files already match the requested state.", "restarted": False, "written": False}
     enabling_heat = desired is not False and not restore and not unknown_removals
     if mods.TARGET in pending and enabling_heat and not fresh.identity.get("history"):
@@ -1904,6 +1963,19 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
         # Commit records after the working files they describe.
         items.sort(key=lambda item: item["path"] == mod_versions.TARGET)
         guards, patterns = {}, {}
+        if orphan_copies:
+            owners = {owner for entry in orphan_copies for owner in recovery_owners(entry["target"])}
+            dependencies = {path for owner in owners for path in mod_versions.FILES[owner]}
+            if screws.PYTHON in owners:
+                dependencies.add(screws.LEGACY_CONFIG)
+            dependencies.update((mod_versions.TARGET, *(entry["target"] for entry in orphan_copies)))
+            for path in dependencies:
+                value = file_snapshot(fresh, path)
+                if value is None:
+                    raise ValueError("Recovery cleanup requires a complete scan of mod files: " + path)
+                guards[path] = value.sha256
+                guards.update(value.guards)
+                patterns.update(value.patterns)
         if retire:
             records = installed_records(fresh)
             scopes = record_scopes(records)
@@ -1975,6 +2047,8 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
                 raise ValueError("Printer startup error changed during Apply. Scan again before removing mods.")
         progress("Writing printer files…")
         outcome = remote.python(APPLY_BATCH, {"files": items, "python_caches": python_caches, "moves": list(moves), "retire": list(retire),
+                                   "recovery_targets": recovery_targets,
+                                   "recovery_inventory": list(orphan_copies),
                                    "fluidd_category": category,
                                    "guards": guards, "patterns": patterns,
                                    "verify_config": screws_desired is False or bool(unknown_removals),
@@ -1986,6 +2060,9 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
         raise RuntimeError("Saved printer files, but Fluidd macro preferences could not be verified. Scan again before proceeding.")
     if retire and set(outcome.get("retired", ())) != retired_paths:
         raise RuntimeError("Backup cleanup did not complete. Scan the printer before applying again.")
+    if orphan_copies and (not {entry["path"] for entry in orphan_copies}.issubset(outcome.get("recovery_removed", ()))
+                          or any(entry in result.recovery_cleanup for entry in orphan_copies)):
+        raise RuntimeError("Recovery-copy cleanup could not be verified. Scan the printer before applying again.")
     moved_sources = {move["source"] for move in moves}
     if any(move["source"] in moved_sources for move in result.storage_moves):
         raise RuntimeError("Backup storage migration could not be verified. Scan the printer before applying again.")
@@ -1999,21 +2076,25 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
     cleared = bool(outcome and outcome.get("cleared"))
     moved = bool(outcome and outcome.get("moved"))
     retired = bool(outcome and outcome.get("retired"))
-    if not pending and not cleared and not moved and not retired:
+    recovery_removed = bool(outcome and outcome.get("recovery_removed"))
+    if not pending and not cleared and not moved and not retired and not recovery_removed:
         return {"snapshot": result, "message": "Printer files already match the requested state.", "restarted": False, "written": False}
     power_cycle = any(path != mod_versions.TARGET for path in pending) or cleared
     return {"snapshot": result, "message": "Saved and verified. Power cycle the printer before printing." if power_cycle
             else "Obsolete or unusable backups removed; current backups relocated." if retired and moved
             else "Obsolete or unusable backups removed." if retired
             else "Backups and uninstall records saved in /mnt/UDISK/Uncurser/." if moved
+            else "Recovery copies removed." if not pending and recovery_removed
             else "Uninstall records removed." if pending == {mod_versions.TARGET: None}
             else "Version stamps and undo records saved.", "restarted": False, "written": True, "power_cycle": power_cycle}
 
 
 def apply(connection, known_hosts, scanned, desired, restore=False, full_risk=False,
-          progress=lambda message: None, mesh_desired=None, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None, unknown_removals=(), warmup_desired=None):
+          progress=lambda message: None, mesh_desired=None, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None, unknown_removals=(), warmup_desired=None, cleanup_recovery=False):
     require_apply_policy(scanned.status, (desired, mesh_desired, temperature_desired, screws_desired, smoothing_desired, warmup_desired), restore, update)
     extra = {"warmup_desired": warmup_desired} if warmup_desired is not None else {}
+    if cleanup_recovery:
+        extra["cleanup_recovery"] = True
     return apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore, full_risk,
                       progress, temperature_desired, screws_desired, update, smoothing_desired, retire_old_backups, repair, unknown_removals, **extra)
 
@@ -2039,7 +2120,8 @@ def fix_issues(connection, known_hosts, scanned, progress=lambda message: None, 
     options = {field: False if path in targets else None for path, field in fields.items()}
     extra = {"unknown_removals": tuple(sorted(unknown_removals))} if unknown_removals else {}
     result = apply(connection, known_hosts, scanned, progress=progress, **options, **extra,
-                   retire_old_backups=bool(scanned.storage_cleanup))
+                   retire_old_backups=bool(scanned.storage_cleanup),
+                   **({"cleanup_recovery": True} if scanned.recovery_cleanup else {}))
     if not reinstall_targets:
         return result
     cleaned = result["snapshot"]

@@ -96,6 +96,7 @@ print(json.dumps(dict(files=files,patterns=patterns)))
 APPLY_BATCH = '''import os,sys,json,base64,hashlib,stat,uuid,ast,glob,fnmatch,configparser,re,posixpath
 r=json.load(sys.stdin); items=r["files"]; prepared=[]; replaced=[]; caches=[]; cleared=[]
 ROOT="/mnt/UDISK/Uncurser"; migrations=[]; copied=[]; removed=[]; migration_temps=[]; retirements=[]; retired=[]
+recovery_copies=[]; recovery_removed=[]
 database=r.get("fluidd_category"); database_attempted=False; database_done=False
 def fluidd(method="GET",value=None):
  import urllib.request,urllib.error
@@ -176,7 +177,11 @@ def guards():
  for item in retirements: retirement_guard(item)
  for item in prepared:
   if "expected_attrs" in item and not (item in replaced and item["new"] is None) and fileattrs(item["path"])!=item["expected_attrs"]: raise ValueError("Working file attributes changed; scan again: "+item["path"])
-  if item.get("recovery_saved") and read(item["backup"])!=item["old"]: raise ValueError("The recovery copy changed: "+item["backup"])
+  if item.get("recovery_saved") and read(item["backup"])!=(None if any(copy["path"]==item["backup"] for copy in recovery_removed) else item["old"]): raise ValueError("The recovery copy changed: "+item["backup"])
+ for copy in recovery_copies:
+  if copy in recovery_removed:
+   if os.path.lexists(copy["path"]): raise ValueError("A removed recovery copy was recreated: "+copy["path"])
+  elif fingerprint(read(copy["path"]))!=copy["sha256"] or fileattrs(copy["path"])!=copy["attrs"]: raise ValueError("The recovery copy changed: "+copy["path"])
  for path,expected in r.get("guards",{}).items():
   if any(item["path"]==path for item in retired): expected=None
   if fingerprint(read(path))!=expected: raise ValueError("Included configuration changed: "+path)
@@ -221,6 +226,22 @@ try:
  if database is not None:
   if not isinstance(database,dict) or set(database)!={"expected","value"} or any(value is not None and not isinstance(value,dict) for value in database.values()): raise ValueError("Invalid Fluidd category change")
   if fluidd()!=database["expected"]: raise ValueError("Fluidd macro preferences changed; scan again")
+ # Freeze the orphan copies shown by Scan before any file writes or deletes.
+ for copy in r.get("recovery_inventory",[]):
+  if not isinstance(copy,dict) or set(copy)!={"target","path","sha256","attrs"}: raise ValueError("Invalid recovery cleanup inventory")
+  target=copy["target"]; path=copy["path"]; checksum=copy["sha256"]; attrs=copy["attrs"]
+  if not isinstance(target,str) or not os.path.isabs(target) or os.path.normpath(target)!=target or target not in r.get("recovery_targets",{}): raise ValueError("Invalid recovery cleanup target")
+  stem,suffix=os.path.splitext(target); marker={".py":".ptn",".cfg":".cfn",".js":".jfn",".json":".jsn"}.get(suffix)
+  if marker is None or not isinstance(checksum,str) or not re.fullmatch(r"[0-9a-f]{64}",checksum): raise ValueError("Invalid recovery cleanup checksum")
+  prefixes=[ROOT+"/recovery"+stem+marker+"."]
+  if target=="/mnt/UDISK/printer_data/config/printer.cfg": prefixes.append(os.path.join(ROOT,"recovery","printer."))
+  if path not in {prefix+checksum+".txt" for prefix in prefixes} or any(item["path"]==path for item in recovery_copies): raise ValueError("Invalid recovery cleanup path")
+  if not isinstance(attrs,dict) or set(attrs)!={"mode","uid","gid"} or any(type(value) is not int or value<0 for value in attrs.values()) or attrs["mode"]>0o7777: raise ValueError("Invalid recovery cleanup attributes")
+  storage_parent(path,False)
+  if os.lstat(path).st_size>2097152: raise ValueError("Recovery copy changed after scan: "+path)
+  data=read(path)
+  if fingerprint(data)!=checksum or fileattrs(path)!=attrs: raise ValueError("Recovery copy changed after scan: "+path)
+  recovery_copies.append(dict(copy,old=data,expected=r["recovery_targets"][target]))
  # Retire only reserved original pairs matching their scanned state and reason.
  for entry in r.get("retire",[]):
   target=entry["target"]; backup=entry["backup"]; model=entry["model"]; release=entry.get("firmware"); reason=entry.get("reason","obsolete")
@@ -477,9 +498,58 @@ try:
    if fingerprint(read(candidate["path"]))!=candidate["new_hash"]: raise ValueError("Working file changed before retiring originals: "+candidate["path"])
   os.unlink(item["path"]); retired.append(item); syncdir(item["path"])
  guards()
- print(json.dumps(dict(saved=[item["path"] for item in replaced],cleared=[item["path"] for item in cleared],moved=[dict(source=move["source"],destination=move["destination"]) for move in migrations],retired=[item["path"] for item in retired])))
+ # Recovery copies protect this transaction, not a permanent mod history.
+ # Clean only content-addressed copies for files verified by this operation.
+ targets=dict(r.get("recovery_targets",{}))
+ for item in prepared: targets[item["path"]]=item["new_hash"]
+ for target,expected in targets.items():
+  if not isinstance(target,str) or not os.path.isabs(target) or os.path.normpath(target)!=target: raise ValueError("Invalid recovery cleanup target")
+  if not any(item["path"]==target for item in prepared) and (target not in r.get("guards",{}) or r["guards"][target]!=expected): raise ValueError("Recovery cleanup requires a guarded file")
+  if fingerprint(read(target))!=expected: raise ValueError("Working file changed before recovery cleanup: "+target)
+  stem,suffix=os.path.splitext(target); marker={".py":".ptn",".cfg":".cfn",".js":".jfn",".json":".jsn"}.get(suffix)
+  if marker is None: continue
+  prefixes=[ROOT+"/recovery"+stem+marker+"."]
+  if target=="/mnt/UDISK/printer_data/config/printer.cfg": prefixes.append(os.path.join(ROOT,"recovery","printer."))
+  # Include the validated legacy startup path as well as mirrored paths.
+  prefixes.extend(item["backup"][:-len(item["expected"]+".txt")] for item in prepared if item["path"]==target and item.get("recovery"))
+  for prefix in set(prefixes):
+   storage_parent(prefix+"placeholder.txt",False)
+   for path in sorted(glob.glob(glob.escape(prefix)+"*.txt")):
+    checksum=path[len(prefix):-4]
+    if not re.fullmatch(r"[0-9a-f]{64}",checksum) or any(copy["path"]==path for copy in recovery_copies): continue
+    if (any(copy["target"]==target for copy in r.get("recovery_inventory",[]))
+        and not any(item["path"]==target for item in prepared)): continue
+    info=os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_size>2097152: continue
+    data=read(path)
+    if fingerprint(data)!=checksum: continue
+    recovery_copies.append(dict(path=path,old=data,sha256=checksum,attrs=fileattrs(path),target=target,expected=expected))
+ for copy in recovery_copies:
+  guards()
+  if fingerprint(read(copy["target"]))!=copy["expected"]: raise ValueError("Working file changed during recovery cleanup: "+copy["target"])
+  os.unlink(copy["path"]); recovery_removed.append(copy); syncdir(copy["path"])
+ guards()
+ for target,expected in targets.items():
+  if fingerprint(read(target))!=expected: raise ValueError("Working file changed after recovery cleanup: "+target)
+ if database is not None and fluidd()!=database["value"]: raise ValueError("Fluidd macro preferences changed during recovery cleanup")
+ print(json.dumps(dict(saved=[item["path"] for item in replaced],cleared=[item["path"] for item in cleared],moved=[dict(source=move["source"],destination=move["destination"]) for move in migrations],retired=[item["path"] for item in retired],recovery_removed=[copy["path"] for copy in recovery_removed])))
 except Exception as error:
  failures=[]
+ # Restore retired recovery data before attempting any working-file rollback.
+ for copy in reversed(recovery_removed):
+  temporary=None
+  try:
+   path=copy["path"]; current=read(path)
+   if current is not None:
+    if current!=copy["old"] or fileattrs(path)!=copy["attrs"]: raise ValueError("Recovery copy was recreated by another writer")
+   else:
+    temporary=path+".uncursed-pending-"+uuid.uuid4().hex+".txt"; migration_temps.append(temporary)
+    create(temporary,copy["old"],copy["attrs"]); os.link(temporary,path); syncdir(path)
+  except Exception:
+   failures.append(copy["path"])
+   # A failed link must not discard the last intact recovery copy.
+   if temporary and os.path.lexists(temporary):
+    migration_temps.remove(temporary); failures.append(temporary)
  if database_attempted:
   try:
    current=fluidd()

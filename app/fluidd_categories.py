@@ -2,8 +2,13 @@
 from copy import deepcopy
 
 
-MACRO = "screws_tilt_calculate"
+MACRO = "bed_screw_helper"
+LEGACY_MACRO = "screws_tilt_calculate"
 CATEGORY = "UNCURSER"
+
+
+def record_macro(record):
+    return record.get("macro", LEGACY_MACRO)
 
 
 def validate(state):
@@ -15,7 +20,7 @@ def validate(state):
     categories, stored = state.get("categories", []), state.get("stored", [])
     if not isinstance(categories, list) or not isinstance(stored, list):
         raise ValueError("Fluidd macro categories or preferences are invalid.")
-    ids, helpers, targets = set(), 0, 0
+    ids, helpers, targets = set(), {MACRO: 0, LEGACY_MACRO: 0}, 0
     for category in categories:
         if (not isinstance(category, dict) or not isinstance(category.get("id"), str)
                 or not category["id"] or not isinstance(category.get("name"), str)
@@ -27,14 +32,18 @@ def validate(state):
         if (not isinstance(preference, dict) or not isinstance(preference.get("name"), str)
                 or ("categoryId" in preference and not isinstance(preference["categoryId"], str))):
             raise ValueError("Fluidd macro preferences are invalid.")
-        helpers += preference["name"].lower() == MACRO
-    if targets > 1 or helpers > 1:
+        name = preference["name"].lower()
+        if name in helpers:
+            helpers[name] += 1
+    if targets > 1 or any(count > 1 for count in helpers.values()):
         raise ValueError("The Fluidd helper category or macro preference is ambiguous.")
 
 
 def validate_record(record):
     if (not isinstance(record, dict)
-            or set(record) != {"category", "created_category", "created_macro", "previous_category", "missing"}
+            or set(record) not in ({"category", "created_category", "created_macro", "previous_category", "missing"},
+                                  {"category", "created_category", "created_macro", "previous_category", "missing", "macro"})
+            or record_macro(record) not in (MACRO, LEGACY_MACRO)
             or type(record["created_category"]) is not bool
             or type(record["created_macro"]) is not bool):
         raise ValueError("Invalid Fluidd category uninstall instructions.")
@@ -57,6 +66,8 @@ def enable(state, record=None):
     validate(state)
     if record is not None:
         validate_record(record)
+        if record_macro(record) != MACRO:
+            return enable(disable(state, record))
         # Updating helper code must not override a user's later category choice.
         return deepcopy(state), deepcopy(record)
     result = deepcopy(state) if state is not None else {}
@@ -82,7 +93,7 @@ def enable(state, record=None):
     if previous["present"]:
         previous["value"] = preference["categoryId"]
     preference["categoryId"] = category["id"]
-    record = {"category": {"id": category["id"], "name": CATEGORY},
+    record = {"macro": MACRO, "category": {"id": category["id"], "name": CATEGORY},
               "created_category": created_category, "created_macro": created_macro,
               "previous_category": previous, "missing": missing}
     validate_record(record)
@@ -97,7 +108,8 @@ def disable(state, record):
         return None
     result = deepcopy(state)
     stored, categories = result.get("stored", []), result.get("categories", [])
-    preference = next((entry for entry in stored if entry["name"].lower() == MACRO), None)
+    macro = record_macro(record)
+    preference = next((entry for entry in stored if entry["name"].lower() == macro), None)
     category_id = record["category"]["id"]
     if preference is not None and preference.get("categoryId") == category_id:
         previous = record["previous_category"]

@@ -833,6 +833,17 @@ class FirmwareIssuesDialog(QDialog):
             solution = solution if obsolete else "relocation"
             problem = ("Obsolete or unusable backups." if storage_issue.get("damaged") else
                        "Backups from older firmware.") if obsolete else "Stored in the old location."
+            if storage_issue.get("recovery"):
+                recovery_text = "Recovery copies remain from removed mods."
+                if storage_issue.get("originals"):
+                    problem += "<br>" + recovery_text
+                    solution += " and remove leftover recovery copies"
+                elif storage_issue.get("relocation"):
+                    problem = "Backups and uninstall records are stored in the old location.<br>" + recovery_text
+                    solution = "Relocate backups and uninstall records, and remove leftover recovery copies."
+                else:
+                    problem = recovery_text
+                    solution = "Remove leftover recovery copies."
             action = ('<span style="color: #00ff00;">Solution: ' + solution + '</span>' if storage_issue["available"] else
                       html.escape("Unresolved: " + storage_issue["reason"]).replace("\n", "<br>"))
             text = label('Backups and uninstall records<br><span style="color: #ff0000;">' +
@@ -1311,8 +1322,8 @@ class Window(QMainWindow):
         screws_layout.setSpacing(12)
         screws_layout.addWidget(label(
             "<ol><li>After applying and power cycling, clear the bed, clean the nozzle, set the target bed temperature and home all axes.</li>"
-            "<li>Once the bed reaches the target temperature run <code>SCREWS_TILT_CALCULATE</code> macro in Fluidd "
-            "(find it either in TOOLS dropdown on the Tool panel or in the Macros list). "
+            "<li>Once the bed reaches the target temperature run <code>BED_SCREW_HELPER</code> "
+            "in Fluidd's <b>UNCURSER</b> macro category. "
             "It probes a full bed mesh and calculates screw adjustments from its overall tilt. "
             "The popup shows the actual bed temperature when probing starts, for example <b>PROBED AT 70°C</b>.</li>"
             "<li>Leave the base screw unchanged, turn the others as shown, then run it again to check. "
@@ -1810,7 +1821,8 @@ class Window(QMainWindow):
         else:
             self.run_task(lambda progress: engine.apply(connection, self.known_hosts, scanned,
                                                        progress=progress, **options,
-                                                       **({"retire_old_backups": True} if scanned.storage_cleanup else {})), fixed)
+                                                       **({"retire_old_backups": True} if scanned.storage_cleanup else {}),
+                                                       **({"cleanup_recovery": True} if scanned.recovery_cleanup else {})), fixed)
 
     def receive_scan(self, result, connection, review=True):
         self.connected = True

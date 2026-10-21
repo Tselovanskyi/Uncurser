@@ -21,7 +21,7 @@ Use
 
 Clear the bed, clean the nozzle, heat the bed to the chosen temperature and
 home all axes. Once the bed reaches that temperature, run:
-SCREWS_TILT_CALCULATE
+BED_SCREW_HELPER
 
 Leave the screw marked "base" unchanged and adjust the other screws as shown.
 CW means clockwise; CCW means counter-clockwise. 18° means 1/20 of a turn;
@@ -42,7 +42,7 @@ Manual installation of these two helper files changes console output only;
 Fluidd's standard window keeps its original turns:minutes display.
 
 Optional example:
-SCREWS_TILT_CALCULATE DIRECTION=CW MAX_DEVIATION=0.05
+BED_SCREW_HELPER DIRECTION=CW MAX_DEVIATION=0.05
 
 DIRECTION selects a reference screw so adjustments use the requested direction.
 MAX_DEVIATION is the allowed height difference from that reference, in mm;
