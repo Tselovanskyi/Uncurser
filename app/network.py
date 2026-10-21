@@ -4,6 +4,7 @@ import json
 import re
 import socket
 import threading
+import urllib.error
 import urllib.request
 
 import websocket
@@ -90,6 +91,19 @@ def http(host, route, payload=None, timeout=5):
     if "error" in result:
         raise RuntimeError(str(result["error"]))
     return result.get("result", result)
+
+
+def fluidd_macros(host):
+    """Read Fluidd's saved macro preferences; a missing key is a fresh setup."""
+    try:
+        result = http(host, "/server/database/item?namespace=fluidd&key=macros")
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        return None
+    if not isinstance(result, dict) or "value" not in result:
+        raise ValueError("Fluidd macro preferences could not be read.")
+    return result["value"]
 
 
 def native_status(host):

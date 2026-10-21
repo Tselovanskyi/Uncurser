@@ -3,7 +3,7 @@ import difflib
 import json
 import re
 
-from . import fluidd_screws, mesh, mesh_temperature, mod_comments, mods, screws, smoothing, storage, warmup
+from . import fluidd_categories, fluidd_screws, mesh, mesh_temperature, mod_comments, mods, screws, smoothing, storage, warmup
 
 TARGET = storage.RECORDS
 ORIGINAL = storage.original(TARGET)
@@ -16,6 +16,7 @@ LEGACY_TARGETS = frozenset((mods.TARGET, mesh.TARGET, mesh_temperature.TARGET))
 HELPER_CONFIG_REVISION = "0.1.15"
 VERSIONS = {module: "0.1.16" for module in
             (mods.TARGET, mesh.TARGET, mesh_temperature.TARGET, screws.PYTHON, smoothing.TARGET, warmup.TARGET)}
+VERSIONS[screws.PYTHON] = "0.1.17"
 MODULES = {module.TARGET: module for module in (mods, mesh, mesh_temperature, smoothing, warmup)}
 # Every mod must declare its complete file scope before it can be applied.
 FILES = {path: (path,) for path in MODULES}
@@ -120,6 +121,9 @@ def _unknown_scope(path, record):
     optional = {"firmware"} if "firmware" in record else set()
     if optional:
         validate_firmware(record["firmware"])
+    if "fluidd_category" in record:
+        fluidd_categories.validate_record(record["fluidd_category"])
+        optional.add("fluidd_category")
     if set(record) == {"version", "undo"} | optional:
         validate_changes(record["undo"])
         scope = (path,)
@@ -175,6 +179,11 @@ def load(data):
         optional = {"firmware"} if "firmware" in record else set()
         if optional:
             validate_firmware(record["firmware"])
+        if "fluidd_category" in record:
+            if path != screws.PYTHON:
+                raise ValueError("Unexpected Fluidd category uninstall record.")
+            fluidd_categories.validate_record(record["fluidd_category"])
+            optional.add("fluidd_category")
         if len(FILES[path]) == 1:
             if set(record) != {"version", "undo"} | optional:
                 raise ValueError("Invalid single-file mod record.")

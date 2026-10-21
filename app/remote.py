@@ -96,6 +96,32 @@ print(json.dumps(dict(files=files,patterns=patterns)))
 APPLY_BATCH = '''import os,sys,json,base64,hashlib,stat,uuid,ast,glob,fnmatch,configparser,re,posixpath
 r=json.load(sys.stdin); items=r["files"]; prepared=[]; replaced=[]; caches=[]; cleared=[]
 ROOT="/mnt/UDISK/Uncurser"; migrations=[]; copied=[]; removed=[]; migration_temps=[]; retirements=[]; retired=[]
+database=r.get("fluidd_category"); database_attempted=False; database_done=False
+def fluidd(method="GET",value=None):
+ import urllib.request,urllib.error
+ payload=None if method=="GET" else json.dumps(dict(namespace="fluidd",key="macros",value=value)).encode()
+ request=urllib.request.Request("http://127.0.0.1:7125/server/database/item?namespace=fluidd&key=macros",data=payload,headers={"Content-Type":"application/json"},method=method)
+ opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+ try:
+  with opener.open(request,timeout=5) as response: body=response.read(2097153)
+ except urllib.error.HTTPError as error:
+  if method=="GET" and error.code==404: return None
+  raise
+ if len(body)>2097152: raise ValueError("Fluidd macro preferences are too large")
+ result=json.loads(body)
+ if "error" in result: raise ValueError("Fluidd macro preferences: "+str(result["error"]))
+ result=result.get("result",result)
+ if method=="GET":
+  if not isinstance(result,dict) or not isinstance(result.get("value"),dict): raise ValueError("Invalid Fluidd macro preferences")
+  return result["value"]
+def write_fluidd():
+ global database_attempted,database_done
+ if database is None or database_done: return
+ if fluidd()!=database["expected"]: raise ValueError("Fluidd macro preferences changed; scan again")
+ database_attempted=True
+ fluidd("DELETE" if database["value"] is None else "POST",database["value"])
+ if fluidd()!=database["value"]: raise ValueError("Saved Fluidd macro preferences could not be verified")
+ database_done=True
 def sha(data): return hashlib.sha256(data).hexdigest()
 def read(path):
  try: s=os.lstat(path)
@@ -192,6 +218,9 @@ def retirement_guard(item):
   if os.path.lexists(path): raise ValueError("Retired original was recreated: "+path)
  elif fingerprint(read(path))!=item["sha256"] or (item["sha256"] is not None and fileattrs(path)!=item["attrs"]): raise ValueError("Old original backup changed since scan: "+path)
 try:
+ if database is not None:
+  if not isinstance(database,dict) or set(database)!={"expected","value"} or any(value is not None and not isinstance(value,dict) for value in database.values()): raise ValueError("Invalid Fluidd category change")
+  if fluidd()!=database["expected"]: raise ValueError("Fluidd macro preferences changed; scan again")
  # Retire only reserved original pairs matching their scanned state and reason.
  for entry in r.get("retire",[]):
   target=entry["target"]; backup=entry["backup"]; model=entry["model"]; release=entry.get("firmware"); reason=entry.get("reason","obsolete")
@@ -420,6 +449,7 @@ try:
   os.unlink(item["path"]); cleared.append(item); syncdir(item["path"])
  for item in prepared:
   guards()
+  if item["path"]==os.path.join(ROOT,"Uncurser_mods.json"): write_fluidd()
   if fingerprint(read(item["path"]))!=item["expected"]: raise ValueError("Working file changed before replacement")
   if item["new"] is None: os.unlink(item["path"])
   elif item["old"] is None: os.link(item["tmp"],item["path"])
@@ -427,6 +457,8 @@ try:
   replaced.append(item); syncdir(item["path"])
   if os.path.exists(item["tmp"]): os.unlink(item["tmp"])
   if fingerprint(read(item["path"]))!=item["new_hash"]: raise ValueError("Working file changed after replacement")
+ write_fluidd()
+ if database is not None and fluidd()!=database["value"]: raise ValueError("Fluidd macro preferences changed during Apply")
  guards()
  for source in cache_sources:
   for path in cache_paths(source):
@@ -448,6 +480,23 @@ try:
  print(json.dumps(dict(saved=[item["path"] for item in replaced],cleared=[item["path"] for item in cleared],moved=[dict(source=move["source"],destination=move["destination"]) for move in migrations],retired=[item["path"] for item in retired])))
 except Exception as error:
  failures=[]
+ if database_attempted:
+  try:
+   current=fluidd()
+   if current==database["value"]:
+    fluidd("DELETE" if database["expected"] is None else "POST",database["expected"])
+    if fluidd()!=database["expected"]: raise ValueError("Fluidd rollback could not be verified")
+   elif current!=database["expected"]: raise ValueError("Fluidd preferences changed by another writer")
+  except Exception:
+   failures.append("Fluidd macro preferences")
+   # Keep the data-only undo proof if Moonraker becomes unavailable after
+   # committing its write, even when file rollback has to remove the new ledger.
+   try:
+    proof=json.dumps(dict(change=database,records=next(item["new"].decode("utf-8") for item in prepared if item["path"]==os.path.join(ROOT,"Uncurser_mods.json") and item["new"] is not None))).encode()
+    path=os.path.join(ROOT,"recovery","fluidd-category-"+sha(proof)+".txt")
+    if read(path) is None: create(path,proof,dict(mode=0o600,uid=os.getuid(),gid=os.getgid()))
+    failures.append(path)
+   except Exception: failures.append("Fluidd category recovery proof could not be saved")
  # Originals remain available until all working changes and records commit.
  for item in reversed(retired):
   try:

@@ -14,7 +14,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 
-from . import fluidd_screws, mesh, mesh_temperature, mod_comments, mod_versions, mods, network, recovery, screws, smoothing, stock, storage, warmup
+from . import fluidd_categories, fluidd_screws, mesh, mesh_temperature, mod_comments, mod_versions, mods, network, recovery, screws, smoothing, stock, storage, warmup
 from .remote import APPLY_BATCH, CONFIG_TREE, Remote
 
 
@@ -75,6 +75,8 @@ class Snapshot:
     unknown_files: dict = field(default_factory=dict)
     ignored_mods: tuple = ()
     warmup: MeshSnapshot | None = None
+    fluidd_macros: dict | None = None
+    fluidd_error: str = ""
 
 
 def version_snapshot(snapshot):
@@ -570,6 +572,7 @@ def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods
     with Remote(connection, known_hosts) as remote:
         remote = storage.Reader(remote)
         status_result = Future()
+        macro_result = Future()
         def read_status():
             try:
                 status_result.set_result((network.status(connection.host), ""))
@@ -577,6 +580,14 @@ def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods
                 status_result.set_result((None, str(error)))
         # A pending status read must not hold the app open when a scan is closed.
         threading.Thread(target=read_status, daemon=True, name="printer-status").start()
+        def read_macros():
+            try:
+                value = network.fluidd_macros(connection.host)
+                fluidd_categories.validate(value)
+                macro_result.set_result((value, ""))
+            except Exception as error:
+                macro_result.set_result((None, str(error) or type(error).__name__))
+        threading.Thread(target=read_macros, daemon=True, name="fluidd-preferences").start()
         remote.prefetch(scan_paths())
         current = remote.read(mods.TARGET)
         identity = remote.identity()
@@ -611,6 +622,7 @@ def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods
         recovery_files = (remote.read(mesh.TARGET), remote.read(screws.LEGACY_CONFIG), remote.read(screws.CONFIG))
         progress("Reading printer status…")
         state, status_error = status_result.result()
+        macro_preferences, macro_error = macro_result.result()
         storage_cleanup = storage.obsolete_originals(remote,
             {filename for scope in mod_versions.FILES.values() for filename in scope} | {screws.LEGACY_CONFIG},
             network.device_identity(state))
@@ -664,7 +676,8 @@ def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods
                     smoothing=smoothing_snapshot, homing=homing_snapshot,
                     recovery=recovery.inspect(state, *recovery_files), storage_moves=storage_moves,
                     original_identity=original_source, stock=stock_snapshot, storage_cleanup=storage_cleanup,
-                    unknown_files=unknown_files, ignored_mods=tuple(ignored_mods), warmup=warmup_snapshot)
+                    unknown_files=unknown_files, ignored_mods=tuple(ignored_mods), warmup=warmup_snapshot,
+                    fluidd_macros=macro_preferences, fluidd_error=macro_error)
     result.storage_error = "\n".join(dict.fromkeys(
         value.backup_error for module, value in file_entries(result) if value and value.backup_error
         and module.TARGET not in result.unknown_files
@@ -1066,6 +1079,42 @@ def capture_helper(baseline, enabled, *, firmware=None):
     return mod_versions.capture_files(screws.PYTHON, baseline, enabled, pairs, firmware=firmware)
 
 
+def category_change(snapshot, prepared):
+    """Compose saved, data-only Fluidd preference undo with this file batch."""
+    if mod_versions.TARGET not in prepared:
+        return None
+    try:
+        before = installed_records(snapshot)
+    except ValueError:
+        # Full original-file restoration may recover an unreadable ledger;
+        # unreadable preference instructions cannot authorize database edits.
+        return None
+    after = mod_versions.load(prepared[mod_versions.TARGET])
+    changes = [(before.get(owner, {}).get("fluidd_category"), after.get(owner, {}).get("fluidd_category"))
+               for owner in before.keys() | after.keys()
+               if before.get(owner, {}).get("fluidd_category") != after.get(owner, {}).get("fluidd_category")]
+    if not changes:
+        return None
+    if snapshot.fluidd_error:
+        raise ValueError("Cannot read Fluidd macro preferences: " + snapshot.fluidd_error)
+    value = snapshot.fluidd_macros
+    for old, new in changes:
+        if old is not None:
+            value = fluidd_categories.disable(value, old)
+        if new is not None:
+            value, captured = fluidd_categories.enable(value)
+            if captured != new:
+                raise ValueError("Fluidd macro preferences changed after scan. Scan again before applying.")
+    return {"expected": snapshot.fluidd_macros, "value": value} if value != snapshot.fluidd_macros else None
+
+
+def category_difference(change):
+    if not change:
+        return ""
+    return file_difference("Fluidd macro preferences", (json.dumps(change["expected"], indent=2) + "\n").encode(),
+        (json.dumps(change["value"], indent=2) + "\n").encode(), "Current Fluidd macro preferences", "Pending Fluidd macro preferences")
+
+
 def inspect_helper_baseline(snapshot, baseline, tree):
     if isinstance(tree, Exception) or snapshot.mesh.analysis.get("include_error"):
         raise ValueError("The helper's active configuration includes need attention.")
@@ -1459,7 +1508,13 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
                 records.pop(path, None)
             else:
                 if path == screws.PYTHON:
+                    category = records.get(path, {}).get("fluidd_category")
+                    if category is None:
+                        if snapshot.fluidd_error:
+                            raise ValueError("Cannot read Fluidd macro preferences: " + snapshot.fluidd_error)
+                        _, category = fluidd_categories.enable(snapshot.fluidd_macros)
                     records[path] = capture_helper(baselines[path], {name: results[name] for name in mod_versions.FILES[path]}, firmware=firmware)
+                    records[path]["fluidd_category"] = category
                 elif path == smoothing.TARGET:
                     records[path] = capture_homing(baselines[path], {name: results[name] for name in mod_versions.FILES[path]}, firmware=firmware)
                 else:
@@ -1518,7 +1573,8 @@ def difference_all(snapshot, desired, mesh_desired=None, restore=False, full_ris
     statuses = removal_statuses(snapshot) if not restore and any(c is False for c in choices.values()) else {}
     recovery_notes = "".join(statuses[path]["details"] + "\n" for path, choice in choices.items()
                              if choice is False and statuses[path].get("recovery"))
-    return moves + deleted + recovery_notes + "".join(file_difference(path, file_snapshot(snapshot, path).data, data,
+    category = category_change(snapshot, prepared)
+    return moves + deleted + recovery_notes + category_difference(category) + "".join(file_difference(path, file_snapshot(snapshot, path).data, data,
         "Current " + path if file_snapshot(snapshot, path).data is not None else "/dev/null",
         "Pending " + path if data is not None else "/dev/null")
         for path, data in prepared.items()) or "No changes."
@@ -1535,7 +1591,7 @@ def initial_difference(snapshot, path):
     """Read-only preview of first enablement, independent of staged/current state."""
     if snapshot is None:
         raise ValueError("Scan the printer to load the files for this comparison.")
-    owner = path
+    owner = screws.PYTHON if path == screws.MOD_ID else path
     def stamp(filename, data):
         return mod_comments.put(data, owner, mod_versions.VERSIONS[owner],
                                 network.device_identity(snapshot.status)[1], filename)
@@ -1555,6 +1611,17 @@ def initial_difference(snapshot, path):
         diff = "".join(file_difference(path, before[path], data,
             "Original " + path if before[path] is not None else "/dev/null",
             "Enabled " + path) for path, data in after.items())
+        if snapshot.fluidd_error:
+            raise ValueError("Cannot read Fluidd macro preferences: " + snapshot.fluidd_error)
+        preferences = snapshot.fluidd_macros
+        try:
+            record = installed_records(snapshot).get(screws.PYTHON, {}).get("fluidd_category")
+        except ValueError:
+            record = None
+        if record:
+            preferences = fluidd_categories.disable(preferences, record)
+        categorized, _ = fluidd_categories.enable(preferences)
+        diff += category_difference({"expected": preferences, "value": categorized})
         return diff, "Baseline: on-printer original backups, or scanned files before the first Apply."
     if path == smoothing.TARGET:
         if mod_snapshot(snapshot, path) is None:
@@ -1730,6 +1797,7 @@ def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore,
                 or getattr(new, "original_absent", False) != getattr(old, "original_absent", False)):
             raise RuntimeError("Printer files changed after the last scan. Scan again; staged choices are retained.")
     pending = prepare_all(fresh, desired, mesh_desired, restore, full_risk, temperature_desired, screws_desired, update, smoothing_desired, **scope)
+    category = category_change(fresh, pending)
     if repair is not None:
         retained = installed_records(fresh)
         updated = mod_versions.load(pending.get(mod_versions.TARGET, version_snapshot(fresh).data))
@@ -1751,7 +1819,7 @@ def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore,
                           or data is None or data != file_snapshot(fresh, path).data)}
     pending = {path: data for path, data in pending.items()
                if data != file_snapshot(fresh, path).data}
-    if not pending and not python_caches and not moves and not retire:
+    if not pending and not python_caches and not moves and not retire and not category:
         return {"snapshot": fresh, "message": "Printer files already match the requested state.", "restarted": False, "written": False}
     enabling_heat = desired is not False and not restore and not unknown_removals
     if mods.TARGET in pending and enabling_heat and not fresh.identity.get("history"):
@@ -1907,12 +1975,15 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
                 raise ValueError("Printer startup error changed during Apply. Scan again before removing mods.")
         progress("Writing printer files…")
         outcome = remote.python(APPLY_BATCH, {"files": items, "python_caches": python_caches, "moves": list(moves), "retire": list(retire),
+                                   "fluidd_category": category,
                                    "guards": guards, "patterns": patterns,
                                    "verify_config": screws_desired is False or bool(unknown_removals),
                                    "firmware": fresh.status["native"].get("modelVersion"),
                                    "model": fresh.status["native"].get("model")})
     progress("Verifying saved printer files…")
     result = rescan(connection, known_hosts, scanned, progress)
+    if category and (result.fluidd_error or result.fluidd_macros != category["value"]):
+        raise RuntimeError("Saved printer files, but Fluidd macro preferences could not be verified. Scan again before proceeding.")
     if retire and set(outcome.get("retired", ())) != retired_paths:
         raise RuntimeError("Backup cleanup did not complete. Scan the printer before applying again.")
     moved_sources = {move["source"] for move in moves}
