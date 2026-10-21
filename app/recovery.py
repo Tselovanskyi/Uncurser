@@ -3,7 +3,7 @@ import base64
 import posixpath
 import re
 
-from . import config_blocks, mesh, mods, network, screws, storage
+from . import config_blocks, mesh, mod_comments, mods, network, screws, storage
 from .remote import APPLY_BATCH, Remote
 
 
@@ -43,9 +43,10 @@ def inspect(status, root_file_read, legacy_cfg_read, current_cfg_read):
         if any(type(value) is not int or value < 0 for value in attrs.values()) or attrs["mode"] > 0o7777:
             raise ValueError("The printer configuration attributes could not be verified.")
         regular, generated = mesh.split(before)
-        remaining, enabled = config_blocks.strip_screws_include(regular)
+        code = mod_comments.strip(regular.encode("utf-8")).decode("utf-8")
+        remaining, enabled = screws.strip_screws_include(regular)
         block = config_blocks.LEGACY_SCREWS_INCLUDE if missing == screws.LEGACY_CONFIG else config_blocks.SCREWS_INCLUDE
-        prefix = regular[:len(regular) - len(remaining)]
+        prefix = code[:len(regular) - len(remaining)]
         if not enabled or prefix.replace("\r\n", "\n") != block:
             raise ValueError("The missing include is not an unchanged Uncurser helper block.")
         for line in remaining.splitlines():
@@ -54,10 +55,15 @@ def inspect(status, root_file_read, legacy_cfg_read, current_cfg_read):
                 raise ValueError("Another helper include needs review before startup can be repaired.")
         mesh.parser(remaining)
         after = (remaining + generated).encode("utf-8")
-        if before[len(prefix.encode("utf-8")):] != after:
+        removed = prefix.encode("utf-8")
+        if before.count(removed) != 1 or before.replace(removed, b"", 1) != after:
             raise ValueError("Startup repair would change unrelated configuration data.")
+        leading = before[:before.index(removed)]
+        if mod_comments.strip(leading):
+            raise ValueError("Only verified metadata may precede the helper include.")
         result.update(available=True, message="The firmware update removed a mod's file.",
-                      sha256=root_file_read["sha256"], before=before, after=after, attrs=attrs)
+                      sha256=root_file_read["sha256"], before=before, after=after, attrs=attrs,
+                      removed_prefix=removed, leading_comments=leading)
     except (ValueError, TypeError, UnicodeError) as error:
         result["message"] = str(error)
     return result
@@ -77,12 +83,14 @@ def repair(connection, known_hosts, scanned_recovery, progress=lambda message: N
         if any(fresh[key] != scanned_recovery.get(key) for key in ("sha256", "before", "after", "missingpath", "attrs")):
             raise ValueError("Printer files changed after the last scan. Scan again before repairing startup.")
         progress("Saving a recovery copy and removing the missing helper include…")
-        prefix = fresh["before"][:len(fresh["before"]) - len(fresh["after"])]
+        prefix = fresh["removed_prefix"]
         remote.python(APPLY_BATCH, {"files": [{"path": mesh.TARGET, "kind": "config", "recovery": True,
             "backup": storage.ROOT + "/recovery/printer." + fresh["sha256"] + ".txt",
             "expected": fresh["sha256"], "expected_attrs": fresh["attrs"],
             "data": base64.b64encode(fresh["after"]).decode(), "new_hash": mods.digest(fresh["after"]),
-            "removed_prefix": base64.b64encode(prefix).decode()}], "guards": {fresh["missingpath"]: None}})
+            "removed_prefix": base64.b64encode(prefix).decode(),
+            "leading_comments": base64.b64encode(fresh["leading_comments"]).decode()}],
+            "guards": {fresh["missingpath"]: None}})
         saved = remote.read(mesh.TARGET)
         if not saved or saved["data"] != fresh["after"] or any(saved[key] != fresh["attrs"][key] for key in fresh["attrs"]):
             raise RuntimeError("Could not verify startup repair. Scan the printer before restarting it.")

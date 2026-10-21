@@ -19,7 +19,8 @@ def defer(jobs):
 class TaskLifetimeTests(unittest.TestCase):
     def operation_window(self):
         return SimpleNamespace(busy=False, closing=False, reachability_generation=0, apply_waiting=None,
-                               scan_button=Mock(), scan_progress=Mock(), refresh=Mock(), active_task=None)
+                               scan_button=Mock(), scan_progress=Mock(), refresh=Mock(), active_task=None,
+                               disconnect_timer=Mock(), connect_cancel_ready=False, connected=False, snapshot=None)
 
     def test_finished_and_cancelled_planners_release_tasks_after_replacement(self):
         for cancelled in (False, True):

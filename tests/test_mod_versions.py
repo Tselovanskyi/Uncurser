@@ -293,9 +293,12 @@ class ModVersionTests(unittest.TestCase):
 
     def test_invalid_schema_paths_and_undo_are_rejected(self):
         record = {"version": "0.1.5", "undo": [{"before": "x = 1\n", "after": "x = 2\n"}]}
+        unknown = {"/etc/shadow": record}
+        self.assertEqual(mod_versions.load(json.dumps({"schema": 1, "mods": unknown}).encode()), unknown)
+        with self.assertRaises(ValueError):
+            mod_versions.file_scope("/etc/shadow", record)
         invalid = [
             {"schema": 2, "mods": {}},
-            {"schema": 1, "mods": {"/etc/shadow": record}},
             {"schema": 1, "mods": {mods.TARGET: {**record, "version": "latest"}}},
             {"schema": 1, "mods": {mods.TARGET: {**record, "undo": [{"before": "x", "after": ""}]}}},
             {"schema": 1, "mods": {mods.TARGET: {**record, "undo": [{"before": "x", "after": "y", "exec": "ignored"}]}}},

@@ -6,12 +6,15 @@ import copy
 import difflib
 import fnmatch
 import json
+import posixpath
+import re
 import threading
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 
-from . import fluidd_screws, mesh, mesh_temperature, mod_versions, mods, network, recovery, screws, smoothing, stock, storage
+from . import fluidd_screws, mesh, mesh_temperature, mod_comments, mod_versions, mods, network, recovery, screws, smoothing, stock, storage, warmup
 from .remote import APPLY_BATCH, CONFIG_TREE, Remote
 
 
@@ -46,8 +49,8 @@ class ScrewsSnapshot:
 
 @dataclass
 class Snapshot:
-    data: bytes
-    sha256: str
+    data: bytes | None
+    sha256: str | None
     analysis: dict
     original: bytes | None
     original_hash: str | None
@@ -69,6 +72,9 @@ class Snapshot:
     original_identity: tuple[str, str] | None = None
     stock: dict | None = None
     storage_cleanup: tuple = ()
+    unknown_files: dict = field(default_factory=dict)
+    ignored_mods: tuple = ()
+    warmup: MeshSnapshot | None = None
 
 
 def version_snapshot(snapshot):
@@ -92,6 +98,17 @@ def installed_records(snapshot, *, removal=False):
     if value.data is not None and mods.digest(value.data) != value.sha256:
         raise ValueError("Mod version records do not match their scanned checksum.")
     return mod_versions.load(value.data)
+
+
+def record_scopes(records, *, strict=False):
+    scopes = dict(mod_versions.FILES)
+    for owner, record in records.items():
+        try:
+            reader = mod_versions.file_scope if strict or owner in mod_versions.VERSIONS else mod_versions.discovery_scope
+            scopes[owner] = reader(owner, record)
+        except (ValueError, TypeError, AttributeError, UnicodeError):
+            scopes[owner] = None
+    return scopes
 
 
 def original_identity(meta):
@@ -139,6 +156,11 @@ def version_details(snapshot, path):
         if record:
             record_baseline(snapshot, path, record)
             return "v" + record["version"]
+        headers = [stamp for filename in mod_versions.FILES[path]
+                   for value in (file_snapshot(snapshot, filename),) if value and value.data is not None
+                   for owner, stamp in mod_comments.read(value.data).items() if owner == path]
+        if headers and all(stamp == headers[0] for stamp in headers):
+            return "v" + headers[0]["version"]
         value = mod_snapshot(snapshot, path)
         return "v" + mod_versions.LEGACY_VERSION if path in mod_versions.LEGACY_TARGETS and value.analysis.get("enabled") is True and value.analysis.get("known") else "Unknown version"
     except (ValueError, TypeError, AttributeError, UnicodeError):
@@ -360,8 +382,6 @@ def scan_fluidd_screws(remote):
     for module in fluidd_screws.FILES:
         try:
             current = remote.read(module.TARGET)
-            if current is None:
-                raise ValueError("Fluidd file not found: " + module.TARGET)
             saved, manifest = remote.read(module.ORIGINAL), remote.read(module.MANIFEST)
             error, identity = "", None
             if saved is not None or manifest is not None:
@@ -376,18 +396,20 @@ def scan_fluidd_screws(remote):
                     identity = original_identity(meta)
                 except (ValueError, UnicodeError) as exc:
                     error = str(exc)
-            analysis = fluidd_screws.inspect(module, current["data"])
+            analysis = fluidd_screws.inspect(module, current["data"]) if current else {
+                "known": True, "enabled": False, "patchable": False, "label": "Not installed",
+                "reason": "The Fluidd file is missing: " + module.TARGET}
             if guard_error:
                 analysis = {**analysis, "known": False, "patchable": False, "label": "Conflict", "reason": guard_error,
                             "dependency_error": guard_error}
-            files[module.TARGET] = MeshSnapshot(current["data"], current["sha256"], analysis,
+            files[module.TARGET] = MeshSnapshot(current["data"] if current else None, current["sha256"] if current else None, analysis,
                                                 saved["data"] if saved else None, saved["sha256"] if saved else None,
                                                 error, guards=dict(guards),
                                                 backup_guards={module.ORIGINAL: saved["sha256"] if saved else None,
                                                                module.MANIFEST: manifest["sha256"] if manifest else None},
                                                 original_identity=identity)
         except (ValueError, RuntimeError, OSError) as error:
-            files[module.TARGET] = MeshSnapshot(None, None, {"known": False, "enabled": None,
+            files[module.TARGET] = MeshSnapshot(b"", "", {"known": False, "enabled": None,
                 "patchable": False, "label": "Unavailable", "reason": str(error)})
     return files
 
@@ -450,13 +472,10 @@ def scan_config(remote, module, tree):
                                       "label": "Unavailable", "reason": str(error)})
 
 
-def scan_homing(remote):
-    module = smoothing.HOMING
+def scan_homing(remote, module=smoothing.HOMING):
     try:
         current, original, manifest = (remote.read(path) for path in
             (module.TARGET, module.ORIGINAL, module.MANIFEST))
-        if current is None:
-            raise ValueError("The existing homing module was not found: " + module.TARGET)
         backup_error, identity = "", None
         if original is not None or manifest is not None:
             try:
@@ -472,8 +491,10 @@ def scan_homing(remote):
             except (ValueError, SyntaxError, AttributeError, UnicodeError) as error:
                 backup_error = str(error)
         saved = original["data"] if original else None
-        return MeshSnapshot(current["data"], current["sha256"],
-            module.inspect(current["data"], saved if not backup_error else None),
+        return MeshSnapshot(current["data"] if current else None, current["sha256"] if current else None,
+            module.inspect(current["data"], saved if not backup_error else None) if current else
+            {"known": True, "enabled": False, "patchable": False, "label": "Not installed",
+             "reason": "The printer module is missing: " + module.TARGET},
             saved, original["sha256"] if original else None, backup_error,
             backup_guards={module.ORIGINAL: original["sha256"] if original else None,
                            module.MANIFEST: manifest["sha256"] if manifest else None},
@@ -488,6 +509,7 @@ def scan_paths():
     for module in (mesh, mesh_temperature, smoothing):
         paths.extend((module.TARGET, module.ORIGINAL, module.MANIFEST))
     paths.extend((smoothing.HOMING.TARGET, smoothing.HOMING.ORIGINAL, smoothing.HOMING.MANIFEST))
+    paths.extend((warmup.TARGET, warmup.ORIGINAL, warmup.MANIFEST))
     for module in screws.SCAN_FILES:
         paths.extend((module.TARGET, module.ORIGINAL, module.MANIFEST))
     paths.append(fluidd_screws.INDEX)
@@ -498,7 +520,52 @@ def scan_paths():
     return storage.scan_paths(paths)
 
 
-def scan(connection, known_hosts, progress=lambda message: None):
+def recorded_file(path):
+    original = storage.original(path)
+    return SimpleNamespace(TARGET=path, ORIGINAL=original, MANIFEST=original + ".json",
+                           REFERENCE_HASH="uncurser-recorded-file-schema-1")
+
+
+def scan_recorded_file(remote, path):
+    module = recorded_file(path)
+    guards = {}
+    try:
+        current, saved, manifest = (remote.read(name) for name in (path, module.ORIGINAL, module.MANIFEST))
+        if path.endswith(".js"):
+            for suffix in (".gz", ".br"):
+                alternate = remote.read(path + suffix)
+                guards[path + suffix] = alternate["sha256"] if alternate else None
+    except (ValueError, RuntimeError, OSError) as exc:
+        return MeshSnapshot(None, None, {"known": True, "enabled": None, "patchable": False,
+            "label": "Unavailable", "reason": str(exc)}, backup_error=str(exc))
+    error, absent, identity = "", False, None
+    try:
+        if saved is not None or manifest is not None:
+            if saved is None or manifest is None:
+                raise ValueError("An original backup or its manifest is missing.")
+            meta = json.loads(manifest["data"])
+            absent = meta.get("absent", False)
+            if (meta.get("path") != path or meta.get("sha256") != saved["sha256"]
+                    or type(absent) is not bool or (absent and saved["data"] != b"")
+                    or any(type(meta.get(key)) is not int for key in ("mode", "uid", "gid"))):
+                raise ValueError("The original backup or absence proof is damaged.")
+            identity = original_identity(meta)
+    except (ValueError, TypeError, AttributeError, UnicodeError) as exc:
+        error = str(exc)
+    if any(guards.values()):
+        error = error or "A compressed copy of this interface file is present; removal could leave its code active."
+    data = current["data"] if current else None
+    original = saved["data"] if saved and not absent else None
+    restored = saved is not None and not error and (data is None if absent else data == original)
+    return MeshSnapshot(data, current["sha256"] if current else None,
+        {"known": True, "enabled": not restored, "patchable": False,
+         "label": "Original" if restored else "Unknown mod", "reason": ""},
+        original, saved["sha256"] if saved else None, error, guards=guards, original_absent=absent,
+        backup_guards={module.ORIGINAL: saved["sha256"] if saved else None,
+                       module.MANIFEST: manifest["sha256"] if manifest else None}, original_identity=identity)
+
+
+def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods=(), unknown_paths=()):
     progress("Reading current printer files…")
     with Remote(connection, known_hosts) as remote:
         remote = storage.Reader(remote)
@@ -512,8 +579,6 @@ def scan(connection, known_hosts, progress=lambda message: None):
         threading.Thread(target=read_status, daemon=True, name="printer-status").start()
         remote.prefetch(scan_paths())
         current = remote.read(mods.TARGET)
-        if current is None:
-            raise RuntimeError("The supported K2 Plus file was not found: " + mods.TARGET)
         identity = remote.identity()
         original = remote.read(mods.ORIGINAL)
         manifest = remote.read(mods.MANIFEST)
@@ -525,8 +590,24 @@ def scan(connection, known_hosts, progress=lambda message: None):
         temperature_snapshot = scan_config(remote, mesh_temperature, tree)
         smoothing_snapshot = scan_config(remote, smoothing, tree)
         homing_snapshot = scan_homing(remote)
+        warmup_snapshot = scan_homing(remote, warmup)
         screws_snapshot = scan_screws(remote, mesh_snapshot, tree)
         versions_snapshot = scan_versions(remote)
+        records = mod_versions.load(versions_snapshot.data) if versions_snapshot.analysis["known"] else {}
+        known_paths = {mods.TARGET, mesh.TARGET, mesh_temperature.TARGET, smoothing.TARGET,
+                       smoothing.HOMING.TARGET, warmup.TARGET, *(module.TARGET for module in screws.SCAN_FILES),
+                       *(module.TARGET for module in fluidd_screws.FILES)}
+        scopes = record_scopes(records, strict=True)
+        extra_paths = set(unknown_paths) | {filename for owner, scope in scopes.items()
+            if owner not in mod_versions.VERSIONS and scope is not None for filename in scope}
+        extra_paths.difference_update(known_paths)
+        if extra_paths:
+            extra_reads = [name for path in sorted(extra_paths)
+                for name in (path, storage.original(path), storage.original(path) + ".json")]
+            extra_reads.extend(path + suffix for path in sorted(extra_paths) if path.endswith(".js")
+                               for suffix in (".gz", ".br"))
+            remote.remote.prefetch(storage.scan_paths(scan_paths() + extra_reads))
+        unknown_files = {path: scan_recorded_file(remote, path) for path in sorted(extra_paths)}
         recovery_files = (remote.read(mesh.TARGET), remote.read(screws.LEGACY_CONFIG), remote.read(screws.CONFIG))
         progress("Reading printer status…")
         state, status_error = status_result.result()
@@ -537,22 +618,28 @@ def scan(connection, known_hosts, progress=lambda message: None):
         # Stock data is a recovery source, never a replacement for originals.
         values = {mesh.TARGET: mesh_snapshot, mesh_temperature.TARGET: temperature_snapshot,
                   smoothing.TARGET: smoothing_snapshot, smoothing.HOMING.TARGET: homing_snapshot,
+                  warmup.TARGET: warmup_snapshot,
                   **(screws_snapshot.files if screws_snapshot else {}),
                   **(screws_snapshot.frontend if screws_snapshot else {})}
-        records = mod_versions.load(versions_snapshot.data) if versions_snapshot.analysis["known"] else {}
+        values.update(unknown_files)
         missing_proof = versions_snapshot.data is None or bool(versions_snapshot.backup_error) or any(
             (original is None if filename == mods.TARGET else
              values.get(filename) is None or values[filename].original is None)
-            for path, record in records.items() for filename in mod_versions.file_scope(path, record))
+            for path, record in records.items() for filename in (scopes.get(path) or ()))
         changed_firmware = any(record.get("firmware") != network.device_identity(state)[1]
                                for record in records.values())
+        added_paths = {filename for owner, record in records.items()
+                       if owner not in mod_versions.VERSIONS and scopes.get(owner) is not None
+                       for filename, entry in record.get("files", {}).items() if "created" in entry}
         if (network.device_identity(state)[0] == "F008"
                 and (missing_proof or changed_firmware or network.is_untested(state)
-                     or any(pair.get("reason", "obsolete") != "obsolete" for pair in storage_cleanup))):
+                     or added_paths or any(pair.get("reason", "obsolete") != "obsolete" for pair in storage_cleanup))):
             progress("Checking stock firmware recovery files…")
-            stock_snapshot = stock.scan(remote, state)
+            stock_snapshot = stock.scan(remote, state, **({"extra_paths": tuple(sorted(added_paths))} if added_paths else {}))
         storage_moves = tuple(remote.moves)
-    analysis = mods.inspect(current["data"])
+    analysis = mods.inspect(current["data"]) if current else {
+        "known": True, "enabled": False, "patchable": False, "label": "Not installed",
+        "reason": "The native print module is missing: " + mods.TARGET}
     backup_error, original_source = "", None
     if original is not None or manifest is not None:
         try:
@@ -569,22 +656,24 @@ def scan(connection, known_hosts, progress=lambda message: None):
             original_source = original_identity(meta)
         except (ValueError, TypeError, AttributeError, KeyError, SyntaxError, UnicodeError) as error:
             backup_error = str(error)
-    result = Snapshot(current["data"], current["sha256"], analysis,
+    result = Snapshot(current["data"] if current else None, current["sha256"] if current else None, analysis,
                     original["data"] if original else None, original["sha256"] if original else None,
                     backup_error, state, status_error, identity, time.time(), mesh_snapshot, temperature_snapshot, screws_snapshot,
                     versions_snapshot, {mods.ORIGINAL: original["sha256"] if original else None,
                                         mods.MANIFEST: manifest["sha256"] if manifest else None},
                     smoothing=smoothing_snapshot, homing=homing_snapshot,
                     recovery=recovery.inspect(state, *recovery_files), storage_moves=storage_moves,
-                    original_identity=original_source, stock=stock_snapshot, storage_cleanup=storage_cleanup)
+                    original_identity=original_source, stock=stock_snapshot, storage_cleanup=storage_cleanup,
+                    unknown_files=unknown_files, ignored_mods=tuple(ignored_mods), warmup=warmup_snapshot)
     result.storage_error = "\n".join(dict.fromkeys(
         value.backup_error for module, value in file_entries(result) if value and value.backup_error
+        and module.TARGET not in result.unknown_files
         and not (module is mod_versions and missing_record_proof(result))))
     if not versions_snapshot.analysis["known"] and not missing_record_proof(result):
         result.storage_error = result.storage_error or versions_snapshot.analysis["reason"]
     if versions_snapshot.analysis["known"]:
         for path, record in installed_records(result).items():
-            if path in (screws.PYTHON, smoothing.TARGET):
+            if path not in mod_versions.VERSIONS or path in (screws.PYTHON, smoothing.TARGET):
                 continue
             value = file_snapshot(result, path)
             if value.analysis.get("include_error"):
@@ -689,11 +778,12 @@ def prepare_mesh(snapshot, desired, restore=False, full_risk=False, module=mesh)
 
 def file_entries(snapshot):
     return ((mods, snapshot), (mesh, snapshot.mesh), (mesh_temperature, snapshot.mesh_temperature),
-            (smoothing, snapshot.smoothing), (smoothing.HOMING, snapshot.homing)) + tuple(
+            (smoothing, snapshot.smoothing), (smoothing.HOMING, snapshot.homing), (warmup, snapshot.warmup)) + tuple(
         (module, snapshot.screws.files[module.TARGET]) for module in screws.SCAN_FILES
         if snapshot.screws and module.TARGET in snapshot.screws.files) + tuple(
         (module, snapshot.screws.frontend[module.TARGET]) for module in fluidd_screws.FILES
-        if snapshot.screws and module.TARGET in snapshot.screws.frontend) + ((mod_versions, version_snapshot(snapshot)),)
+        if snapshot.screws and module.TARGET in snapshot.screws.frontend) + tuple(
+        (recorded_file(path), value) for path, value in snapshot.unknown_files.items()) + ((mod_versions, version_snapshot(snapshot)),)
 
 
 def file_snapshot(snapshot, path):
@@ -709,7 +799,9 @@ def removal_statuses(snapshot):
     except (ValueError, TypeError, AttributeError, UnicodeError) as exc:
         error = str(exc)
     return removal.inspect({module.TARGET: value for module, value in file_entries(snapshot)
-                            if value is not None}, records, metadata_error=error, stock=snapshot.stock)
+                            if value is not None}, records, metadata_error=error, stock=snapshot.stock,
+                           identity=network.device_identity(snapshot.status),
+                           header_fallback=version_snapshot(snapshot).data is None and version_snapshot(snapshot).sha256 is None)
 
 
 def cleanup_snapshot(snapshot, pairs=None):
@@ -723,13 +815,39 @@ def cleanup_snapshot(snapshot, pairs=None):
         value = file_snapshot(result, path)
         value.original = value.original_hash = value.original_identity = None
         value.original_absent, value.backup_error = False, ""
-    result.storage_error = "\n".join(dict.fromkeys(value.backup_error for _, value in file_entries(result)
-        if value and value.backup_error and not (value is result.versions and missing_record_proof(result))))
+    result.storage_error = "\n".join(dict.fromkeys(value.backup_error for module, value in file_entries(result)
+        if value and value.backup_error and module.TARGET not in result.unknown_files
+        and not (value is result.versions and missing_record_proof(result))))
     if result.versions and not result.versions.analysis["known"] and not missing_record_proof(result):
         result.storage_error = result.storage_error or result.versions.analysis["reason"]
     if result.mesh and result.mesh.analysis.get("include_error"):
         result.storage_error = result.storage_error or INCLUDE_STORAGE_ERROR
     return result
+
+
+def ignored_backup_targets(snapshot, scopes, choices=None):
+    """Keep originals owned by unknown mods ignored for this connection."""
+    return {pair["target"] for pair in snapshot.storage_cleanup
+            for owner in snapshot.ignored_mods
+            if owner not in mod_versions.VERSIONS and owner in scopes
+            and (choices or {}).get(owner) is not False
+            and (scopes[owner] is None or pair["target"] in scopes[owner])}
+
+
+def deferred_storage_view(snapshot, targets):
+    # Only remove deferred-backup diagnostics from the aggregate migration
+    # blocker. Their per-file errors still prevent edits to those same files.
+    if not targets:
+        return snapshot
+    errors = {module.TARGET: value.backup_error for module, value in file_entries(snapshot)
+              if value and value.backup_error}
+    protected = set("\n".join(error for path, error in errors.items()
+                              if path not in targets or path == mod_versions.TARGET).splitlines())
+    protected.update(version_snapshot(snapshot).analysis.get("reason", "").splitlines())
+    deferred = set("\n".join(error for path, error in errors.items()
+                             if path in targets and path != mod_versions.TARGET).splitlines()) - protected
+    error = "\n".join(line for line in snapshot.storage_error.splitlines() if line not in deferred)
+    return replace(snapshot, storage_error=error) if error != snapshot.storage_error else snapshot
 
 
 def firmware_issues(snapshot, *, removals=None):
@@ -742,36 +860,53 @@ def firmware_issues(snapshot, *, removals=None):
     except (ValueError, TypeError, AttributeError, UnicodeError):
         records = {}
     result = {}
+    scopes = record_scopes(records)
+    deferred = ignored_backup_targets(snapshot, scopes)
+    cleanup = tuple(pair for pair in snapshot.storage_cleanup if pair["target"] not in deferred)
+    cleanup_files = {file["path"] for pair in snapshot.storage_cleanup for file in pair["files"]}
+    moves = tuple(move for move in snapshot.storage_moves if move["source"] not in cleanup_files)
     view = cleanup_snapshot(snapshot)
     states = removal_statuses(view) if view is not snapshot or removals is None else removals
     damaged = {pair["target"] for pair in snapshot.storage_cleanup if pair.get("reason", "obsolete") != "obsolete"}
-    obsolete = {pair["target"] for pair in snapshot.storage_cleanup if pair.get("reason", "obsolete") == "obsolete"}
+    obsolete = {pair["target"] for pair in cleanup if pair.get("reason", "obsolete") == "obsolete"}
     for path, status in states.items():
-        installed = records.get(path, {}).get("firmware")
+        installed = records.get(path, {}).get("firmware") or status.get("firmware")
+        if path not in mod_versions.VERSIONS:
+            if path not in snapshot.ignored_mods:
+                result[path] = {**status, "unknown": True, "name": path.rsplit("/", 1)[-1],
+                                "firmware_reason": "Unknown mod.", "installed_firmware": installed}
+            continue
         invalid_backup = bool(damaged.intersection(mod_versions.FILES[path])) or (path == screws.PYTHON and screws.LEGACY_CONFIG in damaged)
         obsolete_backup = bool(obsolete.intersection(mod_versions.FILES[path])) or (path == screws.PYTHON and screws.LEGACY_CONFIG in obsolete)
-        if status["present"] and (installed != current or invalid_backup or obsolete_backup):
+        if status["present"] and (installed != current or invalid_backup or obsolete_backup or status.get("header")):
             result[path] = {**status, "installed_firmware": installed, "current_firmware": current,
                             "firmware_reason": ("Its original backup is damaged or incomplete." if invalid_backup else
+                                                "Its uninstall record is missing." if status.get("header") and installed == current else
                                                 "Installed firmware is unknown." if installed is None else
                                                 "Installed on firmware " + installed + "; current firmware is " + current + "." if installed != current else
                                                 "Its original backup belongs to older firmware.")}
     if snapshot.storage_moves or snapshot.storage_cleanup:
-        error = view.storage_error
-        if error == INCLUDE_STORAGE_ERROR and result.get(screws.PYTHON, {}).get("available"):
-            error = ""
+        error = deferred_storage_view(view, deferred).storage_error
+        if error == INCLUDE_STORAGE_ERROR:
+            unknown_repairs = tuple(path for path, issue in result.items()
+                                    if issue.get("unknown") and issue.get("available"))
+            if result.get(screws.PYTHON, {}).get("available") or unknown_startup_repair(view, unknown_repairs):
+                error = ""
         for pair in snapshot.storage_cleanup:
-            for owner, scope in mod_versions.FILES.items():
-                owns = pair["target"] in scope or (owner == screws.PYTHON and pair["target"] == screws.LEGACY_CONFIG)
-                if owns and states.get(owner, {}).get("present") and not result.get(owner, {}).get("available"):
+            for owner, scope in scopes.items():
+                owns = scope is None or pair["target"] in scope or (owner == screws.PYTHON and pair["target"] == screws.LEGACY_CONFIG)
+                if owner not in mod_versions.VERSIONS and owner in snapshot.ignored_mods:
+                    continue
+                verified = result.get(owner, states.get(owner, {}) if pair["target"] in deferred else {})
+                if owns and states.get(owner, {}).get("present") and not verified.get("available"):
                     error = error or "An active mod still requires the backup for " + pair["target"] + "."
-        status = {"kind": "cleanup" if snapshot.storage_cleanup else "relocation", "present": True,
-                  "available": not error, "reason": error}
-        if snapshot.storage_cleanup:
-            retired = {file["path"] for pair in snapshot.storage_cleanup for file in pair["files"] if file["sha256"] is not None}
-            status["relocation"] = any(move["source"] not in retired for move in snapshot.storage_moves)
-            status["damaged"] = bool(damaged)
-        result[storage.ROOT] = status
+        if cleanup or moves or error:
+            status = {"kind": "cleanup" if cleanup else "relocation", "present": True,
+                      "available": not error, "reason": error}
+            if cleanup:
+                status["relocation"] = bool(moves)
+                status["damaged"] = any(pair.get("reason", "obsolete") != "obsolete" for pair in cleanup)
+            result[storage.ROOT] = status
     if result:
         from . import reinstall
         eligible = reinstall.eligible(snapshot, result)
@@ -790,16 +925,21 @@ def prepare_removal(snapshot, choices, *, with_recovery=False):
             continue
         if choice is not False:
             raise ValueError("A removal plan accepts only mods staged for removal.")
-        plan = removal.inspect(files, records, stock=snapshot.stock)[path]
+        plan = removal.inspect(files, records, stock=snapshot.stock,
+                               identity=network.device_identity(snapshot.status),
+                               header_fallback=version_snapshot(snapshot).data is None and version_snapshot(snapshot).sha256 is None)[path]
         if not plan["available"]:
             raise ValueError("Cannot remove " + path.rsplit("/", 1)[-1] + ": " + plan["reason"])
         for filename, data in plan["files"].items():
             results[filename] = data
-            if plan.get("recovery"):
+            if plan.get("recovery") and filename in plan.get("recovery_files", plan["files"]):
                 recovered.add(filename)
             files[filename] = replace(files[filename], data=data,
                                       sha256=mods.digest(data) if data is not None else None)
         records.pop(path, None)
+    mod_versions.preserve_shared_changes(
+        {module.TARGET: value.data for module, value in file_entries(snapshot) if value is not None},
+        results, records, {path for path, choice in choices.items() if choice is False})
     ledger = version_snapshot(snapshot)
     if any(choice is False for choice in choices.values()) and ledger.data is not None:
         data = None if not records and missing_record_proof(snapshot) else mod_versions.dump(records)
@@ -861,7 +1001,7 @@ def homing_baseline(snapshot, record=None):
 
 def capture_homing(baseline, enabled, *, firmware=None):
     pairs = {path: [(change["before"], change["after"]) for change in
-             mod_versions.capture_changes(path, baseline[path], enabled[path])]
+             mod_versions.capture_changes(path, mod_comments.strip(baseline[path]), mod_comments.strip(enabled[path]))]
              for path in mod_versions.FILES[smoothing.TARGET]}
     return mod_versions.capture_files(smoothing.TARGET, baseline, enabled, pairs, firmware=firmware)
 
@@ -922,7 +1062,7 @@ def capture_helper(baseline, enabled, *, firmware=None):
     newline = "\r\n" if "\r\n" in regular else "\n"
     pairs = {mesh.TARGET: [["", screws.SCREWS_INCLUDE.replace("\n", newline)]]}
     pairs[fluidd_screws.TARGET] = fluidd_screws.replacements(
-        fluidd_screws.TARGET, baseline[fluidd_screws.TARGET], enabled[fluidd_screws.TARGET])
+        fluidd_screws.TARGET, mod_comments.strip(baseline[fluidd_screws.TARGET]), mod_comments.strip(enabled[fluidd_screws.TARGET]))
     return mod_versions.capture_files(screws.PYTHON, baseline, enabled, pairs, firmware=firmware)
 
 
@@ -952,10 +1092,12 @@ def inspect_helper_baseline(snapshot, baseline, tree):
 def helper_js_replacements(snapshot, data, *, tolerant=False):
     record = installed_records(snapshot, removal=True).get(screws.PYTHON)
     current = snapshot.screws.frontend[fluidd_screws.TARGET].data
+    pairs = []
+    text = current.decode("utf-8")
     if record is None:
-        return fluidd_screws.replacements(fluidd_screws.TARGET, current, data)
-    entry = record["files"][fluidd_screws.TARGET]
-    if tolerant or network.is_untested(snapshot.status):
+        pairs = fluidd_screws.replacements(fluidd_screws.TARGET, current, data)
+    elif tolerant or network.is_untested(snapshot.status):
+        entry = record["files"][fluidd_screws.TARGET]
         text, pairs = current.decode("utf-8"), []
         for change in reversed(entry["undo"]):
             if text.count(change["after"]) == 1:
@@ -963,15 +1105,41 @@ def helper_js_replacements(snapshot, data, *, tolerant=False):
                 text = text.replace(change["after"], change["before"], 1)
         if text.encode("utf-8") == data:
             return pairs
-    baseline = mod_versions.undo(current, entry)
-    pairs = [[change["after"], change["before"]] for change in reversed(entry["undo"])]
-    if data != baseline:
-        pairs.extend(fluidd_screws.replacements(fluidd_screws.TARGET, baseline, data))
+    if record is not None:
+        entry = record["files"][fluidd_screws.TARGET]
+        baseline = mod_versions.undo(current, entry)
+        pairs = [[change["after"], change["before"]] for change in reversed(entry["undo"])
+                 if not (mod_versions.optional_metadata_change(change, screws.PYTHON)
+                         and change["after"] not in current.decode("utf-8"))]
+        if data != baseline:
+            pairs.extend(fluidd_screws.replacements(fluidd_screws.TARGET, baseline, data))
     text = current.decode("utf-8")
     for before, after in pairs:
         if text.count(before) != 1:
             raise ValueError("The Fluidd uninstall edit is not unique.")
         text = text.replace(before, after, 1)
+    # Metadata is independently owned, just like the helper's UI function.
+    if text.encode("utf-8") != data and mod_comments.strip(text.encode("utf-8")) == mod_comments.strip(data):
+        old, new = mod_comments.lines(text.encode("utf-8")), mod_comments.lines(data)
+        for owner, before in old.items():
+            after = new.get(owner, b"")
+            if before != after:
+                pairs.append([before.decode(), after.decode()])
+                text = text.replace(before.decode(), after.decode(), 1)
+        for owner in new.keys() - old.keys():
+            header = new[owner].decode()
+            target = data.decode()
+            position = target.index(header)
+            if text != target[:position] + target[position + len(header):]:
+                raise ValueError("The Fluidd comment insertion is ambiguous.")
+            for size in (32, 64, 128, 256):
+                anchor = text[position:position + size]
+                if anchor and text.count(anchor) == 1:
+                    pairs.append([anchor, header + anchor])
+                    text = text[:position] + header + text[position:]
+                    break
+            else:
+                raise ValueError("The Fluidd comment insertion is not unique.")
     if text.encode("utf-8") != data:
         raise ValueError("Unrelated Fluidd code would change.")
     return pairs
@@ -979,6 +1147,8 @@ def helper_js_replacements(snapshot, data, *, tolerant=False):
 
 def restorable(snapshot, full_risk=False):
     if network.compatibility_error(snapshot.status):
+        return set()
+    if unknown_record_ids(snapshot):
         return set()
     identity = network.device_identity(snapshot.status)
     paths = {module.TARGET for module, value in file_entries(snapshot)
@@ -1097,10 +1267,28 @@ def prepare_homing(snapshot, desired, full_risk=False, record=None):
     return result
 
 
-def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=False, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, *, repair_targets=None):
+def unknown_record_ids(snapshot):
+    data = version_snapshot(snapshot).data
+    try:
+        document = json.loads(data) if data is not None else {}
+        records = document.get("mods", {})
+        return set(records).difference(mod_versions.VERSIONS) if isinstance(records, dict) else set()
+    except (ValueError, TypeError, AttributeError, UnicodeError):
+        return set()
+
+
+def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=False, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, *, warmup_desired=None, repair_targets=None, unknown_removals=()):
     choices = {mods.TARGET: desired, mesh.TARGET: mesh_desired, mesh_temperature.TARGET: temperature_desired,
-               screws.PYTHON: screws_desired, smoothing.TARGET: smoothing_desired}
+               screws.PYTHON: screws_desired, smoothing.TARGET: smoothing_desired, warmup.TARGET: warmup_desired}
     mod_versions.require_registered(choices)
+    unknown_removals = set(unknown_removals)
+    if unknown_removals:
+        records = installed_records(snapshot, removal=True)
+        if (not unknown_removals.issubset(records.keys() - mod_versions.VERSIONS.keys())
+                or restore or update or full_risk or any(choice is True for choice in choices.values())):
+            raise ValueError("Unknown mod removal must use its isolated Fix issues action.")
+    if restore and unknown_record_ids(snapshot):
+        raise ValueError("Remove unknown mods before using Restore original; their records must be preserved.")
     if repair_targets is not None and (not repair_targets or restore or update or full_risk
             or {path for path, choice in choices.items() if choice is True} != set(repair_targets)
             or any(choice is False for choice in choices.values())):
@@ -1117,8 +1305,9 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
                     or (statuses[path].get("available") and not any(
                         file_snapshot(snapshot, filename).analysis.get("include_error")
                         for filename in statuses[path]["files"])))}
+    removed.update(unknown_removals)
     if removed:
-        results = prepare_removal(snapshot, {path: False if path in removed else None for path in choices})
+        results = prepare_removal(snapshot, {path: False for path in removed})
         # Compose further edits against the verified removal result. Never
         # overwrite a shared file with a second plan based on its old bytes.
         snapshot = copy.deepcopy(snapshot)
@@ -1137,7 +1326,8 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
                 choices[path] = True
                 enrollment.add(path)
     for path in removed:
-        choices[path] = None
+        if path in choices:
+            choices[path] = None
     touched = {path for path, choice in choices.items() if choice is not None}
     try:
         records = installed_records(snapshot) if touched or restore else {}
@@ -1176,6 +1366,9 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
     if temperature_desired is not None or mesh_temperature.TARGET in originals:
         results[mesh_temperature.TARGET] = prepare_mesh(snapshot.mesh_temperature, temperature_desired, True,
             full_risk, mesh_temperature) if restore else prepare_versioned(snapshot, mesh_temperature.TARGET, temperature_desired, full_risk)
+    warmup_desired = choices[warmup.TARGET]
+    if warmup_desired is not None or warmup.TARGET in originals:
+        results[warmup.TARGET] = snapshot.warmup.original if restore else prepare_versioned(snapshot, warmup.TARGET, warmup_desired, full_risk)
     if restore:
         if smoothing.TARGET in originals:
             results[smoothing.TARGET] = prepare_mesh(snapshot.smoothing, None, True, full_risk, smoothing)
@@ -1241,6 +1434,22 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
                 baselines[mesh.TARGET] = edit_helper(baselines[mesh.TARGET])
     if restore and not originals:
         raise ValueError("No eligible on-printer original backups are available.")
+    if not restore:
+        firmware = network.device_identity(snapshot.status)[1]
+        def stamp(data, filename, own=None):
+            if data is None:
+                return None
+            for owner, choice in choices.items():
+                if choice is None or filename not in mod_versions.FILES[owner]:
+                    continue
+                data = (mod_comments.put(data, owner, mod_versions.VERSIONS[owner], firmware, filename)
+                        if choice is True and owner != own else mod_comments.remove(data, owner))
+            return data
+        results = {filename: stamp(data, filename) if filename != mod_versions.TARGET else data
+                   for filename, data in results.items()}
+        for owner, baseline in baselines.items():
+            baselines[owner] = ({filename: stamp(data, filename, owner) for filename, data in baseline.items()}
+                                if isinstance(baseline, dict) else stamp(baseline, owner, owner))
     if touched or restore:
         firmware = network.device_identity(snapshot.status)[1]
         for path in (originals if restore else touched):
@@ -1265,40 +1474,45 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
             data = mod_versions.dump(records)
             if data != ledger.data and (records or ledger.data is not None):
                 results[mod_versions.TARGET] = data
-    if repair_targets is not None:
+    retained = installed_records(snapshot) if unknown_record_ids(snapshot) else records
+    if repair_targets is not None or any(path not in mod_versions.VERSIONS for path in retained):
         mod_versions.preserve_shared_changes(
             {module.TARGET: value.data for module, value in file_entries(snapshot) if value is not None},
-            results, records, repair_targets)
+            results, retained, set(touched) | removed)
     return results
 
 
 def storage_plan(snapshot, choices, restore=False, *, cleanup_all=False):
     """Plan cleanup before migration without discarding a retained mod's baseline."""
     cleanup = getattr(snapshot, "storage_cleanup", ())
-    retire = []
+    retire, deferred = [], set()
     if cleanup:
         states = removal_statuses(cleanup_snapshot(snapshot))
+        records = installed_records(snapshot) if unknown_record_ids(snapshot) else {}
+        scopes = record_scopes(records)
+        deferred = ignored_backup_targets(snapshot, scopes, choices)
         for pair in cleanup:
             needed = restore
-            for owner, scope in mod_versions.FILES.items():
-                owns = pair["target"] in scope or (owner == screws.PYTHON and pair["target"] == screws.LEGACY_CONFIG)
+            for owner, scope in scopes.items():
+                owns = scope is None or pair["target"] in scope or (owner == screws.PYTHON and pair["target"] == screws.LEGACY_CONFIG)
                 needed |= bool(owns and (choices.get(owner) is True or
                                (states.get(owner, {}).get("present") and choices.get(owner) is not False)))
-            if needed and cleanup_all:
+            if needed and cleanup_all and pair["target"] not in deferred:
                 raise ValueError("Remove the mod before deleting its backup: " + pair["target"])
             if not needed:
                 retire.append(pair)
     # Deferred originals stay where they are until their owners are removed.
     excluded = {file["path"] for pair in cleanup for file in pair["files"]}
     moves = tuple(move for move in getattr(snapshot, "storage_moves", ()) if move["source"] not in excluded)
-    return cleanup_snapshot(snapshot, retire) if retire else snapshot, tuple(retire), moves
+    view = cleanup_snapshot(snapshot, retire) if retire else snapshot
+    return deferred_storage_view(view, deferred), tuple(retire), moves
 
 
-def difference_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=False, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None):
+def difference_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=False, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, *, warmup_desired=None):
     choices = {mods.TARGET: desired, mesh.TARGET: mesh_desired, mesh_temperature.TARGET: temperature_desired,
-               screws.PYTHON: screws_desired, smoothing.TARGET: smoothing_desired}
+               screws.PYTHON: screws_desired, smoothing.TARGET: smoothing_desired, warmup.TARGET: warmup_desired}
     snapshot, retire, pending_moves = storage_plan(snapshot, choices, restore)
-    prepared = prepare_all(snapshot, desired, mesh_desired, restore, full_risk, temperature_desired, screws_desired, update, smoothing_desired)
+    prepared = prepare_all(snapshot, desired, mesh_desired, restore, full_risk, temperature_desired, screws_desired, update, smoothing_desired, warmup_desired=warmup_desired)
     moves = "".join("Move " + item["source"] + "\n  to " + item["destination"] + "\n" for item in pending_moves)
     deleted = "".join("Delete " + file["path"] + "\n" for pair in retire for file in pair["files"] if file["sha256"] is not None)
     statuses = removal_statuses(snapshot) if not restore and any(c is False for c in choices.values()) else {}
@@ -1321,6 +1535,10 @@ def initial_difference(snapshot, path):
     """Read-only preview of first enablement, independent of staged/current state."""
     if snapshot is None:
         raise ValueError("Scan the printer to load the files for this comparison.")
+    owner = path
+    def stamp(filename, data):
+        return mod_comments.put(data, owner, mod_versions.VERSIONS[owner],
+                                network.device_identity(snapshot.status)[1], filename)
     if path == screws.MOD_ID:
         if snapshot.screws is None or snapshot.mesh is None:
             raise ValueError("The helper files have not been scanned yet.")
@@ -1333,13 +1551,14 @@ def initial_difference(snapshot, path):
         after = {mesh.TARGET: screws.edit_include(original, True), **prepared}
         for path, value in snapshot.screws.frontend.items():
             before[path] = value.original if value.original is not None else value.data
+        after = {filename: stamp(filename, data) for filename, data in after.items()}
         diff = "".join(file_difference(path, before[path], data,
             "Original " + path if before[path] is not None else "/dev/null",
             "Enabled " + path) for path, data in after.items())
         return diff, "Baseline: on-printer original backups, or scanned files before the first Apply."
     if path == smoothing.TARGET:
         if mod_snapshot(snapshot, path) is None:
-            raise ValueError("Both homing mod files have not been scanned yet.")
+            raise ValueError("This mod's printer files have not been scanned yet.")
         diffs = []
         for module in (smoothing, smoothing.HOMING):
             value = file_snapshot(snapshot, module.TARGET)
@@ -1350,7 +1569,7 @@ def initial_difference(snapshot, path):
             original = value.original if value.original is not None else value.data
             if not original:
                 raise ValueError("The original printer file is unavailable: " + module.TARGET)
-            enabled = module.transform(original, True)
+            enabled = stamp(module.TARGET, module.transform(original, True))
             diffs.append(file_difference(module.TARGET, original, enabled,
                 ("Original " if value.original is not None else "Scanned baseline ") + module.TARGET,
                 "Enabled " + module.TARGET))
@@ -1361,6 +1580,8 @@ def initial_difference(snapshot, path):
         module, value = mesh, snapshot.mesh
     elif path == mesh_temperature.TARGET:
         module, value = mesh_temperature, snapshot.mesh_temperature
+    elif path == warmup.TARGET:
+        module, value = warmup, snapshot.warmup
     else:
         raise ValueError("Unknown mod file.")
     if value is None:
@@ -1379,19 +1600,59 @@ def initial_difference(snapshot, path):
         original = value.data
         baseline = "Baseline: scanned file; no original backup exists yet."
         before_name = "Scanned baseline " + path
-    enabled = module.transform(original, True)
+    enabled = stamp(path, module.transform(original, True))
     diff = "".join(difflib.unified_diff(original.decode().splitlines(True), enabled.decode().splitlines(True),
                                         fromfile=before_name, tofile="Enabled " + path, n=3))
     return diff or "The baseline already contains this mod's enabled values; no file changes are needed.", baseline
 
 
-def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore, full_risk, progress, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None):
+def rescan(connection, known_hosts, scanned, progress=lambda message: None):
+    scan_options = {}
+    if scanned.ignored_mods:
+        scan_options["ignored_mods"] = scanned.ignored_mods
+    if scanned.unknown_files:
+        scan_options["unknown_paths"] = tuple(scanned.unknown_files)
+    return scan(connection, known_hosts, progress, **scan_options)
+
+
+def unknown_startup_repair(snapshot, targets):
+    """Only allow saved undo that removes this exact owned missing include."""
+    info = (snapshot.status or {}).get("info", {})
+    message = info.get("state_message", "")
+    match = re.fullmatch(r"Include file '([^'\r\n]+)' does not exist", message.splitlines()[0] if message else "")
+    if (not targets or info.get("state") != "error" or info.get("config_file") != mesh.TARGET or not match):
+        return False
+    try:
+        missing = posixpath.normpath(match[1])
+        records = installed_records(snapshot, removal=True)
+        owned = any("created" in records[owner].get("files", {}).get(missing, {}) for owner in targets)
+        value = file_snapshot(snapshot, missing)
+        if (not owned or value.data is not None or value.sha256 is not None or value.backup_error
+                or not value.original_absent or value.original_hash != mods.digest(b"")):
+            return False
+        network.require_idle(snapshot.status, allow_error=True)
+        pending = prepare_removal(snapshot, {owner: False for owner in targets})
+        def references(path, data):
+            if data is None:
+                return False
+            regular, _ = mesh.split(data)
+            return any(posixpath.normpath(posixpath.join(posixpath.dirname(path), name.strip())) == missing
+                       for name in re.findall(r"^\s*\[include ([^\]\r\n]+)\]\s*(?:[#;].*)?$", regular, re.M))
+        return any(path.endswith(".cfg") and data is not None
+                   and references(path, file_snapshot(snapshot, path).data) and not references(path, data)
+                   for path, data in pending.items())
+    except (ValueError, RuntimeError, TypeError, KeyError, AttributeError, UnicodeError, StopIteration):
+        return False
+
+
+def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore, full_risk, progress, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None, unknown_removals=(), *, warmup_desired=None):
     progress("Checking fresh file contents and printer activity…")
-    fresh = scan(connection, known_hosts, progress)
+    fresh = rescan(connection, known_hosts, scanned, progress)
     if fresh.status is None:
         raise RuntimeError("Cannot verify printer activity: " + fresh.status_error)
-    choices = (desired, mesh_desired, temperature_desired, screws_desired, smoothing_desired)
-    selected = dict(zip((mods.TARGET, mesh.TARGET, mesh_temperature.TARGET, screws.PYTHON, smoothing.TARGET), choices))
+    choices = (desired, mesh_desired, temperature_desired, screws_desired, smoothing_desired, warmup_desired)
+    selected = dict(zip((mods.TARGET, mesh.TARGET, mesh_temperature.TARGET, screws.PYTHON, smoothing.TARGET, warmup.TARGET), choices))
+    selected.update({path: False for path in unknown_removals})
     if repair is not None:
         allowed = set(repair["targets"])
         if (restore or update or full_risk or retire_old_backups or not allowed
@@ -1416,12 +1677,16 @@ def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore,
     require_apply_policy(fresh.status, choices, restore, update)
     if network.device_identity(fresh.status) != network.device_identity(scanned.status):
         raise ValueError("Printer firmware changed after scan. Scan again before applying changes.")
-    metadata_only = not restore and not update and all(choice is None for choice in choices)
+    metadata_only = not restore and not update and not unknown_removals and all(choice is None for choice in choices)
     startup_removal = bool(screws_desired is False and fresh.recovery and fresh.recovery.get("available"))
     removal_only = not restore and not update and not any(choice is True for choice in choices)
+    unknown_startup = bool(removal_only and unknown_startup_repair(fresh, unknown_removals)
+                           and fresh.status.get("info") == scanned.status.get("info"))
     repair_includes = bool(screws_desired is False and removal_only
                           and removal_statuses(fresh)[screws.PYTHON].get("available"))
-    allow_error = recovery.supports_startup_repair(fresh.status) and (metadata_only or (startup_removal and removal_only))
+    repair_includes |= unknown_startup
+    allow_error = unknown_startup or (recovery.supports_startup_repair(fresh.status)
+                                     and (metadata_only or (startup_removal and removal_only)))
     if (repair is not None and repair.get("startup_error")
             and repair["startup_error"].get("state") == "error"
             and fresh.status.get("info") == repair["startup_error"]
@@ -1438,12 +1703,16 @@ def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore,
     if moves and fresh.mesh and fresh.mesh.analysis.get("include_error") and not repair_includes:
         raise ValueError("Backup storage migration requires verified configuration includes. Repair startup and scan again before Apply.")
     scope = {"repair_targets": repair["targets"]} if repair is not None else {}
+    if warmup_desired is not None:
+        scope["warmup_desired"] = warmup_desired
+    if unknown_removals:
+        scope["unknown_removals"] = unknown_removals
     before = prepare_all(scanned, desired, mesh_desired, restore, full_risk, temperature_desired, screws_desired, update, smoothing_desired, **scope)
-    removal_states = removal_statuses(fresh) if not restore and any(c is False for c in choices) else {}
+    removal_states = removal_statuses(fresh) if not restore and (unknown_removals or any(c is False for c in choices)) else {}
     recover_choices = {path: False for path, choice in selected.items() if choice is False
                        and removal_states[path].get("recovery")} if not restore else {}
     recovered = prepare_removal(fresh, recover_choices, with_recovery=True)[1] if recover_choices else set()
-    stock_guarded = not restore and any(c is False for c in choices) and bool((fresh.stock or {}).get("available"))
+    stock_guarded = not restore and bool(unknown_removals or any(c is False for c in choices)) and bool((fresh.stock or {}).get("available"))
     if (recovered or stock_guarded) and (not fresh.stock or not fresh.stock.get("available")
             or fresh.stock.get("identity") != (scanned.stock or {}).get("identity")
             or fresh.stock.get("proof") != (scanned.stock or {}).get("proof")
@@ -1452,8 +1721,8 @@ def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore,
     for path in before:
         old = file_snapshot(scanned, path)
         new = file_snapshot(fresh, path)
-        unchanged = (new.sha256 == old.sha256 and new.guards == old.guards) if path in (fluidd_screws.TARGET, mod_versions.TARGET) else (
-            (new.sha256 == old.sha256) if path in (mods.TARGET, screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG, smoothing.HOMING.TARGET) else (
+        unchanged = (new.sha256 == old.sha256 and new.guards == old.guards) if new.data is None or old.data is None or path in (fluidd_screws.TARGET, mod_versions.TARGET) else (
+            (new.sha256 == old.sha256) if path in fresh.unknown_files or path in (mods.TARGET, screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG, smoothing.HOMING.TARGET, warmup.TARGET) else (
             mesh.stable_digest(new.data) == mesh.stable_digest(old.data)
             and (new.stable_guards or new.guards) == (old.stable_guards or old.guards)
             and new.patterns == old.patterns))
@@ -1484,7 +1753,7 @@ def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore,
                if data != file_snapshot(fresh, path).data}
     if not pending and not python_caches and not moves and not retire:
         return {"snapshot": fresh, "message": "Printer files already match the requested state.", "restarted": False, "written": False}
-    enabling_heat = desired is not False and not restore
+    enabling_heat = desired is not False and not restore and not unknown_removals
     if mods.TARGET in pending and enabling_heat and not fresh.identity.get("history"):
         raise RuntimeError("Native print history is unavailable; early heating cannot identify new jobs.")
     with Remote(connection, known_hosts) as remote:
@@ -1507,6 +1776,8 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
             strict_files = {filename for path in enabled for filename in mod_versions.FILES[path]}
             if any(path in strict_files and file_snapshot(fresh, path).original_hash is None for path in recovered):
                 raise ValueError("Recover leftovers before installing or updating another mod that shares a file without its original backup.")
+        unknown_files = {filename for owner in unknown_removals
+                         for filename in mod_versions.file_scope(owner, installed_records(fresh)[owner])}
         for path, data in pending.items():
             module, value = next((module, value) for module, value in file_entries(fresh) if module.TARGET == path)
             item = {"path": path, "backup": aliases.get(module.ORIGINAL, module.ORIGINAL), "expected": value.sha256,
@@ -1515,7 +1786,9 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
                     "original_hash": value.original_hash, "may_capture_original": value.analysis["enabled"] is False,
                     "original_absent": getattr(value, "original_absent", False),
                     "reference": module.REFERENCE_HASH, "restore": restore,
-                    "kind": "python" if path.endswith(".py") else "json" if path == mod_versions.TARGET else "config"}
+                    "kind": "python" if path.endswith(".py") else "json" if path.endswith(".json") else "config"}
+            if path.endswith(".js") and path in unknown_files and data is not None:
+                item.update(kind="javascript", replacements=[(value.data.decode("utf-8"), data.decode("utf-8"))])
             if path == mesh.TARGET:
                 if screws.screws_include_path(mesh.split(value.data)[0]) is not None:
                     item["may_capture_original"] = False
@@ -1527,7 +1800,7 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
                 item["settings"] = smoothing.settings(data)
             elif path == fluidd_screws.TARGET:
                 item["kind"] = "javascript"
-                if not restore:
+                if not restore and path not in unknown_files:
                     item["replacements"] = helper_js_replacements(fresh, data, tolerant=path in recovered or screws_desired is False)
             elif path == mod_versions.TARGET:
                 item["original_paths"] = [mod_versions.TARGET, storage.LEGACY_RECORDS]
@@ -1550,8 +1823,11 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
         helper_paths = (screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG)
         items.sort(key=lambda item: (0 if item["data"] is not None else 2)
                    if item["path"] in helper_paths else 1)
+        if unknown_removals:
+            items.sort(key=lambda item: item["data"] is None)
         if set(mod_versions.FILES[smoothing.TARGET]) & pending.keys():
-            homing_enabling = smoothing.inspect(pending.get(smoothing.TARGET, fresh.smoothing.data),
+            homing_data = pending.get(smoothing.TARGET, fresh.smoothing.data)
+            homing_enabling = homing_data is not None and smoothing.inspect(homing_data,
                 fresh.smoothing.original).get("enabled") is True
             # Register the native command before its config starts calling it;
             # remove that config call before removing the Python command.
@@ -1561,9 +1837,13 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
         items.sort(key=lambda item: item["path"] == mod_versions.TARGET)
         guards, patterns = {}, {}
         if retire:
-            owners = {owner for pair in retire for owner, scope in mod_versions.FILES.items()
-                      if pair["target"] in scope or (owner == screws.PYTHON and pair["target"] == screws.LEGACY_CONFIG)}
-            dependencies = {path for owner in owners for path in mod_versions.FILES[owner]}
+            records = installed_records(fresh)
+            scopes = record_scopes(records)
+            owners = {owner for pair in retire for owner, scope in scopes.items()
+                      if scope is None or pair["target"] in scope or (owner == screws.PYTHON and pair["target"] == screws.LEGACY_CONFIG)}
+            if any(scopes[owner] is None for owner in owners):
+                raise ValueError("Unknown mod ownership must be resolved before deleting backups.")
+            dependencies = {path for owner in owners for path in scopes[owner]}
             if screws.PYTHON in owners:
                 dependencies.add(screws.LEGACY_CONFIG)
             dependencies.add(mod_versions.TARGET)
@@ -1628,11 +1908,11 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
         progress("Writing printer files…")
         outcome = remote.python(APPLY_BATCH, {"files": items, "python_caches": python_caches, "moves": list(moves), "retire": list(retire),
                                    "guards": guards, "patterns": patterns,
-                                   "verify_config": screws_desired is False,
+                                   "verify_config": screws_desired is False or bool(unknown_removals),
                                    "firmware": fresh.status["native"].get("modelVersion"),
                                    "model": fresh.status["native"].get("model")})
     progress("Verifying saved printer files…")
-    result = scan(connection, known_hosts, progress)
+    result = rescan(connection, known_hosts, scanned, progress)
     if retire and set(outcome.get("retired", ())) != retired_paths:
         raise RuntimeError("Backup cleanup did not complete. Scan the printer before applying again.")
     moved_sources = {move["source"] for move in moves}
@@ -1660,26 +1940,34 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
 
 
 def apply(connection, known_hosts, scanned, desired, restore=False, full_risk=False,
-          progress=lambda message: None, mesh_desired=None, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None):
-    require_apply_policy(scanned.status, (desired, mesh_desired, temperature_desired, screws_desired, smoothing_desired), restore, update)
+          progress=lambda message: None, mesh_desired=None, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None, unknown_removals=(), warmup_desired=None):
+    require_apply_policy(scanned.status, (desired, mesh_desired, temperature_desired, screws_desired, smoothing_desired, warmup_desired), restore, update)
+    extra = {"warmup_desired": warmup_desired} if warmup_desired is not None else {}
     return apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore, full_risk,
-                      progress, temperature_desired, screws_desired, update, smoothing_desired, retire_old_backups, repair)
+                      progress, temperature_desired, screws_desired, update, smoothing_desired, retire_old_backups, repair, unknown_removals, **extra)
 
 
-def fix_issues(connection, known_hosts, scanned, progress=lambda message: None, *, reinstall_targets=()):
+def fix_issues(connection, known_hosts, scanned, progress=lambda message: None, *, reinstall_targets=(), unknown_removals=()):
     """Remove verified issues, then reinstall only the user's compatible choices."""
     issues = firmware_issues(scanned)
     if storage.ROOT in issues and not issues[storage.ROOT]["available"]:
         raise ValueError("Cannot fix backup storage: " + issues[storage.ROOT]["reason"])
     targets = {path for path in mod_versions.VERSIONS
                if issues.get(path, {}).get("present") and issues[path].get("available")}
+    unknown_removals = set(unknown_removals)
+    if any(not issues.get(path, {}).get("unknown") or not issues[path].get("available")
+           for path in unknown_removals):
+        raise ValueError("The selected unknown mod could not be verified for removal. Scan again.")
     reinstall_targets = set(reinstall_targets)
     if any(path not in targets or not issues[path].get("reinstall") for path in reinstall_targets):
         raise ValueError("The selected mod could not be verified for reinstallation. Scan again.")
     fields = {mods.TARGET: "desired", mesh.TARGET: "mesh_desired", mesh_temperature.TARGET: "temperature_desired",
               screws.PYTHON: "screws_desired", smoothing.TARGET: "smoothing_desired"}
+    if warmup.TARGET in targets or warmup.TARGET in reinstall_targets:
+        fields[warmup.TARGET] = "warmup_desired"
     options = {field: False if path in targets else None for path, field in fields.items()}
-    result = apply(connection, known_hosts, scanned, progress=progress, **options,
+    extra = {"unknown_removals": tuple(sorted(unknown_removals))} if unknown_removals else {}
+    result = apply(connection, known_hosts, scanned, progress=progress, **options, **extra,
                    retire_old_backups=bool(scanned.storage_cleanup))
     if not reinstall_targets:
         return result
@@ -1689,7 +1977,9 @@ def fix_issues(connection, known_hosts, scanned, progress=lambda message: None, 
         if network.device_identity(cleaned.status) != network.device_identity(scanned.status):
             raise ValueError("Printer firmware changed during cleanup. Scan again before reinstalling mods.")
         progress("Checking compatible mods for reinstallation…")
-        startup_error = (scanned.status.get("info") if scanned.recovery and scanned.recovery.get("available") else None)
+        startup_error = (scanned.status.get("info")
+                         if (scanned.recovery and scanned.recovery.get("available"))
+                         or unknown_startup_repair(scanned, unknown_removals) else None)
         options = {field: True if path in reinstall_targets else None for path, field in fields.items()}
         install_started = True
         installed = apply(connection, known_hosts, cleaned, progress=progress, **options,
@@ -1698,7 +1988,7 @@ def fix_issues(connection, known_hosts, scanned, progress=lambda message: None, 
         # The cleanup already committed. Never roll old incompatible code back
         # over a successful repair, or claim a failed post-write scan wrote nothing.
         try:
-            result["snapshot"] = scan(connection, known_hosts, progress)
+            result["snapshot"] = rescan(connection, known_hosts, scanned, progress)
         except Exception:
             pass
         if install_started:

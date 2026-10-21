@@ -19,6 +19,7 @@ class ImmediateCleanupTests(unittest.TestCase):
         connection = Connection("192.0.2.1")
         window = SimpleNamespace(busy=False, connected=True, closing=False, snapshot=scanned,
                                  snapshot_connection=(connection.host, connection.username), known_hosts=Path("unused"),
+                                 ignored_mods=set(),
                                  staged=True, mesh_staged=False, temperature_staged=False, screws_staged=True,
                                  smoothing_staged=True, restore_pending=True, update_enabled=True, update_active=True,
                                  receive_scan=Mock(), show_write_success=Mock(), apply_button=Mock(), run_task=Mock())
@@ -350,7 +351,7 @@ class ImmediateCleanupTests(unittest.TestCase):
                         self.assertEqual(issue_dialog.call_count, attempt + 1)
                         issue_dialog.assert_called_with(issues, window)
                     self.assertEqual(scan.call_count, 2)
-                    scan.assert_called_with(connection, window.known_hosts, progress)
+                    scan.assert_called_with(connection, window.known_hosts, progress, ignored_mods=())
                     self.assertEqual(window.receive_scan.call_count, 2)
                     window.receive_scan.assert_called_with(scanned, connection)
                     self.assertEqual(window.review_firmware_issues.call_count, 2)

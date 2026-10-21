@@ -1,5 +1,5 @@
 """Plan verified, data-only mod removal without requiring tested firmware."""
-from . import fluidd_screws, mesh, mod_versions, mods, screws, smoothing
+from . import fluidd_screws, mesh, mod_comments, mod_versions, mods, screws, smoothing, warmup
 
 
 def _data(files, path):
@@ -20,6 +20,8 @@ def _legacy_state(files, path):
 
 
 def _present(files, path):
+    if _commented(files, path):
+        return True
     if path in mod_versions.LEGACY_TARGETS:
         state = _legacy_state(files, path)
         if state.get("enabled") is not False:
@@ -39,6 +41,22 @@ def _present(files, path):
                 return True
         data = _data(files, fluidd_screws.TARGET) or b""
         return any(after.encode() in data for _, after in fluidd_screws.blocks(fluidd_screws.TARGET))
+    if path == warmup.TARGET:
+        return warmup.inspect(_data(files, path) or b"").get("enabled") is True
+    return False
+
+
+def _commented(files, path):
+    for filename in mod_versions.FILES.get(path, ()):
+        data = _data(files, filename)
+        if data is None:
+            continue
+        try:
+            if path in mod_comments.read(data):
+                return True
+        except (ValueError, TypeError, UnicodeError):
+            if path.encode() in data and b" UNCURSER " in data:
+                return True
     return False
 
 
@@ -66,7 +84,7 @@ def _verified(files, path, *, added=False):
     return value
 
 
-def _undo(path, value, entry):
+def _undo(path, value, entry, owner):
     data = value.data
     regular, generated = mesh.split(data) if path.endswith(".cfg") else (data.decode("utf-8"), "")
     original = mesh.split(value.original)[0] if path.endswith(".cfg") else value.original.decode("utf-8")
@@ -78,6 +96,9 @@ def _undo(path, value, entry):
         matches = regular.count(after)
         if matches == 1:
             regular = regular.replace(after, before, 1)
+        elif (matches == 0 and mod_versions.optional_metadata_change(change, owner)
+              and owner not in mod_comments.read(regular.encode("utf-8"))):
+            continue  # Supplemental metadata may be missing; owned code may not.
         elif matches == 0 and before and regular.count(before) == 1:
             continue  # Firmware already restored this exact owned region.
         else:
@@ -96,10 +117,11 @@ def _recorded(files, path, record, stock=None):
         entry = entries[filename]
         if "created" in entry:
             value = _verified(files, filename, added=True)
-            if value.data is not None and value.data != entry["created"].encode("utf-8"):
+            if value.data is not None and not mod_versions.created_matches(value.data, entry["created"], path):
                 raise ValueError("An added mod file differs from its uninstall record: " + filename)
             result[filename] = None
-            if value.data is not None and stock and stock.get("available"):
+            if (value.data is not None
+                    and (path not in mod_versions.VERSIONS or (stock and stock.get("available")))):
                 from .stock_recovery import stock_data
                 native = stock_data(stock, filename)
                 if native is not None:
@@ -108,7 +130,7 @@ def _recorded(files, path, record, stock=None):
                     result[filename] = value.data
         else:
             value = _verified(files, filename)
-            result[filename] = _undo(filename, value, entry)
+            result[filename] = _undo(filename, value, entry, path)
     return result
 
 
@@ -135,7 +157,7 @@ def _missing_recovery_data(files, path, record):
     return missing
 
 
-def inspect(files, records, *, metadata_error="", stock=None):
+def inspect(files, records, *, metadata_error="", stock=None, identity=None, header_fallback=False):
     """Return each mod's presence, removal eligibility, edits and blocking reason."""
     if not isinstance(records, dict):
         records, metadata_error = {}, metadata_error or "Installed mod records could not be verified."
@@ -145,7 +167,7 @@ def inspect(files, records, *, metadata_error="", stock=None):
         except (ValueError, TypeError, KeyError, UnicodeError) as error:
             metadata_error = "Installed mod records need attention: " + str(error)
     result = {}
-    for path in mod_versions.VERSIONS:
+    for path in dict.fromkeys((*mod_versions.VERSIONS, *records)):
         present = path in records or _present(files, path)
         value = result[path] = {"available": False, "files": {}, "reason": "", "present": present,
                                 "recovery": False, "defaults": False, "details": ""}
@@ -156,6 +178,10 @@ def inspect(files, records, *, metadata_error="", stock=None):
                 raise ValueError(metadata_error)
             record = records.get(path)
             if record is None:
+                if header_fallback and _commented(files, path):
+                    from .stock_recovery import header_plan
+                    value.update(header_plan(files, path, stock, identity=identity))
+                    continue
                 if path not in mod_versions.LEGACY_TARGETS:
                     raise ValueError("Unknown installed mod version: verified uninstall instructions are missing.")
                 state = _legacy_state(files, path)
@@ -168,7 +194,8 @@ def inspect(files, records, *, metadata_error="", stock=None):
         except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, SyntaxError) as error:
             value["reason"] = str(error) or "This mod cannot be removed safely."
         finally:
-            if stock and not metadata_error and not value["available"]:
+            if (stock and path in mod_versions.VERSIONS and not metadata_error and not value["available"]
+                    and not (header_fallback and _commented(files, path))):
                 try:
                     if _missing_recovery_data(files, path, records.get(path)):
                         from . import stock_recovery

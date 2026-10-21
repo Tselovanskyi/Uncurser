@@ -1,7 +1,9 @@
 """Focused checks for the print-only temperature fix; no printer access."""
 import base64
+import ast
 import copy
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -43,6 +45,84 @@ class TemperatureTests(unittest.TestCase):
         self.assertEqual(mod.transform(enabled, False, SOURCE), SOURCE)
         self.assertTrue(mod.inspect(enabled, SOURCE)['enabled'])
         self.assertTrue(mod.inspect(enabled, SOURCE)['known'])
+
+    def test_condition_only_legacy_is_recognized_and_upgraded(self):
+        marker = b'[gcode_macro BED_MESH'
+        prefix, section = SOURCE.split(marker, 1)
+        legacy = prefix + marker + section.replace(mod.ORIGINAL_CONDITION.encode(), mod.ENABLED_CONDITION.encode())
+        state = mod.inspect(legacy, SOURCE)
+        self.assertTrue(state['enabled'])
+        self.assertTrue(state['legacy'])
+        self.assertTrue(state['known'])
+        enabled = mod.transform(legacy, True)
+        self.assertFalse(mod.inspect(enabled, SOURCE)['legacy'])
+        # The unrelated G29 condition is preserved.
+        self.assertEqual(enabled.split(marker)[0], legacy.split(marker)[0])
+        restored = mod.transform(enabled, False, SOURCE)
+        self.assertEqual(restored, legacy.split(marker)[0] + marker + SOURCE.split(marker, 1)[1])
+
+    def test_mixed_legacy_condition_is_normalized_without_losing_the_fix(self):
+        enabled = mod.transform(SOURCE, True)
+        lines, _, condition_index = mod.anchors(enabled)
+        lines[condition_index] = lines[condition_index].replace(mod.ORIGINAL_CONDITION, mod.ENABLED_CONDITION)
+        mixed = ''.join(lines).encode()
+        self.assertTrue(mod.inspect(mixed, SOURCE)['legacy'])
+        self.assertEqual(mod.transform(mixed, True), enabled)
+
+    def test_missing_duplicate_or_reordered_initializer_is_blocked(self):
+        for source in (SOURCE.replace(mod.ORIGINAL_INITIALIZER.encode(), b'{% set bed_temp = 90 %}'),
+                       SOURCE.replace(mod.ORIGINAL_INITIALIZER.encode(),
+                                      (mod.ORIGINAL_INITIALIZER + '\n  ' + mod.ORIGINAL_INITIALIZER).encode()),
+                       SOURCE.replace((mod.ORIGINAL_INITIALIZER + '\n  ').encode(), b'').replace(
+                           b'  M140 S{bed_temp}', (f'  {mod.ORIGINAL_INITIALIZER}\n  M140 S{{bed_temp}}').encode())):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                mod.transform(source, True)
+
+    @staticmethod
+    def selected_temperature(data, target, params):
+        """Evaluate only the macro's two selection statements; no Jinja dependency."""
+        lines, initializer, condition = mod.anchors(data)
+        statement = lines[initializer].strip()
+        if statement == mod.ORIGINAL_INITIALIZER:
+            value = 50
+        else:
+            expression = statement.split('params.BED_TEMP|default(', 1)[1].removesuffix(') %}')
+            printer = SimpleNamespace(heater_bed=SimpleNamespace(target=target),
+                                      custom_macro=SimpleNamespace(default_bed_temp=50))
+            fallback = eval(expression, {'__builtins__': {}}, {'printer': printer})
+            value = params.get('BED_TEMP', fallback)
+        if 'BED_TEMP' in params and (lines[condition].strip() == mod.ENABLED_CONDITION or int(float(params['BED_TEMP'])) >= 50):
+            value = params['BED_TEMP']
+        return float(value)
+
+    def test_native_callers_and_macro_select_bed_target_on_both_firmwares(self):
+        fixtures = Path(__file__).resolve().parents[1] / 'build/firmware-analysis'
+        cases = [(42, None, 42), (50, None, 50), (100, None, 100),
+                 (100, 42, 42), (100, 0, 0), (0, None, 50)]
+        for firmware in ('1.1.6.4', '1.1.7.0'):
+            root = fixtures / firmware / 'rootfs/usr/share/klipper'
+            if not (root / 'klippy/extras/virtual_sdcard.py').is_file():
+                self.skipTest('Local firmware extraction is unavailable.')
+            caller = ast.parse((root / 'klippy/extras/virtual_sdcard.py').read_text(encoding='utf-8'))
+            gates = [node.test for node in ast.walk(caller) if isinstance(node, ast.If)
+                     and ast.unparse(node.test) == 'target_temp > default_bed_temp']
+            self.assertEqual(len(gates), 1)
+            gate = compile(ast.Expression(gates[0]), '<native mesh temperature gate>', 'eval')
+            for variant in ('F008_CR0CN240319C13', 'F008_CR0CN240319C13_1'):
+                native = (root / 'config' / variant / 'gcode_macro.cfg').read_bytes()
+                enabled = mod.transform(native, True)
+                self.assertEqual(sum(a != b for a, b in zip(native.splitlines(), enabled.splitlines())), 1)
+                self.assertEqual(mod.fingerprint(enabled), mod.fingerprint(native))
+                self.assertEqual(mod.transform(enabled, False, native), native)
+                self.assertEqual(self.selected_temperature(native, 42, {}), 50)
+                for target, explicit, expected in cases:
+                    params = {}
+                    if eval(gate, {'__builtins__': {}}, {'target_temp': target, 'default_bed_temp': 50}):
+                        params['BED_TEMP'] = str(target)
+                    if explicit is not None:
+                        params['BED_TEMP'] = str(explicit)
+                    with self.subTest(firmware=firmware, variant=variant, target=target, explicit=explicit):
+                        self.assertEqual(self.selected_temperature(enabled, target, params), expected)
 
     def test_disable_uses_backup_and_preserves_unrelated_edits(self):
         current = mod.transform(SOURCE, True).replace(b'G4 P100', b'G4 P123')
@@ -89,12 +169,12 @@ class TemperatureTests(unittest.TestCase):
         snapshot.mesh.guards = {mod.TARGET: mods.digest(SOURCE)}
         snapshot.mesh_temperature.guards = {mesh.TARGET: mods.digest(test_mesh.SOURCE)}
         saved = copy.deepcopy(snapshot)
-        saved.mesh.data = mesh.transform(test_mesh.SOURCE, True)
+        plan = engine.prepare_all(snapshot, None, mesh_desired=True, temperature_desired=True)
+        saved.mesh.data = plan[mesh.TARGET]
         saved.mesh.sha256 = mods.digest(saved.mesh.data)
-        saved.mesh_temperature.data = mod.transform(SOURCE, True)
+        saved.mesh_temperature.data = plan[mod.TARGET]
         saved.mesh_temperature.sha256 = mods.digest(saved.mesh_temperature.data)
-        ledger = engine.prepare_all(snapshot, None, mesh_desired=True,
-                                    temperature_desired=True)[mod_versions.TARGET]
+        ledger = plan[mod_versions.TARGET]
         saved.versions = engine.MeshSnapshot(ledger, mods.digest(ledger),
             {'known': True, 'enabled': True, 'patchable': True},
             original_hash=mods.digest(b''), original_absent=True)

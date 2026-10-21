@@ -9,12 +9,12 @@ from app.remote import Connection
 
 class PendingValidationTests(unittest.TestCase):
     def window(self):
-        window = SimpleNamespace(snapshot=SimpleNamespace(storage_cleanup=(), storage_moves=(), recovery=None,
+        window = SimpleNamespace(snapshot=SimpleNamespace(storage_cleanup=(), storage_moves=(), storage_error="", recovery=None,
                                                          _ui_checks={"issues": {}}),
                                  snapshot_connection=("192.0.2.1", "root"),
                                  connected=True, closing=False, busy=False, policy="known",
                                  staged=False, mesh_staged=None, temperature_staged=None,
-                                 screws_staged=None, smoothing_staged=None, restore_pending=False,
+                                 screws_staged=None, smoothing_staged=None, warmup_staged=None, restore_pending=False,
                                  update_active=False, plan_key=None, plan_request=None, plan_result=None,
                                  plan_task=None, plan_timer=Mock(), refresh=Mock(), apply_waiting=None,
                                  apply_button=Mock(), connection=lambda: Connection("192.0.2.1"),
@@ -48,7 +48,7 @@ class PendingValidationTests(unittest.TestCase):
         self.assertEqual(prepare.call_count, 2)
         self.assertFalse(prepare.call_args_list[0].kwargs["desired"])
         self.assertTrue(prepare.call_args_list[1].kwargs["desired"])
-        self.assertEqual(window.pending_plan(), {"mandatory": {mods.TARGET}, "error": "", "storage_changed": False})
+        self.assertEqual(window.pending_plan(), {"mandatory": {mods.TARGET}, "error": "", "storage_changed": False, "storage_error": ""})
 
     def test_disconnect_or_new_scan_invalidates_completed_checks(self):
         for change in ("disconnect", "scan"):
@@ -79,7 +79,7 @@ class PendingValidationTests(unittest.TestCase):
         window = self.window()
         window.staged = True
         window.pending_plan()
-        scanned, view = window.snapshot, object()
+        scanned, view = window.snapshot, SimpleNamespace(storage_error="")
         jobs = []
         with patch.object(ui.threading, "Thread", side_effect=lambda **kw: jobs.append(kw["target"]) or Mock()), \
                 patch.object(ui.engine, "storage_plan", return_value=(view, ({"target": mods.TARGET},), ())) as storage_plan, \
@@ -91,7 +91,7 @@ class PendingValidationTests(unittest.TestCase):
             storage_plan.assert_called_once_with(scanned, {mods.TARGET: True}, False)
             automatic.assert_called_once_with(view, {mods.TARGET: True})
             self.assertIs(prepare.call_args.args[0], view)
-        self.assertEqual(window.plan_result, {"mandatory": set(), "error": "", "storage_changed": True})
+        self.assertEqual(window.plan_result, {"mandatory": set(), "error": "", "storage_changed": True, "storage_error": ""})
 
     def test_backup_plan_conflict_blocks_pending_validation_before_mod_planning(self):
         window = self.window()
@@ -120,7 +120,7 @@ class PendingValidationTests(unittest.TestCase):
                 patch.object(ui.engine, "prepare_all", return_value={}):
             window.validate_pending()
             jobs.pop(0)()
-        self.assertEqual(window.plan_result, {"mandatory": set(), "error": "", "storage_changed": False})
+        self.assertEqual(window.plan_result, {"mandatory": set(), "error": "", "storage_changed": False, "storage_error": ""})
 
     def test_cancelled_planner_completion_cannot_clear_a_new_worker(self):
         window = self.window()

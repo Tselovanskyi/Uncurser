@@ -9,13 +9,13 @@ import weakref
 from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRectF, QRunnable, QSignalBlocker, QSize, Qt, QThreadPool, QTimer, QUrl, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QLinearGradient, QPainter, QPen, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QPainter, QPen, QTextCharFormat, QTextCursor
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QDialogButtonBox,
                                QFrame, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox,
                                QPushButton, QPlainTextEdit, QScrollArea, QSizePolicy, QStackedWidget, QStyle, QStyleOptionButton, QVBoxLayout, QWidget)
 
-from . import __version__, engine, mesh, mesh_temperature, mods, network, recovery, screws, settings, smoothing, storage, ui_checks
+from . import __version__, engine, mesh, mesh_temperature, mods, network, recovery, screws, settings, smoothing, storage, ui_checks, warmup
 from .remote import Connection, NewHostKey, trust_key
 
 
@@ -116,11 +116,12 @@ DEFAULT_PASSWORD = "creality_2024"
 PRINTER_ROW_HEIGHT = 48
 SUPPORT_URL = "https://donatello.to/uncurse"
 MOD_CONTROLS = (
-    (mods.TARGET, "staged", "Heat before homing & calibration"),
     (mesh.TARGET, "mesh_staged", "Speed up Bed mesh"),
-    (mesh_temperature.TARGET, "temperature_staged", "Mesh at print temperature"),
-    (screws.PYTHON, "screws_staged", "Bed screw adjustment helper"),
     (smoothing.TARGET, "smoothing_staged", "Speed up homing"),
+    (mods.TARGET, "staged", "Heat before homing & calibration"),
+    (mesh_temperature.TARGET, "temperature_staged", "Mesh at print temperature"),
+    (warmup.TARGET, "warmup_staged", "Don’t delay chamber heating"),
+    (screws.PYTHON, "screws_staged", "Bed screw adjustment helper"),
 )
 
 
@@ -161,25 +162,63 @@ class ActivityButton(QPushButton):
             painter.end()
 
 
+class LoadingLabel(QLabel):
+    def __init__(self, caption, parent=None):
+        super().__init__(caption + "...", parent)
+        self.caption = caption
+        self.phase = 0
+        self.setObjectName("section")
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.timer = QTimer(self)
+        self.timer.setInterval(400)
+        self.timer.timeout.connect(self.advance)
+
+    def reserve_width(self):
+        self.setFixedWidth(self.fontMetrics().horizontalAdvance(self.caption + "...") + 2)
+
+    def advance(self):
+        self.phase = self.phase % 3 + 1
+        self.setText(self.caption + "." * self.phase)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.ensurePolished()
+        self.reserve_width()
+        self.phase = 0
+        self.advance()
+        self.timer.start()
+
+    def hideEvent(self, event):
+        self.timer.stop()
+        super().hideEvent(event)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange) and hasattr(self, "caption"):
+            self.reserve_width()
+
+
 class ConnectionButton(QPushButton):
     def __init__(self):
         super().__init__("Connect")
         self.connected = False
+        self.connecting = False
         self.hovered = False
         self.setObjectName("primary")
         self.setFixedWidth(110)
 
-    def set_connected(self, connected):
-        if self.connected != connected:
+    def set_connected(self, connected, connecting=False):
+        if (self.connected, self.connecting) != (connected, connecting):
             self.connected = connected
-            self.setObjectName("connected" if connected else "primary")
+            self.connecting = connecting
+            self.setObjectName("connected" if connected or connecting else "primary")
             self.style().unpolish(self)
             self.style().polish(self)
-        self.setAccessibleName("Disconnect printer" if connected else "Connect printer")
+        self.setAccessibleName("Disconnect printer" if connected or connecting else "Connect printer")
         self.update_caption()
 
     def update_caption(self):
-        self.setText("Disconnect" if self.connected and self.hovered and self.isEnabled()
+        self.setText("Disconnect" if self.connecting or (self.connected and self.hovered and self.isEnabled())
                      else "Connected" if self.connected else "Connect")
 
     def enterEvent(self, event):
@@ -268,42 +307,43 @@ class SmoothScrollArea(QScrollArea):
 
 
 class ScrollFade(QWidget):
-    def __init__(self, scroll):
-        super().__init__(scroll.viewport())
+    def __init__(self, scroll, parent=None):
+        super().__init__(parent if parent is not None else scroll.viewport())
         self.setObjectName("scrollFade")
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.viewport = scroll.viewport()
         self.bar = scroll.verticalScrollBar()
         self.bar.rangeChanged.connect(self.sync)
         self.bar.valueChanged.connect(self.sync)
-        scroll.viewport().installEventFilter(self)
+        self.viewport.installEventFilter(self)
+        scroll.installEventFilter(self)
+        self.parentWidget().installEventFilter(self)
         self.sync()
 
     def sync(self, *unused):
-        self.setGeometry(self.parentWidget().rect())
+        origin = self.viewport.mapTo(self.parentWidget(), self.viewport.rect().topLeft())
+        self.setGeometry(0, origin.y(), self.parentWidget().width(), self.viewport.height())
         self.bar.setEnabled(self.bar.maximum() > self.bar.minimum())
         self.setVisible(self.bar.maximum() > self.bar.minimum())
         self.raise_()
         self.update()
 
     def eventFilter(self, widget, event):
-        if event.type() == QEvent.Type.Resize:
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.Move):
             self.sync()
         return False
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        extent = min(64, self.height() // 2)
-        top = min(extent, self.bar.value() - self.bar.minimum())
-        bottom = min(extent, self.bar.maximum() - self.bar.value())
-        for height, y, reverse in ((top, 0, False), (bottom, self.height() - bottom, True)):
-            if height <= 0:
+        top = self.bar.value() - self.bar.minimum()
+        bottom = self.bar.maximum() - self.bar.value()
+        for distance, y in ((top, 0), (bottom, self.height() - 1)):
+            if distance <= 0:
                 continue
-            fade = QLinearGradient(0, y, 0, y + height)
-            fade.setColorAt(0, QColor(0, 0, 0, 0 if reverse else 255))
-            fade.setColorAt(1, QColor(0, 0, 0, 255 if reverse else 0))
-            painter.fillRect(QRectF(0, y, self.width(), height), fade)
+            painter.setOpacity(min(1.0, distance / 32.0))
+            painter.fillRect(QRectF(0, y, self.width(), 1), QColor("#333333"))
 
 
 class DetailsReveal(QWidget):
@@ -543,8 +583,12 @@ class Task(QRunnable):
             self.signals.progress.emit(message)
 
     def run(self):
+        if self.cancelled.is_set():
+            return
         try:
             result = self.function(self.progress)
+            if self.cancelled.is_set():
+                return
             scanned = result.get("snapshot") if isinstance(result, dict) else result
             if isinstance(scanned, engine.Snapshot):
                 ui_checks.populate(scanned)
@@ -592,7 +636,7 @@ class PrinterRow(QWidget):
         self.password.setEchoMode(QLineEdit.EchoMode.Normal)
         self.password.setAccessibleName("Saved SSH password")
         self.connect_button = ConnectionButton()
-        self.connect_button.clicked.connect(lambda: self.disconnect_requested.emit(self) if self.connect_button.connected
+        self.connect_button.clicked.connect(lambda: self.disconnect_requested.emit(self) if self.connect_button.connected or self.connect_button.connecting
                                             else self.connect_requested.emit(self))
         self.availability = label("Checking…", "muted")
         self.availability.setFixedWidth(110)
@@ -620,10 +664,10 @@ class PrinterRow(QWidget):
         values = self.values()
         return Connection(network.parse_host(values["host"]), username=values["username"], password=values["password"])
 
-    def refresh(self, active, busy):
-        self.connection_state.setCurrentWidget(self.connect_button if self.reachable or active else self.availability)
-        self.connect_button.setEnabled(not busy)
-        self.connect_button.set_connected(active)
+    def refresh(self, active, busy, *, connecting=False, can_disconnect=False):
+        self.connection_state.setCurrentWidget(self.connect_button if self.reachable or active or connecting else self.availability)
+        self.connect_button.setEnabled(not busy or can_disconnect)
+        self.connect_button.set_connected(active, connecting)
         self.remove_button.setEnabled(not busy)
         self.availability.setText(("Checking…" if self.reachable is None else "Unavailable") if self.host.text().strip() else "")
         self.availability.setToolTip("" if active else "Connect is available when the printer is reachable.")
@@ -666,52 +710,120 @@ def file_summary(modified=0, added=0):
     return " · ".join(parts)
 
 
+def remove_all_targets(snapshot):
+    removals = ui_checks.check(snapshot, "removals")
+    targets = {path for path, status in removals.items() if status.get("present")}
+    if not targets:
+        return set(), "No installed mods were found."
+    if ui_checks.check(snapshot, "issues") or snapshot.recovery:
+        return set(), "Fix the detected issues before removing all mods."
+    if targets - {path for path, _, _ in MOD_CONTROLS}:
+        return set(), "Use Fix issues to handle unknown mods first."
+    if any(not removals[path].get("available") for path in targets):
+        return set(), "Some installed mods cannot be safely removed. Scan the printer to review the issues."
+    return targets, ""
+
+
+class RestoreChoiceDialog(QDialog):
+    def __init__(self, removal_reason, can_restore, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Restore original")
+        self.setMinimumWidth(540)
+        self.choice = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(20)
+        message = label('Restore original uses backups and may undo unrelated changes made by you or the printer. '
+                        'The safer choice is <span style="color: #00ff00;">&quot;Remove all mods&quot;</span>, '
+                        'which uses each mod’s individual uninstall instructions.', wrap=True)
+        message.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(message)
+        actions = QHBoxLayout()
+        actions.setSpacing(12)
+        for choice, title, name, enabled, reason in (
+                ("remove", "Remove all mods", "removeModsAction", not removal_reason, removal_reason),
+                ("restore", "Restore original", "restoreFilesAction", can_restore,
+                 "Verified original backups for this printer model and firmware are required.")):
+            action = button(title, lambda checked=False, selected=choice: self.select(selected))
+            action.setObjectName(name)
+            action.setEnabled(enabled)
+            action.setAutoDefault(False)
+            action.setDefault(choice == "remove" and enabled)
+            action.setToolTip("" if enabled else reason)
+            actions.addWidget(action)
+        layout.addLayout(actions)
+        self.setStyleSheet("""
+            QPushButton#removeModsAction { background: #217a3c; color: #ffffff; }
+            QPushButton#removeModsAction:enabled:hover { background: #29994c; }
+            QPushButton#removeModsAction:enabled:pressed { background: #185b2c; }
+            QPushButton#removeModsAction:disabled { background: #152b1b; color: #718777; }
+            QPushButton#restoreFilesAction { background: #b42323; color: #ffffff; }
+            QPushButton#restoreFilesAction:enabled:hover { background: #cf3131; }
+            QPushButton#restoreFilesAction:enabled:pressed { background: #8e1c1c; }
+            QPushButton#restoreFilesAction:disabled { background: #3c1818; color: #9a6b6b; }
+        """)
+
+    def select(self, choice):
+        self.choice = choice
+        self.accept()
+
+
 class FirmwareIssuesDialog(QDialog):
     def __init__(self, issues, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Scan for issues")
         self.setMinimumWidth(440)
         self.issue_buttons = {}
+        self.unknown_buttons = {}
+        self.unknown_available = set()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(18)
         can_fix = False
-        for path, _, name in MOD_CONTROLS:
+        entries = [(path, name) for path, _, name in MOD_CONTROLS]
+        entries.extend((path, status.get("name") or path.rsplit("/", 1)[-1])
+                       for path, status in issues.items() if status.get("unknown"))
+        for path, name in entries:
             status = issues.get(path)
             if not status:
                 continue
             row = QVBoxLayout()
             row.setSpacing(4)
-            reason = ("Unknown firmware compatibility" if status.get("installed_firmware") is None else
+            unknown = bool(status.get("unknown"))
+            reason = ("Unknown mod." if unknown else
+                      "Unknown firmware compatibility" if status.get("installed_firmware") is None else
                       status.get("firmware_reason") or "Mod firmware differs from the current printer firmware.")
             heading = label(html.escape(name) + '<br><span style="color: #ff0000;">' +
                             html.escape(reason).replace("\n", "<br>") + '</span>', wrap=True)
             heading.setTextFormat(Qt.TextFormat.RichText)
             row.addWidget(heading)
-            if status.get("available"):
-                can_fix = True
-                if status.get("reinstall") and status.get("present"):
-                    action_row = QHBoxLayout()
-                    action_row.setSpacing(8)
-                    action_row.addWidget(label('<span style="color: #00ff00;">Solution:</span>'))
-                    action = button("Reinstall")
-                    action.setObjectName("issueSolution")
-                    action.setCheckable(True)
-                    action.setChecked(True)
-                    action.setAutoDefault(False)
-                    action.toggled.connect(lambda checked, target=action:
-                                           target.setText("Reinstall" if checked else "Remove"))
-                    self.issue_buttons[path] = action
-                    action_row.addWidget(action)
-                    action_row.addStretch()
-                    row.addLayout(action_row)
-                else:
-                    row.addWidget(label('<span style="color: #00ff00;">Solution: Remove</span>'))
-            else:
+            if unknown or status.get("available") and status.get("reinstall") and status.get("present"):
+                action_row = QHBoxLayout()
+                action_row.setSpacing(8)
+                action_row.addWidget(label('<span style="color: #00ff00;">Solution:</span>'))
+                selected, alternative = ("Remove", "Ignore") if unknown else ("Reinstall", "Remove")
+                action = button(selected)
+                action.setObjectName("issueSolution")
+                action.setCheckable(True)
+                action.setChecked(True)
+                action.setAutoDefault(False)
+                (self.unknown_buttons if unknown else self.issue_buttons)[path] = action
+                if unknown and status.get("available"):
+                    self.unknown_available.add(path)
+                action.toggled.connect(lambda checked, target=action, on=selected, off=alternative:
+                                       target.setText(on if checked else off))
+                action.toggled.connect(self.update_fix_enabled)
+                action_row.addWidget(action)
+                action_row.addStretch()
+                row.addLayout(action_row)
+            elif status.get("available"):
+                row.addWidget(label('<span style="color: #00ff00;">Solution: Remove</span>'))
+            if not status.get("available"):
                 unresolved = "Unresolved: " + status.get("reason", "The changes could not be verified.")
                 text = label(unresolved, wrap=True)
                 text.setTextFormat(Qt.TextFormat.PlainText)
                 row.addWidget(text)
+            can_fix |= bool(not unknown and status.get("available"))
             layout.addLayout(row)
         storage_issue = issues.get(storage.ROOT)
         if storage_issue:
@@ -731,7 +843,8 @@ class FirmwareIssuesDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         self.fix_button = button("Fix issues")
         self.fix_button.setObjectName("fixIssues")
-        self.fix_button.setEnabled(can_fix)
+        self.can_fix_known = can_fix
+        self.update_fix_enabled()
         buttons.addButton(self.fix_button, QDialogButtonBox.ButtonRole.AcceptRole)
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
         buttons.accepted.connect(self.accept)
@@ -740,6 +853,18 @@ class FirmwareIssuesDialog(QDialog):
 
     def reinstall_targets(self):
         return tuple(path for path, action in self.issue_buttons.items() if action.isChecked())
+
+    def unknown_removals(self):
+        return tuple(path for path, action in self.unknown_buttons.items()
+                     if action.isChecked() and path in self.unknown_available)
+
+    def ignored_targets(self):
+        return tuple(path for path, action in self.unknown_buttons.items() if not action.isChecked())
+
+    def update_fix_enabled(self):
+        # Ignore is a session acknowledgement and does not require a write.
+        if hasattr(self, "fix_button"):
+            self.fix_button.setEnabled(bool(self.can_fix_known or self.unknown_removals() or self.ignored_targets()))
 
 
 class FileStatusList(QScrollArea):
@@ -865,17 +990,20 @@ class Window(QMainWindow):
         self.start_polling = start_polling
         self.snapshot = None
         self.snapshot_connection = None
+        self.ignored_mods = set()
         self.staged = None
         self.mesh_staged = None
         self.temperature_staged = None
         self.screws_staged = None
         self.smoothing_staged = None
+        self.warmup_staged = None
         self.restore_pending = False
         self.update_enabled = True
         self.automatic_update_error = ""
         self.policy = "known"
         self.busy = False
         self.scanning = False
+        self.connect_cancel_ready = False
         self.active_task = None
         self.discovery_task = None
         self.discovery_stop = threading.Event()
@@ -898,6 +1026,11 @@ class Window(QMainWindow):
         self.probe_timer.timeout.connect(self.check_reachability)
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self.check_reachability)
+        self.disconnect_timer = QTimer(self)
+        self.disconnect_timer.setSingleShot(True)
+        self.disconnect_timer.setInterval(7000)
+        self.disconnect_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.disconnect_timer.timeout.connect(self.enable_scan_disconnect)
         self.setWindowTitle("Uncurser · K2 Plus")
         self.setProperty("hideTitleText", True)
         self.resize(720, 920)
@@ -956,9 +1089,8 @@ class Window(QMainWindow):
 
         self.scan_card, layout = card()
         self.scan_card.setObjectName("scanPanel")
-        self.scan_loading = label("Reading printer details…", "section", True)
-        self.scan_loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.scan_loading)
+        self.scan_loading = LoadingLabel("Reading printer details", self.scan_card)
+        layout.addWidget(self.scan_loading, alignment=Qt.AlignmentFlag.AlignHCenter)
         self.scan_content = QWidget()
         self.scan_content.setObjectName("scanContent")
         layout.addWidget(self.scan_content)
@@ -1030,7 +1162,6 @@ class Window(QMainWindow):
         self.heat_details.setToolTip("View the code for the initial application of this mod")
         self.heat_item = ModItem(self.mod_card, self.pending_label, self.toggle,
                                  self.heat_details, self.heat_expand)
-        mod_list.addWidget(self.heat_item)
         self.mesh_card = QWidget()
         self.mesh_card.setObjectName("modContent")
         layout = QHBoxLayout(self.mesh_card)
@@ -1062,7 +1193,6 @@ class Window(QMainWindow):
         self.mesh_details.setToolTip("View the code for the initial application of this mod")
         self.mesh_item = ModItem(self.mesh_card, self.mesh_pending, self.mesh_toggle,
                                  self.mesh_details, self.mesh_expand)
-        mod_list.addWidget(self.mesh_item)
         self.temperature_card = QWidget()
         self.temperature_card.setObjectName("modContent")
         layout = QHBoxLayout(self.temperature_card)
@@ -1094,7 +1224,6 @@ class Window(QMainWindow):
         self.temperature_details.setToolTip("View the code for the initial application of this mod")
         self.temperature_item = ModItem(self.temperature_card, self.temperature_pending, self.temperature_toggle,
                                         self.temperature_details, self.temperature_expand)
-        mod_list.addWidget(self.temperature_item)
         self.smoothing_card = QWidget()
         self.smoothing_card.setObjectName("modContent")
         layout = QHBoxLayout(self.smoothing_card)
@@ -1128,12 +1257,43 @@ class Window(QMainWindow):
         self.smoothing_details.setToolTip("View the code for the initial application of this mod")
         self.smoothing_item = ModItem(self.smoothing_card, self.smoothing_pending, self.smoothing_toggle,
                                       self.smoothing_details, self.smoothing_expand)
-        mod_list.addWidget(self.smoothing_item)
+        self.warmup_card = QWidget()
+        self.warmup_card.setObjectName("modContent")
+        layout = QHBoxLayout(self.warmup_card)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(label("Don’t delay chamber heating", "section"))
+        self.warmup_opacity = QGraphicsOpacityEffect(self.warmup_card)
+        self.warmup_card.setGraphicsEffect(self.warmup_opacity)
+        self.warmup_body = QWidget()
+        self.warmup_body.setObjectName("modBody")
+        warmup_layout = QVBoxLayout(self.warmup_body)
+        warmup_layout.setContentsMargins(0, 0, 0, 0)
+        warmup_layout.setSpacing(12)
+        warmup_layout.addWidget(label(
+            "Start chamber heating at 50% power while the bed heats, instead of waiting for the bed to be ready", wrap=True))
+        self.warmup_expand = DetailsButton(self.warmup_body)
+        self.warmup_toggle = Switch()
+        self.warmup_toggle.setAccessibleName("Don’t delay chamber heating")
+        self.warmup_toggle.toggled.connect(self.stage_warmup_toggle)
+        self.warmup_pending = label("Pending", "muted")
+        self.warmup_pending.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pending_size = self.warmup_pending.sizePolicy()
+        pending_size.setRetainSizeWhenHidden(True)
+        self.warmup_pending.setSizePolicy(pending_size)
+        self.warmup_details = ModFilesButton(file_summary(modified=1), lambda: self.show_mod_code(warmup.TARGET))
+        self.warmup_details.setObjectName("modDetails")
+        self.warmup_details.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.warmup_details.setToolTip("View the code for the initial application of this mod")
+        self.warmup_item = ModItem(self.warmup_card, self.warmup_pending, self.warmup_toggle,
+                                   self.warmup_details, self.warmup_expand)
+        for item in (self.mesh_item, self.smoothing_item, self.heat_item, self.temperature_item, self.warmup_item):
+            mod_list.addWidget(item)
         self.mod_version_rows = {
             mods.TARGET: (self.heat_details, self.heat_details.text()),
             mesh.TARGET: (self.mesh_details, self.mesh_details.text()),
             mesh_temperature.TARGET: (self.temperature_details, self.temperature_details.text()),
             smoothing.TARGET: (self.smoothing_details, self.smoothing_details.text()),
+            warmup.TARGET: (self.warmup_details, self.warmup_details.text()),
         }
         maintenance_section, maintenance_layout = card()
         maintenance_layout.addWidget(label("HELPERS", "groupHeading"))
@@ -1176,7 +1336,8 @@ class Window(QMainWindow):
         self.screws_item = ModItem(self.screws_card, self.screws_pending, self.screws_toggle,
                                   self.screws_details, self.screws_expand)
         maintenance_layout.addWidget(self.screws_item)
-        self.details_buttons = (self.heat_expand, self.mesh_expand, self.temperature_expand, self.smoothing_expand, self.screws_expand)
+        self.details_buttons = (self.heat_expand, self.mesh_expand, self.temperature_expand, self.smoothing_expand,
+                                self.warmup_expand, self.screws_expand)
         for disclosure in self.details_buttons:
             disclosure.toggled.connect(lambda expanded, active=disclosure: self.close_other_details(active, expanded))
         mods_and_footer = QVBoxLayout()
@@ -1197,7 +1358,7 @@ class Window(QMainWindow):
         self.cards_scroll.setWidgetResizable(True)
         self.cards_scroll.setMinimumHeight(100)
         self.cards_scroll.setWidget(cards)
-        self.cards_fade = ScrollFade(self.cards_scroll)
+        self.cards_fade = ScrollFade(self.cards_scroll, container)
         mods_and_footer.addWidget(self.cards_scroll, 1)
         outer.addLayout(mods_and_footer, 1)
 
@@ -1236,9 +1397,7 @@ class Window(QMainWindow):
         footer.addStretch()
         self.original_button = button("Restore original…", self.stage_restore)
         self.original_button.setObjectName("restore")
-        self.original_button.setToolTip("Full restore requires original backups from this printer model and firmware. "
-                                       "Backups from another firmware or without verified identity cannot be used. "
-                                       "Verified mod removal remains available.")
+        self.original_button.setToolTip("Choose mod removal or restoration from original backups.")
         footer.addWidget(self.original_button)
         self.cancel_button = button("Cancel", self.cancel_staged)
         self.apply_button = ActivityButton("Apply", "Applying…", self.apply_clicked)
@@ -1352,6 +1511,7 @@ class Window(QMainWindow):
         if row is self.active_row:
             self.active_row = None
             self.connected = False
+            self.ignored_mods.clear()
             self.snapshot = None
             self.snapshot_connection = None
             self.clear_pending()
@@ -1376,6 +1536,7 @@ class Window(QMainWindow):
             row.reachable = None
             if row is self.active_row:
                 self.connected = False
+                self.ignored_mods.clear()
                 self.snapshot = None
                 self.snapshot_connection = None
                 self.clear_pending()
@@ -1422,6 +1583,7 @@ class Window(QMainWindow):
                 row.reachable = results[host]
                 if row is self.active_row and self.connected and not row.reachable:
                     self.connected = False
+                    self.ignored_mods.clear()
                     self.clear_pending()
                     self.scan_progress("Printer unreachable. Reconnect when it is available.")
         self.refresh()
@@ -1439,6 +1601,7 @@ class Window(QMainWindow):
             self.active_row = row
             self.policy = "known"
         self.connected = False
+        self.ignored_mods.clear()
         self.clear_pending()
         self.snapshot = None
         self.snapshot_connection = None
@@ -1450,10 +1613,27 @@ class Window(QMainWindow):
         self.run_task(lambda progress: engine.scan(connection, self.known_hosts, progress),
                       lambda result: self.receive_scan(result, connection), scan=True)
 
+    def enable_scan_disconnect(self):
+        if (not self.closing and self.busy and self.scanning and not self.connected
+                and self.snapshot is None and self.active_task is not None):
+            self.connect_cancel_ready = True
+            self.refresh()
+
     def disconnect_printer(self, row=None):
-        if self.busy or (row is not None and row is not self.active_row):
+        if row is not None and row is not self.active_row:
             return
+        if self.busy:
+            if not self.scanning or not self.connect_cancel_ready:
+                return
+            task, self.active_task = self.active_task, None
+            if task is not None:
+                task.cancelled.set()
+            self.busy = self.scanning = False
+            self.scan_button.set_running(False)
+        self.disconnect_timer.stop()
+        self.connect_cancel_ready = False
         self.connected = False
+        self.ignored_mods.clear()
         self.clear_pending()
         self.scan_progress("Disconnected.")
         self.refresh()
@@ -1465,6 +1645,10 @@ class Window(QMainWindow):
         self.reachability_generation += 1
         self.busy = True
         self.scanning = scan
+        self.disconnect_timer.stop()
+        self.connect_cancel_ready = False
+        if scan and not self.connected and self.snapshot is None:
+            self.disconnect_timer.start()
         if scan:
             self.scan_button.set_running(True)
             self.scan_progress("Reading printer files…")
@@ -1474,25 +1658,32 @@ class Window(QMainWindow):
         task = Task(function)
         self.active_task = task
         task_ref = weakref.ref(task)
+        def current_task():
+            active = task_ref()
+            return (not self.closing and active is not None and self.active_task is active
+                    and not active.cancelled.is_set())
         def progress(message):
-            if not self.closing:
+            if current_task():
                 (self.scan_progress if scan else self.apply_button.setToolTip)(message)
         task.signals.progress.connect(progress)
         def stop_progress():
+            self.active_task = None
             self.busy = False
             self.scanning = False
+            self.disconnect_timer.stop()
+            self.connect_cancel_ready = False
             if scan:
                 self.scan_button.set_running(False)
             else:
                 self.apply_button.set_running(False)
         def finish(value):
-            if self.closing:
+            if not current_task():
                 return
             stop_progress()
             done(value)
             self.refresh()
         def fail(error):
-            if self.closing:
+            if not current_task():
                 return
             failed_task = task_ref()
             stop_progress()
@@ -1538,7 +1729,8 @@ class Window(QMainWindow):
         except (ValueError, OSError) as error:
             QMessageBox.warning(self, "Connection", str(error))
             return
-        self.run_task(lambda progress: engine.scan(connection, self.known_hosts, progress),
+        ignored = tuple(sorted(self.ignored_mods))
+        self.run_task(lambda progress: engine.scan(connection, self.known_hosts, progress, ignored_mods=ignored),
                       lambda result: self.receive_scan(result, connection), scan=True)
 
     def review_firmware_issues(self, result, connection):
@@ -1549,12 +1741,26 @@ class Window(QMainWindow):
         try:
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 selected = dialog.reinstall_targets()
-                QTimer.singleShot(0, lambda: self.fix_firmware_issues(result, connection, issues, reinstall_targets=selected))
+                unknown = any(status.get("unknown") for status in issues.values())
+                removals = dialog.unknown_removals() if unknown else ()
+                ignored = dialog.ignored_targets() if unknown else ()
+                if ignored:
+                    if (not self.connected or self.snapshot is not result or
+                            self.snapshot_connection != (connection.host, connection.username)):
+                        return True
+                    self.ignored_mods.update(ignored)
+                    ui_checks.set_ignored(result, self.ignored_mods)
+                    issues = ui_checks.check(result, "issues")
+                    self.refresh()
+                if issues:
+                    extra = {"unknown_removals": removals} if removals else {}
+                    QTimer.singleShot(0, lambda: self.fix_firmware_issues(result, connection, issues,
+                                                                         reinstall_targets=selected, **extra))
         finally:
             dialog.deleteLater()
         return True
 
-    def fix_firmware_issues(self, scanned, connection, issues, *, reinstall_targets=None):
+    def fix_firmware_issues(self, scanned, connection, issues, *, reinstall_targets=None, unknown_removals=()):
         if self.busy or not self.connected or self.closing:
             return
         try:
@@ -1567,13 +1773,16 @@ class Window(QMainWindow):
                        if issues.get(path, {}).get("present") and issues[path].get("available")}
             reinstall_targets = tuple(path for path in targets if issues[path].get("reinstall") and
                                       (reinstall_targets is None or path in reinstall_targets))
-            if not targets and not issues.get(storage.ROOT, {}).get("available"):
+            if not targets and not unknown_removals and not issues.get(storage.ROOT, {}).get("available"):
                 return
             options = {"desired": targets.get(mods.TARGET), "mesh_desired": targets.get(mesh.TARGET),
                        "temperature_desired": targets.get(mesh_temperature.TARGET),
                        "screws_desired": targets.get(screws.PYTHON), "smoothing_desired": targets.get(smoothing.TARGET),
                        "restore": False, "update": False, "full_risk": False}
-            engine.prepare_all(engine.cleanup_snapshot(scanned) if scanned.storage_cleanup else scanned, **options)
+            if warmup.TARGET in targets:
+                options["warmup_desired"] = targets[warmup.TARGET]
+            extra = {"unknown_removals": unknown_removals} if unknown_removals else {}
+            engine.prepare_all(engine.cleanup_snapshot(scanned) if scanned.storage_cleanup else scanned, **options, **extra)
         except (ValueError, TypeError, SyntaxError) as error:
             QMessageBox.warning(self, "Cannot fix issues", str(error))
             return
@@ -1594,9 +1803,10 @@ class Window(QMainWindow):
                     QMessageBox.information(self, "Write successful", result["message"])
 
         # Repair excludes pending user edits, which remain available for Apply.
-        if reinstall_targets:
+        if reinstall_targets or unknown_removals:
             self.run_task(lambda progress: engine.fix_issues(connection, self.known_hosts, scanned,
-                                                            progress=progress, reinstall_targets=reinstall_targets), fixed)
+                                                            progress=progress, reinstall_targets=reinstall_targets,
+                                                            **extra), fixed)
         else:
             self.run_task(lambda progress: engine.apply(connection, self.known_hosts, scanned,
                                                        progress=progress, **options,
@@ -1678,9 +1888,10 @@ class Window(QMainWindow):
         if dialog.clickedButton() is not repair_button:
             return
 
+        ignored = tuple(sorted(self.ignored_mods))
         def repair(progress):
             result = recovery.repair(connection, self.known_hosts, scanned, progress)
-            result["snapshot"] = engine.scan(connection, self.known_hosts, progress)
+            result["snapshot"] = engine.scan(connection, self.known_hosts, progress, ignored_mods=ignored)
             return result
 
         def repaired(result):
@@ -1783,6 +1994,7 @@ class Window(QMainWindow):
         self.temperature_staged = None
         self.screws_staged = None
         self.smoothing_staged = None
+        self.warmup_staged = None
         self.restore_pending = False
         self.update_enabled = update_enabled
         self.update_active = False
@@ -1803,20 +2015,33 @@ class Window(QMainWindow):
     def stage_restore(self):
         if self.snapshot is None or not self.connected or self.busy:
             return
-        paths = ui_checks.check(self.snapshot, ("restore", self.policy == "all"))
-        if not paths:
+        scanned, connection = self.snapshot, self.snapshot_connection
+        targets, reason = remove_all_targets(scanned)
+        paths = ui_checks.check(scanned, ("restore", self.policy == "all"))
+        if not targets and not paths:
             return
-        names = "\n".join(path.rsplit("/", 1)[-1] for path in sorted(paths))
-        reply = QMessageBox.question(self, "Restore initial originals?", "Restore these files from their initial on-printer backups:\n\n" + names +
-                                     "\n\nLater manual edits to these files will be removed. Current generated calibration data is preserved.\n\nStage this restoration?")
-        if reply == QMessageBox.StandardButton.Yes:
-            self.restore_pending = True
-            self.staged = None
-            self.mesh_staged = None
-            self.temperature_staged = None
-            self.screws_staged = None
-            self.smoothing_staged = None
+        self.apply_waiting = None
+        dialog = RestoreChoiceDialog(reason, bool(paths), self)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            if (not self.connected or self.busy or self.snapshot is not scanned
+                    or self.snapshot_connection != connection):
+                return
+            if dialog.choice not in ("remove", "restore"):
+                return
+            if (dialog.choice == "remove" and not targets) or (dialog.choice == "restore" and not paths):
+                return
+            self.clear_pending(update_enabled=False)
+            if dialog.choice == "remove":
+                for path, field, _ in MOD_CONTROLS:
+                    if path in targets:
+                        setattr(self, field, False)
+            else:
+                self.restore_pending = True
             self.refresh()
+        finally:
+            dialog.deleteLater()
 
     def stage_temperature_toggle(self, value):
         self.stage_mod_toggle(mesh_temperature.TARGET, "temperature_staged", value)
@@ -1826,6 +2051,9 @@ class Window(QMainWindow):
 
     def stage_smoothing_toggle(self, value):
         self.stage_mod_toggle(smoothing.TARGET, "smoothing_staged", value)
+
+    def stage_warmup_toggle(self, value):
+        self.stage_mod_toggle(warmup.TARGET, "warmup_staged", value)
 
     def pending_plan(self, choices, needed):
         scope = (id(self.snapshot), self.snapshot_connection, self.policy, self.restore_pending)
@@ -1840,6 +2068,8 @@ class Window(QMainWindow):
                    "temperature_desired": self.temperature_staged, "screws_desired": self.screws_staged,
                    "smoothing_desired": self.smoothing_staged, "restore": self.restore_pending,
                    "full_risk": self.policy == "all", "update": self.update_active}
+        if self.warmup_staged is not None:
+            options["warmup_desired"] = self.warmup_staged
         key = (id(self.snapshot), self.snapshot_connection, self.policy, tuple(options.items()))
         if key != self.plan_key:
             self.plan_key, self.plan_result = key, None
@@ -1856,15 +2086,18 @@ class Window(QMainWindow):
         def validate(progress):
             required = set()
             storage_changed = False
+            storage_error = scanned.storage_error
             try:
                 view, retire, moves = engine.storage_plan(scanned, choices, options["restore"])
                 storage_changed = bool(retire or moves)
+                storage_error = view.storage_error
                 if not options["restore"] and any(choice is True for choice in choices.values()):
                     required = engine.automatic_updates(view, choices)
                 engine.prepare_all(view, **options)
             except (ValueError, SyntaxError, TypeError, UnicodeError) as error:
-                return {"mandatory": required, "error": operation_error_message(error), "storage_changed": storage_changed}
-            return {"mandatory": required, "error": "", "storage_changed": storage_changed}
+                return {"mandatory": required, "error": operation_error_message(error), "storage_changed": storage_changed,
+                        "storage_error": storage_error}
+            return {"mandatory": required, "error": "", "storage_changed": storage_changed, "storage_error": storage_error}
 
         task = Task(validate)
         self.plan_task = task
@@ -1885,7 +2118,7 @@ class Window(QMainWindow):
 
         task.signals.done.connect(finished)
         task.signals.error.connect(lambda error: finished({"mandatory": set(), "error": operation_error_message(error),
-                                                         "storage_changed": False}))
+                                                         "storage_changed": False, "storage_error": scanned.storage_error}))
         # Local planning is read-only and must not block editing or closing.
         threading.Thread(target=task.run, daemon=True, name="pending-changes").start()
 
@@ -1900,7 +2133,8 @@ class Window(QMainWindow):
             removal = removals.get(path, {})
             applied = removal.get("present") if untested or removal.get("recovery") else value.analysis["enabled"] if value else None
             staged = getattr(self, field)
-            if not issues_found and applied is not None and staged is not None and staged == applied:
+            if (not issues_found and applied is not None and staged is not None and staged == applied
+                    and not (staged is False and removal.get("present") and removal.get("available"))):
                 setattr(self, field, None)
         device_error = network.compatibility_error(snapshot.status if snapshot else None)
         supported = snapshot is not None and not device_error
@@ -1916,7 +2150,7 @@ class Window(QMainWindow):
         restore_paths = ui_checks.check(snapshot, ("restore", self.policy == "all")) if self.restore_pending else set()
         choices = {mods.TARGET: self.staged, mesh.TARGET: self.mesh_staged,
                    mesh_temperature.TARGET: self.temperature_staged, screws.PYTHON: self.screws_staged,
-                   smoothing.TARGET: self.smoothing_staged}
+                   smoothing.TARGET: self.smoothing_staged, warmup.TARGET: self.warmup_staged}
         update_statuses = ui_checks.check(snapshot, "updates")
         outdated_paths = engine.outdated_mods(snapshot, update_statuses, issues)
         update_targets = {path for path in outdated_paths if choices.get(path) is not False} if not self.restore_pending else set()
@@ -1933,6 +2167,11 @@ class Window(QMainWindow):
             update_error = plan["error"]
         plan_ready = not needs_plan or plan is not None
         storage_error = snapshot.storage_error if snapshot else ""
+        if needs_plan and plan is None:
+            # Apply waits for this plan before any write can begin.
+            storage_error = ""
+        elif plan is not None:
+            storage_error = plan.get("storage_error", storage_error)
         if (storage_error == engine.INCLUDE_STORAGE_ERROR and self.screws_staged is False
                 and removals.get(screws.PYTHON, {}).get("available") and not self.restore_pending
                 and not self.update_active and not any(choice is True for choice in choices.values())):
@@ -1954,6 +2193,8 @@ class Window(QMainWindow):
              self.screws_toggle, self.screws_pending, self.screws_card, self.screws_opacity),
             (smoothing.TARGET, engine.mod_snapshot(snapshot, smoothing.TARGET) if snapshot else None, self.smoothing_staged,
              self.smoothing_toggle, self.smoothing_pending, self.smoothing_card, self.smoothing_opacity),
+            (warmup.TARGET, engine.mod_snapshot(snapshot, warmup.TARGET) if snapshot else None, self.warmup_staged,
+             self.warmup_toggle, self.warmup_pending, self.warmup_card, self.warmup_opacity),
         )
         for path, value, staged, toggle, pending, panel, opacity in entries:
             removal = removals.get(path, {})
@@ -1976,7 +2217,9 @@ class Window(QMainWindow):
             toggle.setChecked(staged if staged is not None else applied is True)
             toggle.blockSignals(False)
             toggle.update()
-            changed = path in restore_paths or (path in update_paths and staged is not False) or (staged is not None and staged != applied)
+            changed = (path in restore_paths or (path in update_paths and staged is not False)
+                       or (staged is not None and staged != applied)
+                       or (staged is False and removal.get("present") and removal.get("available")))
             any_changed |= changed
             pending.setVisible(bool(changed))
             pending.setToolTip("Restore the initial on-printer original" if path in restore_paths else
@@ -1984,7 +2227,8 @@ class Window(QMainWindow):
             allowed = bool(self.connected and access and (removable if maintenance and applied else
                            maintenance or (value.analysis.get("patchable", False) and not value.backup_error)))
             if changed:
-                change_allowed = bool(self.connected and updatable) if maintenance and path in update_paths and staged is not False else allowed
+                change_allowed = (bool(removal.get("present") and removal.get("available")) if staged is False else
+                                  bool(self.connected and updatable) if maintenance and path in update_paths else allowed)
                 permitted &= bool(self.connected and path in restore_paths) if self.restore_pending else change_allowed
             panel.setEnabled(bool(self.connected and access and not self.busy))
             opacity.setOpacity(1 if self.connected and access else 0.45)
@@ -2000,12 +2244,15 @@ class Window(QMainWindow):
         self.temperature_details.setEnabled(self.connected)
         self.screws_details.setEnabled(self.connected)
         self.smoothing_details.setEnabled(self.connected)
+        self.warmup_details.setEnabled(self.connected)
         for widget in (self.heat_expand, self.mesh_expand, self.temperature_expand,
                        self.heat_body, self.mesh_body, self.temperature_body, self.screws_expand, self.screws_body,
-                       self.smoothing_expand, self.smoothing_body):
+                       self.smoothing_expand, self.smoothing_body, self.warmup_expand, self.warmup_body):
             widget.setEnabled(self.connected)
         for row in self.printer_rows:
-            row.refresh(row is self.active_row and self.connected, self.busy)
+            connecting = bool(row is self.active_row and self.scanning and not self.connected and snapshot is None)
+            row.refresh(row is self.active_row and self.connected, self.busy,
+                        connecting=connecting, can_disconnect=connecting and self.connect_cancel_ready)
         self.find_button.setEnabled(self.discovery_task is None)
         self.scan_card.setVisible(self.connected or self.scanning)
         initial_scan = self.scanning and snapshot is None
@@ -2028,9 +2275,10 @@ class Window(QMainWindow):
                                            and not self.busy and not mandatory_updates and not issues_found))
         self.update_control.setToolTip("Updates are required when enabling another mod." if mandatory_updates
             else "Update active outdated mods in the same Apply batch; mods turned off will be removed instead.")
-        self.cancel_button.setEnabled(not self.busy and (self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.screws_staged is not None or self.smoothing_staged is not None or self.restore_pending or self.update_active))
+        self.cancel_button.setEnabled(not self.busy and (self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.screws_staged is not None or self.smoothing_staged is not None or self.warmup_staged is not None or self.restore_pending or self.update_active))
         self.original_button.setEnabled(bool(self.connected and snapshot and not self.busy
-                                             and ui_checks.check(snapshot, ("restore", self.policy == "all"))))
+                                             and (ui_checks.check(snapshot, ("restore", self.policy == "all"))
+                                                  or remove_all_targets(snapshot)[0])))
         updates_only = bool(update_paths) and not self.restore_pending and all(value is None for value in choices.values())
         action_name = "fixIssuesAction" if issues_found else "primary"
         if self.apply_button.objectName() != action_name:
@@ -2054,7 +2302,8 @@ class Window(QMainWindow):
 
     def preview(self):
         try:
-            diff = engine.difference_all(self.snapshot, self.staged, self.mesh_staged, self.restore_pending, self.policy == "all", self.temperature_staged, self.screws_staged, update=self.update_active, smoothing_desired=self.smoothing_staged)
+            diff = engine.difference_all(self.snapshot, self.staged, self.mesh_staged, self.restore_pending, self.policy == "all", self.temperature_staged, self.screws_staged, update=self.update_active, smoothing_desired=self.smoothing_staged,
+                                         **({"warmup_desired": self.warmup_staged} if self.warmup_staged is not None else {}))
         except (ValueError, SyntaxError) as error:
             QMessageBox.warning(self, "Cannot prepare changes", str(error))
             return
@@ -2065,7 +2314,7 @@ class Window(QMainWindow):
             return
         name = {mods.TARGET: "Heat before homing & calibration", mesh.TARGET: "Speed up Bed mesh",
                 mesh_temperature.TARGET: "Mesh at print temperature", screws.MOD_ID: "Bed screw adjustment helper",
-                smoothing.TARGET: "Speed up homing"}[path]
+                smoothing.TARGET: "Speed up homing", warmup.TARGET: "Don’t delay chamber heating"}[path]
         try:
             diff, baseline = engine.initial_difference(self.snapshot, path)
         except (ValueError, SyntaxError, UnicodeError) as error:
@@ -2151,6 +2400,7 @@ class Window(QMainWindow):
         temperature_desired = self.temperature_staged
         screws_desired = self.screws_staged
         smoothing_desired = self.smoothing_staged
+        warmup_desired = self.warmup_staged
         update = self.update_active
         def applied(result):
             self.staged = None
@@ -2158,6 +2408,7 @@ class Window(QMainWindow):
             self.temperature_staged = None
             self.screws_staged = None
             self.smoothing_staged = None
+            self.warmup_staged = None
             self.restore_pending = False
             self.receive_scan(result["snapshot"], connection, review=False)
             self.apply_button.setToolTip(result["message"])
@@ -2169,7 +2420,8 @@ class Window(QMainWindow):
         self.run_task(lambda progress: engine.apply(connection, self.known_hosts, scanned, desired, restore, risk, progress,
                                                    mesh_desired=mesh_desired, temperature_desired=temperature_desired,
                                                    screws_desired=screws_desired, update=update,
-                                                   smoothing_desired=smoothing_desired), applied)
+                                                   smoothing_desired=smoothing_desired,
+                                                   **({"warmup_desired": warmup_desired} if warmup_desired is not None else {})), applied)
 
     def show_write_success(self):
         dialog = QDialog(self)
@@ -2267,7 +2519,7 @@ class Window(QMainWindow):
         if self.busy and not self.scanning:
             QMessageBox.information(self, "Write in progress", "Wait for the printer files to finish writing before closing the app.")
             event.ignore()
-        elif self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.screws_staged is not None or self.smoothing_staged is not None or self.restore_pending:
+        elif self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.screws_staged is not None or self.smoothing_staged is not None or self.warmup_staged is not None or self.restore_pending:
             dialog = QMessageBox(QMessageBox.Icon.Question, "Discard pending edits?",
                                 "Close without applying your pending edits?",
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
@@ -2299,3 +2551,4 @@ class Window(QMainWindow):
             self.save_timer.stop()
             self.probe_timer.stop()
             self.poll_timer.stop()
+            self.disconnect_timer.stop()

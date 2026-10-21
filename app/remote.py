@@ -93,7 +93,7 @@ print(json.dumps(dict(files=files,patterns=patterns)))
 # O_EXCL creation prevents a second app from overwriting the original baseline.
 # Multiple staged mods share preflight, backup and candidate preparation. Renames
 # are atomic per file; ordinary failures roll back only files still matching us.
-APPLY_BATCH = '''import os,sys,json,base64,hashlib,stat,uuid,ast,glob,fnmatch,configparser,re
+APPLY_BATCH = '''import os,sys,json,base64,hashlib,stat,uuid,ast,glob,fnmatch,configparser,re,posixpath
 r=json.load(sys.stdin); items=r["files"]; prepared=[]; replaced=[]; caches=[]; cleared=[]
 ROOT="/mnt/UDISK/Uncurser"; migrations=[]; copied=[]; removed=[]; migration_temps=[]; retirements=[]; retired=[]
 def sha(data): return hashlib.sha256(data).hexdigest()
@@ -285,7 +285,7 @@ try:
     if text.encode("utf-8")!=new: raise ValueError("Unrelated Fluidd code would change")
   elif item["kind"]=="json":
    document=json.loads(new.decode("utf-8"))
-   if not isinstance(document,dict) or document.get("schema")!=1 or not isinstance(document.get("mods"),dict): raise ValueError("Invalid mod records")
+   if p==os.path.join(ROOT,"Uncurser_mods.json") and (not isinstance(document,dict) or document.get("schema")!=1 or not isinstance(document.get("mods"),dict)): raise ValueError("Invalid mod records")
   else: raise ValueError("Unsupported file type")
   attrs=dict(mode=stat.S_IMODE(s.st_mode) if old is not None else 0o644,uid=s.st_uid,gid=s.st_gid)
   b=item["backup"]; m=b+".json"; meta=None
@@ -294,7 +294,20 @@ try:
    if item["recovery"] is True:
     if p!="/mnt/UDISK/printer_data/config/printer.cfg" or item["kind"]!="config" or new is None: raise ValueError("Invalid reference repair")
     prefix=base64.b64decode(item["removed_prefix"],validate=True)
-    if not prefix or not old.startswith(prefix) or old[len(prefix):]!=new: raise ValueError("Recovery changes more than the owned reference")
+    leading=base64.b64decode(item.get("leading_comments",""),validate=True); owners=set()
+    for line in leading.splitlines(True):
+     match=re.fullmatch(rb'[ \\t]*# UNCURSER[ \\t]+(\\{[^\\r\\n]*\\})\\r?\\n',line)
+     if not match: raise ValueError("Invalid recovery metadata prefix")
+     pairs=json.loads(match[1],object_pairs_hook=lambda values:values)
+     if not isinstance(pairs,list) or len(pairs)!=3: raise ValueError("Invalid recovery metadata")
+     metadata=dict(pairs)
+     if set(metadata)!={"mod","version","firmware"}: raise ValueError("Invalid recovery metadata")
+     owner=metadata["mod"]
+     if not isinstance(owner,str) or not owner.startswith("/") or owner.startswith("//") or posixpath.normpath(owner)!=owner or "\\\\" in owner or any(ord(char)<32 or ord(char)==127 for char in owner) or owner in owners: raise ValueError("Invalid recovery metadata owner")
+     if not isinstance(metadata["version"],str) or not re.fullmatch(r"\\d+\\.\\d+\\.\\d+",metadata["version"]) or not isinstance(metadata["firmware"],str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\\.(?:0|[1-9][0-9]*)){3}",metadata["firmware"]): raise ValueError("Invalid recovery metadata version")
+     owners.add(owner)
+    blocks=[("# UNCURSER BEGIN bed_screws_v1\\n[include "+path+"]\\n# UNCURSER END bed_screws_v1\\n").encode() for path in ("screws_tilt_adjust.cfg","/usr/share/klipper/klippy/extras/screws_tilt_adjust.cfg")]
+    if prefix.replace(b"\\r\\n",b"\\n") not in blocks or old.count(prefix)!=1 or not old.startswith(leading+prefix) or leading+old[len(leading)+len(prefix):]!=new: raise ValueError("Recovery changes more than the owned reference")
     expected_backup=os.path.join(ROOT,"recovery","printer."+item["expected"]+".txt")
    else:
     stem,suffix=os.path.splitext(p); markers={".py":".ptn",".cfg":".cfn",".js":".jfn",".json":".jsn"}

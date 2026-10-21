@@ -4,9 +4,10 @@ import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import mesh, mods, storage
+from . import mesh, mod_comments, mods, storage
 from .config_blocks import (SCREWS_CONFIG, LEGACY_SCREWS_CONFIG, SCREWS_INCLUDE,
-                            screws_include_path, strip_screws_include)
+                            screws_include_path as _include_path,
+                            strip_screws_include as _strip_include)
 
 MOD_ID = "bed_screws_v1"
 PYTHON = "/usr/share/klipper/klippy/extras/screws_tilt_adjust.py"
@@ -36,8 +37,23 @@ LEGACY_FILE = HelperFile(LEGACY_CONFIG)
 SCAN_FILES = (*FILES, LEGACY_FILE)
 
 
+def screws_include_path(text):
+    return _include_path(mod_comments.strip(text.encode("utf-8")).decode("utf-8"))
+
+
+def strip_screws_include(text):
+    code = mod_comments.strip(text.encode("utf-8")).decode("utf-8")
+    remaining, enabled = _strip_include(code)
+    if not enabled:
+        return text, False
+    block = code[:len(code) - len(remaining)]
+    if text.count(block) != 1:
+        raise ValueError("The bed screw include is interrupted or duplicated.")
+    return text.replace(block, "", 1), True
+
+
 def recognized(path, data):
-    normalized = data.replace(b"\r\n", b"\n")
+    normalized = mod_comments.strip(data).replace(b"\r\n", b"\n")
     return normalized == payload(path)
 
 
@@ -51,6 +67,7 @@ def payload(path):
 
 
 def validate(path, data):
+    mod_comments.read(data)
     if path == PYTHON:
         ast.parse(data.decode("utf-8"), filename=path, feature_version=(3, 9))
     else:
@@ -94,7 +111,7 @@ def inspect(root, files, included, patterns):
             if path in included and included[path] != value.data:
                 raise ValueError("A helper file changed during the scan; scan again: " + path)
             expected = payload(path) if enabled and path in (PYTHON, active_config) else None
-            actual = value.data.replace(b"\r\n", b"\n") if value.data is not None else None
+            actual = mod_comments.strip(value.data).replace(b"\r\n", b"\n") if value.data is not None else None
             if actual != expected:
                 raise ValueError("An existing, edited, or incomplete helper needs review: " + path)
         known = root.analysis["known"]

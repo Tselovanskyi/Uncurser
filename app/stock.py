@@ -3,14 +3,16 @@ import base64
 import hashlib
 import re
 
-from . import fluidd_screws, mesh, mesh_temperature, mods, network, screws, smoothing
+from . import fluidd_screws, mesh, mesh_temperature, mods, network, screws, smoothing, storage, warmup
 
 
 INIT = "/rom/etc/init.d/klipper"
 _TOOLS = ("/usr/bin/get_sn_mac.sh", "/usr/bin/keybox", "/usr/sbin/fw_printenv", "/etc/fw_env.config")
 _CONFIGS = ("printer.cfg", "gcode_macro.cfg", "sensorless.cfg", "screws_tilt_adjust.cfg")
-_COMMON = (mods.TARGET, smoothing.HOMING.TARGET, screws.PYTHON, screws.CONFIG,
+_COMMON = (mods.TARGET, smoothing.HOMING.TARGET, warmup.TARGET, screws.PYTHON, screws.CONFIG,
            fluidd_screws.TARGET, fluidd_screws.INDEX)
+_CONFIG_ROOT = "/mnt/UDISK/printer_data/config/"
+_EXTRA_ROOTS = (_CONFIG_ROOT, "/usr/share/klipper/klippy/extras/", "/usr/share/fluidd/assets/")
 
 # Fixed, read-only queries travel through Remote's existing in-memory bootstrap.
 READ = '''import os,sys,json,base64,hashlib,stat,subprocess,re
@@ -120,12 +122,25 @@ def _mount_proof(raw):
             "root_type": root[0][3], "lowerdir": next(value for value in root[0][4] if value.startswith("lowerdir="))}
 
 
-def scan(remote, status):
+def scan(remote, status, *, extra_paths=()):
     """Return guarded current-ROM baselines, or a reason no stock proof is safe."""
     result = {"available": False, "reason": "", "identity": {}, "files": {}, "guards": {}, "proof": {}}
     try:
         network.require_removal_supported(status)
-        raw = remote.python(READ, {"tools": list(_TOOLS), "configs": list(_CONFIGS), "common": list(_COMMON)},
+        if isinstance(extra_paths, (str, bytes)):
+            raise ValueError("Expected a collection of extra firmware file paths.")
+        extra_paths = tuple(dict.fromkeys(extra_paths))
+        for path in extra_paths:
+            storage.original(path)
+            if (not path.startswith(_EXTRA_ROOTS) or path == storage.LEGACY_RECORDS
+                    or ".Original.txt" in path or "/__pycache__/" in path
+                    or any(ord(char) < 32 or ord(char) == 127 for char in path)):
+                raise ValueError("Unsupported extra firmware file: " + path)
+        configs = tuple(dict.fromkeys((*_CONFIGS,
+            *(path[len(_CONFIG_ROOT):] for path in extra_paths if path.startswith(_CONFIG_ROOT)))))
+        common = tuple(dict.fromkeys((*_COMMON,
+            *(path for path in extra_paths if not path.startswith(_CONFIG_ROOT)))))
+        raw = remote.python(READ, {"tools": list(_TOOLS), "configs": list(configs), "common": list(common)},
                             max_output_bytes=48 * 1024 * 1024)
         mount = _mount_proof(raw)
         model, firmware = network.device_identity(status)
@@ -154,12 +169,14 @@ def scan(remote, status):
         folder = "/rom/usr/share/klipper/config/" + variant + "/"
         sources.update({mesh.TARGET: folder + "printer.cfg", mesh_temperature.TARGET: folder + "gcode_macro.cfg",
                         smoothing.TARGET: folder + "sensorless.cfg", screws.LEGACY_CONFIG: folder + "screws_tilt_adjust.cfg"})
+        sources.update({path: folder + path[len(_CONFIG_ROOT):] if path.startswith(_CONFIG_ROOT) else "/rom" + path
+                        for path in extra_paths})
         files = {}
         for path, source in sources.items():
             if source not in records:
                 raise ValueError("The selected ROM source was not scanned: " + source)
             value = records[source]
-            absent = value is None and path in (screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG)
+            absent = value is None and path in (screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG, *extra_paths)
             files[path] = dict(value or dict(data=None, sha256=None, source=source),
                                available=value is not None or absent, absent=absent,
                                reason="" if value is not None or absent else "The current ROM file is unavailable.")

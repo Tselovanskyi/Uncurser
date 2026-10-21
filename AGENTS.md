@@ -15,7 +15,9 @@
 
 ## Release versions
 
-- Before every new release, update `__version__` in `app/__init__.py` to a new `major.minor.patch` version. Never replace a published release with a changed build under the same version.
+- Bump app or mod versions only with explicit user approval. Code changes, builds, rebuilds and release requests do not by themselves authorize version bumps.
+- Proactively ask for version-bump approval when it may be needed, explaining why and proposing the affected app/mod versions. Wait for approval before changing them; do not ask for routine rebuilds when no bump is needed.
+- Before a new release, obtain approval for any needed bump of `__version__` in `app/__init__.py` to a new `major.minor.patch` version. Never replace a published release with a changed build under the same version.
 - `app/__init__.py` is the single source of truth. The top-right app label, EXE filename (`Uncurser_v<version>.exe`), and Windows File version and Product version must derive from it. Do not hardcode those versions elsewhere.
 - After changing the version, build using `build-portable.ps1`. It generates Windows metadata through `tools/version_info.py`, verifies the metadata, and runs the packaged startup check.
 - Before publishing, verify that the app label, EXE filename, Windows metadata, Git tag (`v<version>`), and GitHub release version all agree. Upload the newly built versioned EXE from `build/single-exe-release`.
@@ -24,7 +26,9 @@
 ## Mod versions and uninstall records
 
 - Every mod, including helpers and future additions, must be registered in `app/mod_versions.py` with its revision and support for verified uninstall records. Do not add a mod without this support.
-- A mod revision is the last app release that changed its installed printer code or configuration. Update only affected revisions; UI changes and adding other mods do not change existing revisions.
+- Stamp each installed source/configuration file with independently owned Uncurser comments identifying the mod, its revision and installation firmware. Write comments only with that mod's install/update; preserve other mods' comments. Missing comments alone never block legacy installations. Changes to installed comments require a new affected mod revision through the normal update flow.
+- When the uninstall ledger is absent, current-revision comments may identify partial installations for verified cleanup. Verify the surviving owned code against the bundled implementation and current-firmware originals or read-only firmware sources; comments alone never authorize removal. Preserve unrelated edits and other mods' comments, leave already-missing files absent, and never override damaged ledger data or delete stock code adopted by newer firmware.
+- A mod revision is the last app release that changed its installed printer code or configuration. Update only affected revisions, after explicit user approval; UI changes and adding other mods do not change existing revisions.
 - Store only the currently installed revision and validated, data-only uninstall instructions in `Uncurser_mods.json` on the printer. Never execute those records or keep a history of previous implementations in the app.
 - Each mod record also stores the canonical printer firmware used for its last installation or verified update. Write the stamp only with that mod's install/update transaction; keep retained records unchanged during scans, removals of other mods and storage migration. Missing legacy stamps mean unknown. Check present mods with missing or mismatched firmware after normal scans on tested and untested releases; offer verified cleanup without writing automatically or discarding staged edits.
 - The firmware-issues popup's explicit **Fix issues** action runs an isolated guarded cleanup immediately, then reinstalls only compatible mods selected in that dialog after a fresh scan. It must exclude unrelated staged installs, automatic updates and Restore choices; normal scans and merely opening the popup remain read-only. Validate reinstall eligibility from verified cleaned files and current firmware sources. If reinstall verification fails, retain the cleanup result, rescan when possible and report any possible writes and required physical power cycle.

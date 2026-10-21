@@ -2,8 +2,10 @@
 import fnmatch
 import posixpath
 import re
+from dataclasses import replace
 
-from . import config_blocks, fluidd_screws, mesh, mesh_temperature, mod_versions, mods, screws, smoothing
+from . import (config_blocks, fluidd_screws, mesh, mesh_temperature, mod_comments,
+               mod_versions, mods, screws, smoothing, warmup)
 
 
 def stock_data(stock, path):
@@ -33,19 +35,27 @@ def current_data(files, path, *, absent=False):
     return data
 
 
+def _baseline(source, path):
+    return source(path) if callable(source) else stock_data(source, path)
+
+
 def regular(path, data):
     return mesh.split(data)[0] if path.endswith(".cfg") else data.decode("utf-8")
 
 
-def owned_record(path, data, reference, entry, normalized=()):
+def owned_record(path, data, reference, entry, normalized=(), *, owner=None):
     """A stock reset may remove owned edits; edited context remains a conflict."""
     if entry is None or regular(path, data) == regular(path, reference):
         return
     text = regular(path, data)
+    owner = owner or path
     for change in entry["undo"]:
         before, after = change["before"], change["after"]
         count = text.count(after)
         if count == 1:
+            continue
+        if (count == 0 and mod_versions.optional_metadata_change(change, owner)
+                and owner not in mod_comments.read(text.encode("utf-8"))):
             continue
         if count == 0 and ((before and text.count(before) == 1)
                            or any(regular(path, candidate).count(after) == 1 for candidate in normalized)):
@@ -55,7 +65,7 @@ def owned_record(path, data, reference, entry, normalized=()):
 
 def early(files, stock, entries):
     path = mods.TARGET
-    data, reference = current_data(files, path), stock_data(stock, path)
+    data, reference = current_data(files, path), _baseline(stock, path)
     if reference is None:
         raise ValueError("The firmware's early-heating module is missing.")
     base, applied = mods.strip_mod(data)
@@ -68,9 +78,9 @@ def early(files, stock, entries):
     return {path: base}, applied
 
 
-def bed_mesh(files, stock, entries):
+def bed_mesh(files, stock, entries, *, partial=False):
     path = mesh.TARGET
-    data, reference = current_data(files, path), stock_data(stock, path)
+    data, reference = current_data(files, path), _baseline(stock, path)
     if reference is None:
         raise ValueError("The firmware's printer configuration is missing.")
     current, default = mesh.Document(data), mesh.Document(reference)
@@ -79,12 +89,12 @@ def bed_mesh(files, stock, entries):
         if value == default.values[key]:
             continue
         allowed = {mesh.numeric(key, mesh.VALUES[key])}
-        if key == ("bed_mesh", "speed"):
+        if key == ("bed_mesh", "speed") and not partial:
             allowed.add(mesh.numeric(key, "700"))
         if value not in allowed:
             raise ValueError("A bed-mesh setting is neither the firmware default nor a known mod value: " + key[1])
         changed[key] = default.raw[key]
-    if changed and path not in entries and not any(all(
+    if changed and path not in entries and not partial and not any(all(
             current.values[key] == mesh.numeric(key, "700" if key == ("bed_mesh", "speed") and legacy else value)
             for key, value in mesh.VALUES.items()) for legacy in (False, True)):
         raise ValueError("A partial bed-mesh preset has no verified ownership record.")
@@ -95,22 +105,18 @@ def bed_mesh(files, stock, entries):
 
 def temperature(files, stock, entries):
     path = mesh_temperature.TARGET
-    data, reference = current_data(files, path), stock_data(stock, path)
+    data, reference = current_data(files, path), _baseline(stock, path)
     if reference is None:
         raise ValueError("The firmware's print-start macro is missing.")
-    stock_lines, stock_index = mesh_temperature.condition(reference)
-    lines, index = mesh_temperature.condition(data)
-    if stock_lines[stock_index].strip() == mesh_temperature.ENABLED_CONDITION:
-        return {path: data}, False
+    restored = mesh_temperature.transform(data, False, reference)
     owned_record(path, data, reference, entries.get(path), (mesh_temperature.transform(data, True),))
-    applied = lines[index].strip() == mesh_temperature.ENABLED_CONDITION
-    return {path: mesh_temperature.transform(data, False, reference)}, applied
+    return {path: restored}, regular(path, restored) != regular(path, data)
 
 
 def homing(files, stock, entries):
     cfg, python = smoothing.TARGET, smoothing.HOMING.TARGET
-    data, source = current_data(files, cfg), stock_data(stock, cfg)
-    module, reference = current_data(files, python), stock_data(stock, python)
+    data, source = current_data(files, cfg), _baseline(stock, cfg)
+    module, reference = current_data(files, python), _baseline(stock, python)
     if source is None or reference is None:
         raise ValueError("The firmware's native homing files are missing.")
     stock_lines, stock_index, _ = smoothing.anchor(source)
@@ -121,9 +127,24 @@ def homing(files, stock, entries):
         return {cfg: data, python: module}, False
     smoothing.HOMING.transform(reference, True)
     owned_record(cfg, data, source, entries.get(cfg), (smoothing.transform(data, True),))
-    owned_record(python, module, reference, entries.get(python), (smoothing.HOMING.transform(module, True),))
+    owned_record(python, module, reference, entries.get(python), (smoothing.HOMING.transform(module, True),), owner=cfg)
     return {cfg: smoothing.transform(data, False, source), python: smoothing.HOMING.transform(module, False)}, (
         python_applied or lines[index].strip() == smoothing.ENABLED_LINE)
+
+
+def chamber(files, stock, entries):
+    path = warmup.TARGET
+    data, reference = current_data(files, path), _baseline(stock, path)
+    if reference is None:
+        raise ValueError("The firmware's heater controller is missing.")
+    native = warmup.inspect(reference, reference)
+    state = warmup.inspect(data, reference)
+    if not native.get("patchable") or not state.get("patchable"):
+        raise ValueError(state.get("reason") or native.get("reason") or "The chamber heating gate has changed.")
+    if native["enabled"]:
+        return {path: data}, False
+    owned_record(path, data, reference, entries.get(path), (warmup.transform(data, True),))
+    return {path: warmup.transform(data, False, reference)}, state["enabled"]
 
 
 def ui_undo(data, reference, entry):
@@ -145,6 +166,9 @@ def ui_undo(data, reference, entry):
             if (before and stock_text.count(before) != 1) or (not before and after in stock_text):
                 raise ValueError("The stored helper-interface default differs from the current firmware.")
             text = text.replace(after, before, 1)
+        elif (text.count(after) == 0 and mod_versions.optional_metadata_change(change, screws.PYTHON)
+              and screws.PYTHON not in mod_comments.read(text.encode("utf-8"))):
+            continue
         elif text.count(after) == 0 and before and text.count(before) == 1 and stock_text.count(before) == 1:
             continue
         else:
@@ -152,38 +176,49 @@ def ui_undo(data, reference, entry):
     return text.encode("utf-8")
 
 
-def helper(files, stock, entries):
+def helper(files, stock, entries, *, partial=False):
     root = mesh.TARGET
-    data, reference = current_data(files, root), stock_data(stock, root)
-    if reference is None:
+    data = current_data(files, root, absent=partial)
+    reference = _baseline(stock, root) if data is not None else None
+    if data is not None and reference is None:
         raise ValueError("The firmware's printer configuration is missing.")
-    if config_blocks.screws_include_path(mesh.split(reference)[0]) is not None:
+    native_include = config_blocks.screws_include_path(mesh.split(reference)[0]) if reference is not None else None
+    if native_include is not None and not partial:
         if (config_blocks.screws_include_path(mesh.split(data)[0]) == config_blocks.screws_include_path(mesh.split(reference)[0])
-                and all(current_data(files, path, absent=True) == stock_data(stock, path)
+                and all(current_data(files, path, absent=True) == _baseline(stock, path)
                         for path in (screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG, fluidd_screws.TARGET))):
             return {root: data}, False
         raise ValueError("The current firmware already supplies the helper include; its OEM feature must be preserved.")
-    result = {root: screws.edit_include(data, False)}
+    if native_include is not None and config_blocks.screws_include_path(mesh.split(data)[0]) not in (None, native_include):
+        raise ValueError("The helper include differs from the current firmware's native feature.")
+    result = {root: screws.edit_include(data, False) if data is not None and native_include is None else data}
     applied = result[root] != data
-    newline = "\r\n" if b"\r\n" in data else "\n"
-    normalized = tuple((block.replace("\n", newline) + mesh.split(result[root])[0] + mesh.split(result[root])[1]).encode()
-                       for block in (config_blocks.SCREWS_INCLUDE, config_blocks.LEGACY_SCREWS_INCLUDE))
-    owned_record(root, data, reference, entries.get(root), normalized)
+    if data is not None:
+        newline = "\r\n" if b"\r\n" in data else "\n"
+        normalized = tuple((block.replace("\n", newline) + mesh.split(result[root])[0] + mesh.split(result[root])[1]).encode()
+                           for block in (config_blocks.SCREWS_INCLUDE, config_blocks.LEGACY_SCREWS_INCLUDE))
+        owned_record(root, data, reference, entries.get(root), normalized, owner=screws.PYTHON)
     for path in (screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG):
-        current, default = current_data(files, path, absent=True), stock_data(stock, path)
+        current = current_data(files, path, absent=True)
+        if current is None and partial:
+            result[path] = None
+            continue
+        default = _baseline(stock, path)
         if default is not None:
             if current != default:
                 raise ValueError("The current firmware supplies this helper file; automatic deletion is blocked: " + path)
             result[path] = current
             continue
         if current is not None:
+            if partial and mod_comments.read(current):
+                raise ValueError("Another mod still owns the added helper file: " + path)
             entry = entries.get(path)
-            if ((entry is not None and entry.get("created", "").encode() != current)
-                    or (entry is None and not screws.recognized(path, current))):
+            if ((entry is not None and not mod_versions.created_matches(current, entry.get("created", ""), screws.PYTHON))
+                    or (entry is None and not screws.recognized(path, mod_comments.strip(current)))):
                 raise ValueError("An added helper file was edited or cannot be recognized: " + path)
             applied = True
         result[path] = None
-    remaining, _ = mesh.split(result[root])
+    remaining = mesh.split(result[root])[0] if result[root] is not None else ""
     for line in remaining.splitlines():
         match = re.fullmatch(r"\s*\[include ([^\]]+)\]\s*(?:[#;].*)?", line)
         if match:
@@ -191,7 +226,11 @@ def helper(files, stock, entries):
             if any(result.get(path) is None and fnmatch.fnmatchcase(path, pattern) for path in (screws.CONFIG, screws.LEGACY_CONFIG)):
                 raise ValueError("Another configuration include still requires a helper file.")
     path = fluidd_screws.TARGET
-    current, default = current_data(files, path), stock_data(stock, path)
+    current = current_data(files, path, absent=partial)
+    if current is None:
+        result[path] = None
+        return result, applied
+    default = _baseline(stock, path)
     if default is None:
         raise ValueError("The firmware's helper interface could not be verified.")
     result[path] = ui_undo(current, default, entries.get(path))
@@ -202,8 +241,10 @@ def helper(files, stock, entries):
 def plan(files, path, stock, record=None):
     entries = record.get("files", {path: {"undo": record.get("undo", [])}}) if record else {}
     operation = {mods.TARGET: early, mesh.TARGET: bed_mesh, mesh_temperature.TARGET: temperature,
-                 smoothing.TARGET: homing, screws.PYTHON: helper}[path]
+                 smoothing.TARGET: homing, screws.PYTHON: helper, warmup.TARGET: chamber}[path]
     result, present = operation(files, stock, entries)
+    result = {filename: mod_comments.remove(data, path) if data is not None else None
+              for filename, data in result.items()}
     for filename, data in result.items():
         if filename.endswith(".cfg") and data is not None:
             if mesh.split(data)[1] != mesh.split(current_data(files, filename))[1]:
@@ -214,3 +255,84 @@ def plan(files, path, stock, record=None):
     return {"available": bool(present or record), "present": bool(present or record), "files": result,
             "reason": "", "recovery": True, "defaults": True,
             "details": f"Uses verified firmware {firmware}{variant} defaults where restoration data is missing. Unrelated edits are preserved."}
+
+
+def header_plan(files, path, stock=None, *, identity=None):
+    """Validate surviving current-code regions; a comment alone never owns code."""
+    scope = mod_versions.FILES[path]
+    scanned = tuple(dict.fromkeys((*scope, screws.LEGACY_CONFIG))) if path == screws.PYTHON else scope
+    headers, clean = [], {}
+    for filename in scanned:
+        data = current_data(files, filename, absent=True)
+        if data is not None:
+            stamp = mod_comments.read(data).get(path)
+            if stamp is not None:
+                headers.append(stamp)
+            data = mod_comments.remove(data, path)
+        clean[filename] = replace(files[filename], data=data, sha256=mods.digest(data) if data is not None else None)
+    if not headers:
+        raise ValueError("Verified uninstall instructions and source comments are missing.")
+    stamp = headers[0]
+    if any(value != stamp for value in headers) or stamp["version"] != mod_versions.VERSIONS[path]:
+        raise ValueError("Source comments have conflicting or unsupported mod revisions.")
+    if identity is None:
+        current = (stock or {}).get("identity", {})
+        identity = (current.get("model"), current.get("firmware"))
+    if not identity or identity[0] != "F008" or not identity[1]:
+        raise ValueError("The current printer firmware identity could not be verified.")
+    mod_versions.validate_firmware(identity[1])
+    native_identity = (stock or {}).get("identity", {})
+    if stock and stock.get("available") and (native_identity.get("model"), native_identity.get("firmware")) != identity:
+        raise ValueError("The current firmware sources do not match the printer.")
+
+    rom_files = set()
+
+    def baseline(filename):
+        value = files[filename]
+        if value.backup_error:
+            raise ValueError("The original backup needs attention: " + value.backup_error)
+        if getattr(value, "original_identity", None) == identity:
+            if value.original_absent and value.original is None and value.original_hash == mods.digest(b""):
+                return None
+            if (not value.original_absent and isinstance(value.original, bytes)
+                    and value.original_hash == mods.digest(value.original)):
+                return mod_comments.strip(value.original)
+        data = stock_data(stock, filename)
+        rom_files.add(filename)
+        return mod_comments.strip(data) if data is not None else None
+
+    if path == smoothing.TARGET:
+        result = {}
+        for module in (smoothing, smoothing.HOMING):
+            filename = module.TARGET
+            data = current_data(clean, filename, absent=True)
+            if data is None:
+                result[filename] = None
+                continue
+            reference = baseline(filename)
+            if reference is None:
+                raise ValueError("The native homing source is missing: " + filename)
+            if module is smoothing:
+                lines, index, _ = smoothing.anchor(reference)
+                smoothing.anchor(data)
+                result[filename] = data if lines[index].strip() == smoothing.ENABLED_LINE else smoothing.transform(data, False, reference)
+            else:
+                _, native = module.strip_mod(reference)
+                module.strip_mod(data)
+                module.transform(reference, True)
+                result[filename] = data if native else module.transform(data, False)
+    elif path == screws.PYTHON:
+        result, _ = helper(clean, baseline, {}, partial=True)
+    elif current_data(clean, path, absent=True) is None:
+        result = {path: None}
+    else:
+        operation = {mods.TARGET: early, mesh.TARGET: bed_mesh,
+                     mesh_temperature.TARGET: temperature, warmup.TARGET: chamber}[path]
+        result, _ = operation(clean, baseline, {}, **({"partial": True} if path == mesh.TARGET else {}))
+    for filename, data in result.items():
+        if data is not None and filename.endswith(".cfg") and mesh.split(data)[1] != mesh.split(files[filename].data)[1]:
+            raise ValueError("Comment recovery would change generated calibration data: " + filename)
+    return {"available": True, "present": True, "files": result, "reason": "", "recovery": True,
+            "defaults": bool(rom_files), "recovery_files": tuple(sorted(rom_files)), "header": True, **stamp,
+            "incomplete": any(files[filename].data is None for filename in scope),
+            "details": "Verifies surviving mod code using source comments and current-firmware restoration sources. Missing files remain absent."}

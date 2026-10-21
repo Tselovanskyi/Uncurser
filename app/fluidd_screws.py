@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import mods, storage
+from . import mod_comments, mods, storage
 
 TARGET = "/usr/share/fluidd/assets/index-DAJGCJUz.js"
 INDEX = "/usr/share/fluidd/index.html"
@@ -45,6 +45,7 @@ def blocks(path):
 
 
 def strip_mod(path, data):
+    mod_comments.read(data)
     text = data.decode("utf-8")
     states = []
     for original, replacement in blocks(path):
@@ -65,7 +66,7 @@ def strip_mod(path, data):
 def inspect(module, data):
     try:
         base, enabled = strip_mod(module.TARGET, data)
-        known = mods.digest(base) == module.REFERENCE_HASH
+        known = mods.digest(mod_comments.strip(base)) == module.REFERENCE_HASH
         return {"known": known, "enabled": enabled, "patchable": True,
                 "label": "Uncursed" if known and enabled else "Original" if known else "Unknown",
                 "reason": "" if known else "This Fluidd file differs from the supported build."}
@@ -89,7 +90,7 @@ def transform(path, data, enabled):
 def replacements(path, before, after):
     old_base, old_enabled = strip_mod(path, before)
     new_base, new_enabled = strip_mod(path, after)
-    if old_base != new_base:
+    if mod_comments.strip(old_base) != mod_comments.strip(new_base):
         raise ValueError("Unrelated Fluidd code would change.")
     return [[values[int(old_enabled)], values[int(new_enabled)]]
             for values in blocks(path) if old_enabled != new_enabled]
@@ -100,6 +101,11 @@ def difference(path, before, after, fromfile, tofile):
     # when the rest is identical; never hide unrelated changes.
     try:
         pairs = replacements(path, before, after)
+        old_comments, new_comments = mod_comments.lines(before), mod_comments.lines(after)
+        pairs = [(old_comments.get(owner, b"").decode().rstrip("\r\n"),
+                  new_comments.get(owner, b"").decode().rstrip("\r\n"))
+                 for owner in sorted(old_comments.keys() | new_comments.keys())
+                 if old_comments.get(owner) != new_comments.get(owner)] + pairs
     except ValueError:
         pairs = [(before.decode(), after.decode())]
     return "".join("".join(difflib.unified_diff(

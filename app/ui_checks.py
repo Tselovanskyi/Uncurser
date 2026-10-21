@@ -16,6 +16,14 @@ def check(snapshot, key):
     return cache[key]
 
 
+def set_ignored(snapshot, targets):
+    """Acknowledge unknown IDs for this connection without changing printer data."""
+    snapshot.ignored_mods = tuple(sorted(targets))
+    cache = getattr(snapshot, "_ui_checks", None)
+    if cache is not None:
+        cache.pop("issues", None)
+
+
 def _calculate(snapshot, key):
     if key == "removals":
         return engine.removal_statuses(snapshot) if snapshot is not None else {}

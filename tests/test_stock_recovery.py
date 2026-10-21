@@ -2,7 +2,7 @@
 import unittest
 from unittest.mock import patch
 
-from app import engine, fluidd_screws, mesh, mesh_temperature, mod_versions, mods, removal, screws, smoothing
+from app import engine, fluidd_screws, mesh, mesh_temperature, mod_comments, mod_versions, mods, removal, screws, smoothing, stock_recovery
 from tests import test_helper_versions, test_mod_versions, test_smoothing_versions, test_untested_removal
 
 
@@ -28,6 +28,47 @@ def forget_original(value):
 
 
 class StockRecoveryTests(unittest.TestCase):
+    def test_mesh_temperature_recovery_restores_each_anchor_and_preserves_native_adoption(self):
+        source = test_mod_versions.SOURCES[mesh_temperature.TARGET]
+        enabled = mesh_temperature.transform(source, True)
+        original_lines, original_initial, original_condition = mesh_temperature.anchors(source)
+        enabled_lines, enabled_initial, enabled_condition = mesh_temperature.anchors(enabled)
+        # Include the old relaxed condition so each independently adopted
+        # stock anchor is checked even though the fixed mod needs only one.
+        enabled_lines[enabled_condition] = enabled_lines[enabled_condition].replace(
+            enabled_lines[enabled_condition].strip(), mesh_temperature.ENABLED_CONDITION)
+        enabled = "".join(enabled_lines).encode()
+        extra = b"\n# unrelated macro edit\n"
+        for adopted in ((), ("initializer",), ("condition",), ("initializer", "condition")):
+            with self.subTest(adopted=adopted):
+                lines = list(original_lines)
+                if "initializer" in adopted:
+                    lines[original_initial] = enabled_lines[enabled_initial]
+                if "condition" in adopted:
+                    lines[original_condition] = enabled_lines[enabled_condition]
+                native = "".join(lines).encode()
+                data = enabled + extra
+                files = {mesh_temperature.TARGET: engine.MeshSnapshot(data, mods.digest(data), {})}
+                result, present = stock_recovery.temperature(files, stock({mesh_temperature.TARGET: native}), {})
+                self.assertEqual(result[mesh_temperature.TARGET], native + extra)
+                self.assertEqual(present, len(adopted) < 2)
+
+    def test_previous_mesh_temperature_record_recovers_without_original_backup(self):
+        source = test_mod_versions.SOURCES[mesh_temperature.TARGET]
+        lines, index = mesh_temperature.condition(source)
+        lines[index] = lines[index].replace(mesh_temperature.ORIGINAL_CONDITION,
+                                            mesh_temperature.ENABLED_CONDITION)
+        prior = "".join(lines).encode()
+        prior = mod_comments.put(prior, mesh_temperature.TARGET, "0.1.16", "1.1.6.4", mesh_temperature.TARGET)
+        record = mod_versions.capture(mesh_temperature.TARGET, source, prior, firmware="1.1.6.4")
+        record["version"] = "0.1.16"
+        files = {mesh_temperature.TARGET: engine.MeshSnapshot(prior, mods.digest(prior), {})}
+        plan = removal.inspect(files, {mesh_temperature.TARGET: record},
+                               stock=stock({mesh_temperature.TARGET: source}))[mesh_temperature.TARGET]
+        self.assertTrue(plan["available"], plan)
+        self.assertTrue(plan["recovery"])
+        self.assertEqual(plan["files"][mesh_temperature.TARGET], source)
+
     def originals(self):
         return stock(test_mod_versions.SOURCES)
 

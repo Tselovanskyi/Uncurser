@@ -3,7 +3,7 @@ import configparser
 import hashlib
 import re
 from decimal import Decimal
-from . import storage
+from . import mod_comments, storage
 from .config_blocks import strip_screws_include
 
 TARGET = "/mnt/UDISK/printer_data/config/printer.cfg"
@@ -46,7 +46,7 @@ def parser(text):
     result = configparser.RawConfigParser(interpolation=None, strict=True,
                                          inline_comment_prefixes=("#", ";"))
     try:
-        result.read_string(text)
+        result.read_string(text.removeprefix("\ufeff"))
     except configparser.Error as error:
         raise ValueError("Ambiguous or invalid configuration: " + str(error)) from error
     if result.defaults():
@@ -84,6 +84,7 @@ def numeric(key, value):
 
 class Document:
     def __init__(self, data):
+        mod_comments.read(data)
         self.regular, self.generated = split(data)
         self.config = parser(self.regular)
         self.lines = self.regular.splitlines(True)
@@ -144,7 +145,7 @@ def stable_digest(data):
 
 
 def fingerprint(data):
-    doc = Document(strip_screws_include(data.decode("utf-8"))[0].encode("utf-8"))
+    doc = Document(strip_screws_include(mod_comments.strip(data).decode("utf-8"))[0].encode("utf-8"))
     indices = {index for index, match in doc.options.values()}
     text = "".join(line for index, line in enumerate(doc.lines) if index not in indices)
     return hashlib.sha256((text.replace("\r\n", "\n").rstrip() + "\n").encode()).hexdigest()

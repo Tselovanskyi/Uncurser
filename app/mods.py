@@ -3,7 +3,7 @@
 import ast
 import hashlib
 from dataclasses import dataclass
-from . import storage
+from . import mod_comments, storage
 
 TARGET = "/usr/share/klipper/klippy/extras/pause_resume.py"
 ORIGINAL = storage.original(TARGET)
@@ -90,7 +90,8 @@ def digest(data: bytes) -> str:
 
 
 def validate(data: bytes):
-    ast.parse(data.decode("utf-8"), filename=TARGET, feature_version=(3, 9))
+    mod_comments.read(data)
+    ast.parse(data.decode("utf-8-sig"), filename=TARGET, feature_version=(3, 9))
 
 
 @dataclass(frozen=True)
@@ -119,13 +120,15 @@ INSERTIONS = (
 
 def strip_mod(data: bytes) -> tuple[bytes, bool]:
     text = data.decode("utf-8")
-    if "UNCURSER" not in text and "_uncursed_" not in text:
+    code = mod_comments.strip(data).decode("utf-8")
+    if "UNCURSER" not in code and "_uncursed_" not in code:
         return data, False
     for ins in INSERTIONS:
         if text.count(ins.marked) != 1:
             raise ValueError("The early-heating modification is partial or has been edited. Automatic reversal is unavailable.")
         text = text.replace(ins.marked, "", 1)
-    if "_uncursed_" in text or "UNCURSER" in text:
+    code = mod_comments.strip(text.encode("utf-8")).decode("utf-8")
+    if "_uncursed_" in code or "UNCURSER" in code:
         raise ValueError("Unrecognized Uncurser code remains in this file.")
     return text.encode("utf-8"), True
 
@@ -152,7 +155,7 @@ def inspect(data: bytes):
         base, enabled = strip_mod(data)
         validate(base)
         transform(data, not enabled)
-        known = digest(base) == REFERENCE_HASH
+        known = digest(mod_comments.strip(base)) == REFERENCE_HASH
         return {"known": known, "enabled": enabled, "patchable": True,
                 "label": ("Uncursed" if enabled else "Original") if known else ("Unknown + Uncursed" if enabled else "Unknown"),
                 "reason": "" if known else "This file differs from the original reference captured from your printer."}

@@ -1,6 +1,6 @@
 """Temporarily raise XY first-pass and bed-centre homing motion limits."""
 import ast
-from . import mesh, mods, storage
+from . import mesh, mod_comments, mods, storage
 
 TARGET = "/mnt/UDISK/printer_data/config/sensorless.cfg"
 ORIGINAL = storage.original(TARGET)
@@ -12,6 +12,7 @@ REFERENCE_HASH = "9d635c7410d49325fbca7f70108451fbac39f6d5b3fed06e49a9507934764a
 
 
 def anchor(data):
+    mod_comments.read(data)
     regular, generated = mesh.split(data)
     config = mesh.parser(regular)
     if not config.has_option(SECTION, "gcode"):
@@ -46,7 +47,7 @@ def validate(data):
 
 
 def fingerprint(data):
-    lines, index, _ = anchor(data)
+    lines, index, _ = anchor(mod_comments.strip(data))
     lines[index] = lines[index].replace(lines[index].strip(), ORIGINAL_LINE, 1)
     return mods.digest(("".join(lines).replace("\r\n", "\n").rstrip("\n") + "\n").encode())
 
@@ -168,6 +169,7 @@ class HomingModule:
 
     @staticmethod
     def strip_mod(data):
+        mod_comments.read(data)
         text = data.decode().replace("\r\n", "\n")
         if "homing_speed:" not in text:
             if "_uncursed_homing" in text or "_uncursed_first_home" in text or "_UNCURSER_HOME_CENTRE" in text:
@@ -204,7 +206,7 @@ class HomingModule:
 
     @classmethod
     def fingerprint(cls, data):
-        text, _ = cls.strip_mod(data)
+        text, _ = cls.strip_mod(mod_comments.strip(data))
         return mods.digest(text.encode())
 
     @classmethod
