@@ -1,7 +1,7 @@
 """Classify current mod compatibility without writing or trusting old scan flags."""
 from dataclasses import replace
 
-from . import fluidd_screws, mesh, mod_versions, mods, network, screws, smoothing
+from . import fluidd_screws, mesh, mod_versions, mods, network, pa, screws, smoothing
 from .stock_recovery import current_data, stock_data
 
 
@@ -105,12 +105,8 @@ def eligible(snapshot, issues):
         return set()
     try:
         view = engine.cleanup_snapshot(snapshot)
-        prepared = engine.prepare_removal(view, choices)
-        files = {module.TARGET: value for module, value in engine.file_entries(view) if value is not None}
-        for path, data in prepared.items():
-            files[path] = replace(files[path], data=data, sha256=mods.digest(data) if data is not None else None)
-        retained = engine.installed_records(view, removal=True)
-        retained = {path: record for path, record in retained.items() if path not in choices}
+        current = {module.TARGET: value for module, value in engine.file_entries(view) if value is not None}
+        records = engine.installed_records(view, removal=True)
     except _ERRORS:
         return set()
     result = set()
@@ -119,11 +115,41 @@ def eligible(snapshot, issues):
             continue
         try:
             scope = mod_versions.FILES[path]
+            dependencies = set(scope) | set(getattr(mod_versions.MODULES.get(path), "DEPENDENCIES", ()))
+            if any(filename.endswith(".cfg") for filename in scope):
+                # Configuration checks also consume the include tree. Keep
+                # its broken-include cleanup local to configuration candidates.
+                dependencies.update(filename for filename in current if filename.endswith(".cfg")
+                                    and filename not in (screws.CONFIG, screws.LEGACY_CONFIG))
+                dependencies.update(getattr(view.mesh, "included", {}))
+            related = {owner: False for owner in choices
+                       if dependencies.intersection(mod_versions.file_scope(owner, records.get(owner)))}
+            prepared = engine.prepare_removal(view, related)
+            files = dict(current)
+            for filename, data in prepared.items():
+                files[filename] = replace(files[filename], data=data, sha256=mods.digest(data) if data is not None else None)
+            retained = {owner: record for owner, record in records.items() if owner not in related}
             reference = {filename: stock_data(stock, filename) for filename in scope}
             baseline = {filename: current_data(files, filename, absent=filename in mod_versions.ADDED_FILES[path])
                         for filename in scope}
             if path == screws.PYTHON:
                 enabled = _helper(engine, snapshot, files, reference, baseline)
+            elif path == pa.TARGET:
+                # Only this mod's native ABI dependencies participate in its
+                # reinstall eligibility; unrelated mod files remain untouched.
+                dependencies = {name: stock_data(stock, name) for name in pa.DEPENDENCIES}
+                pa.validate_dependencies(dependencies)
+                pa.validate_dependencies(snapshot.pa_dependencies)
+                if reference[pa.LIBRARY] is not None or baseline[pa.LIBRARY] is not None:
+                    raise ValueError("The native PA helper location is occupied.")
+                value = files[pa.TARGET]
+                retired = any(pair["target"] == pa.TARGET for pair in snapshot.storage_cleanup)
+                original = value.original if not retired and not value.backup_error and value.original_identity == identity else None
+                _inspect(pa, baseline[pa.TARGET], original)
+                native = pa.transform_files(reference, True, reference)
+                enabled = pa.transform_files(baseline, True, reference)
+                engine.capture_pa(reference, native)
+                engine.capture_pa(baseline, enabled)
             else:
                 modules = (smoothing, smoothing.HOMING) if path == smoothing.TARGET else (mod_versions.MODULES[path],)
                 enabled, native = {}, {}

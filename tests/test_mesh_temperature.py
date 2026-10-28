@@ -127,9 +127,30 @@ class TemperatureTests(unittest.TestCase):
     def test_disable_uses_backup_and_preserves_unrelated_edits(self):
         current = mod.transform(SOURCE, True).replace(b'G4 P100', b'G4 P123')
         self.assertEqual(mod.transform(current, False, SOURCE), SOURCE.replace(b'G4 P100', b'G4 P123'))
-        self.assertFalse(mod.inspect(current, SOURCE)['known'])
+        self.assertTrue(mod.inspect(current, SOURCE)['known'])
         with self.assertRaisesRegex(ValueError, 'original'):
             mod.transform(current, False)
+
+    def test_unrelated_macro_and_section_changes_do_not_block_compatibility(self):
+        current = SOURCE.replace(b'G4 P100', b'G4 P321') + b'\n[gcode_macro NEW_MACRO]\ngcode:\n  G4 P25\n'
+        for value in (current, mod.transform(current, True)):
+            with self.subTest(enabled=mod.inspect(value)['enabled']):
+                self.assertTrue(mod.inspect(value)['known'])
+                self.assertTrue(mod.inspect(value, SOURCE)['patchable'])
+                self.assertEqual(mod.fingerprint(mod.transform(value, True)), mod.fingerprint(value))
+        self.assertEqual(mod.transform(mod.transform(current, True), False, SOURCE), current)
+
+    def test_owned_anchor_conflicts_still_block_inspection(self):
+        for source in (SOURCE.replace(mod.ORIGINAL_INITIALIZER.encode(), b'{% set bed_temp = 90 %}'),
+                       SOURCE.replace(mod.ORIGINAL_INITIALIZER.encode(),
+                                      (mod.ORIGINAL_INITIALIZER + '\n  ' + mod.ORIGINAL_INITIALIZER).encode()),
+                       SOURCE.replace(b'{% set bed_temp = params.BED_TEMP %}', b'{% set bed_temp = 90 %}'),
+                       SOURCE.replace(mod.ORIGINAL_CONDITION.encode(), b'{% if params.BED_TEMP > 10 %}')):
+            with self.subTest(source=source):
+                state = mod.inspect(source, SOURCE)
+                self.assertFalse(state['known'])
+                self.assertFalse(state['patchable'])
+                self.assertEqual(state['label'], 'Conflict')
 
     def test_windows_line_endings_do_not_change_recognition(self):
         windows = SOURCE.replace(b'\n', b'\r\n')

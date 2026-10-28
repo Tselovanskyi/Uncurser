@@ -97,6 +97,7 @@ APPLY_BATCH = '''import os,sys,json,base64,hashlib,stat,uuid,ast,glob,fnmatch,co
 r=json.load(sys.stdin); items=r["files"]; prepared=[]; replaced=[]; caches=[]; cleared=[]
 ROOT="/mnt/UDISK/Uncurser"; migrations=[]; copied=[]; removed=[]; migration_temps=[]; retirements=[]; retired=[]
 recovery_copies=[]; recovery_removed=[]
+ADDED_BINARIES={"/usr/share/klipper/klippy/chelper/uncurser_pa.so"}
 database=r.get("fluidd_category"); database_attempted=False; database_done=False
 def fluidd(method="GET",value=None):
  import urllib.request,urllib.error
@@ -130,6 +131,30 @@ def read(path):
  if not stat.S_ISREG(s.st_mode): raise ValueError("Not a regular file: "+path)
  with open(path,"rb") as f: return f.read()
 def fingerprint(data): return sha(data) if data is not None else None
+
+def binary_identity(value):
+ if not isinstance(value,dict) or set(value)!={"sha256","size"} or not isinstance(value["sha256"],str) or not re.fullmatch(r"[0-9a-f]{64}",value["sha256"]) or type(value["size"]) is not int or not 52<=value["size"]<=2097152: raise ValueError("Invalid added-binary ownership")
+ return value
+
+def binary_matches(data,value):
+ value=binary_identity(value)
+ return data is not None and len(data)==value["size"] and sha(data)==value["sha256"]
+
+def validate_added_binary(item,old,new):
+ if item["path"] not in ADDED_BINARIES: raise ValueError("Unregistered added native helper")
+ if item.get("restore") and new is None:
+  if item.get("original_absent") is not True or item.get("original_hash")!=sha(b""): raise ValueError("Restoring native-helper absence requires a verified original")
+  return
+ owned=binary_identity(item["created_binary"])
+ initial=old is None and item.get("may_capture_original") and item.get("original_hash") is None
+ if not item.get("original_absent") and not initial: raise ValueError("Added native helper requires original absence proof")
+ if new is None:
+  if not binary_matches(old,owned): raise ValueError("Added native helper differs from its uninstall record")
+ elif not binary_matches(new,owned): raise ValueError("Added native helper upload differs from its ownership record")
+ else:
+  if new[:7]!=bytes((127,69,76,70,1,1,1)) or new[16:20]!=bytes((3,0,40,0)): raise ValueError("Added native helper is not an ARM shared library")
+  if old is not None and not binary_matches(old,item.get("previous_created_binary")): raise ValueError("Installed native helper differs from its uninstall record")
+  if old is None and item.get("previous_created_binary") is not None: raise ValueError("Missing native helper cannot satisfy previous ownership")
 def fileattrs(path):
  s=os.lstat(path)
  return dict(mode=stat.S_IMODE(s.st_mode),uid=s.st_uid,gid=s.st_gid)
@@ -231,7 +256,7 @@ try:
   if not isinstance(copy,dict) or set(copy)!={"target","path","sha256","attrs"}: raise ValueError("Invalid recovery cleanup inventory")
   target=copy["target"]; path=copy["path"]; checksum=copy["sha256"]; attrs=copy["attrs"]
   if not isinstance(target,str) or not os.path.isabs(target) or os.path.normpath(target)!=target or target not in r.get("recovery_targets",{}): raise ValueError("Invalid recovery cleanup target")
-  stem,suffix=os.path.splitext(target); marker={".py":".ptn",".cfg":".cfn",".js":".jfn",".json":".jsn"}.get(suffix)
+  stem,suffix=os.path.splitext(target); marker={".py":".ptn",".cfg":".cfn",".js":".jfn",".json":".jsn",".so":".sbn"}.get(suffix)
   if marker is None or not isinstance(checksum,str) or not re.fullmatch(r"[0-9a-f]{64}",checksum): raise ValueError("Invalid recovery cleanup checksum")
   prefixes=[ROOT+"/recovery"+stem+marker+"."]
   if target=="/mnt/UDISK/printer_data/config/printer.cfg": prefixes.append(os.path.join(ROOT,"recovery","printer."))
@@ -247,7 +272,7 @@ try:
   target=entry["target"]; backup=entry["backup"]; model=entry["model"]; release=entry.get("firmware"); reason=entry.get("reason","obsolete")
   if not isinstance(target,str) or not os.path.isabs(target) or os.path.normpath(target)!=target: raise ValueError("Invalid original retirement target")
   source="/mnt/UDISK/printer_data/config/Uncurser_mods.json" if target==os.path.join(ROOT,"Uncurser_mods.json") else target
-  stem,suffix=os.path.splitext(source); marker={".py":".ptn",".cfg":".cfn",".js":".jfn",".json":".jsn"}.get(suffix)
+  stem,suffix=os.path.splitext(source); marker={".py":".ptn",".cfg":".cfn",".js":".jfn",".json":".jsn",".so":".sbn"}.get(suffix)
   if marker is None: raise ValueError("Invalid original retirement type")
   canonical=os.path.normpath(ROOT+"/originals"+stem+marker+".Original.txt"); legacy=stem+marker+".Original.txt"
   if backup not in (canonical,legacy) or (in_storage(backup) and backup!=canonical): raise ValueError("Invalid original retirement path")
@@ -313,7 +338,10 @@ try:
   if fingerprint(old)!=item["expected"]: raise ValueError("Working file changed since scan: "+p)
   new=base64.b64decode(item["data"],validate=True) if item["data"] is not None else None
   if fingerprint(new)!=item["new_hash"]: raise ValueError("Upload checksum mismatch")
+  added_binary=item["kind"]=="binary" and ("created_binary" in item or (item.get("restore") and item["path"] in ADDED_BINARIES and new is None))
+  if added_binary: validate_added_binary(item,old,new)
   if new is None:
+   if item["kind"]=="binary" and not added_binary: raise ValueError("Binary modules cannot be deleted")
    if not item.get("original_absent") and not (item.get("recovery")=="records" and p==os.path.join(ROOT,"Uncurser_mods.json") and item["kind"]=="json"): raise ValueError("Only files originally absent may be removed")
   elif item["kind"]=="python": ast.parse(new.decode("utf-8"),filename=p)
   elif item["kind"]=="config":
@@ -333,6 +361,23 @@ try:
      if not before or text.count(before)!=1: raise ValueError("Fluidd edit is not unique")
      text=text.replace(before,after,1)
     if text.encode("utf-8")!=new: raise ValueError("Unrelated Fluidd code would change")
+  elif item["kind"]=="binary":
+   if added_binary: pass
+   elif not p.endswith(".so") or (old is None and not item.get("restore")): raise ValueError("The existing binary module is missing or unsupported")
+   elif item.get("restore"):
+    if new!=read(item["backup"]): raise ValueError("Binary restoration does not match its original backup")
+   else:
+    size=item.get("binary_size"); changes=item.get("binary_changes")
+    if type(size) is not int or len(old)!=size or len(new)!=size or not isinstance(changes,list) or not 1<=len(changes)<=64: raise ValueError("Invalid binary edit scope")
+    prepared_binary=bytearray(old); end=0
+    for change in changes:
+     if not isinstance(change,dict) or set(change)!={"offset","before","after"}: raise ValueError("Invalid binary edit")
+     offset=change["offset"]; before=change["before"]; after=change["after"]
+     if type(offset) is not int or offset<end or not isinstance(before,str) or not isinstance(after,str) or not re.fullmatch(r"(?:[0-9a-f]{2})+",before) or not re.fullmatch(r"(?:[0-9a-f]{2})+",after) or len(before)!=len(after) or before==after: raise ValueError("Invalid binary edit range")
+     before=bytes.fromhex(before); after=bytes.fromhex(after); end=offset+len(before)
+     if end>size or old[offset:end]!=before: raise ValueError("Binary edit no longer matches the printer module")
+     prepared_binary[offset:end]=after
+    if bytes(prepared_binary)!=new: raise ValueError("Unrelated binary bytes would change")
   elif item["kind"]=="json":
    document=json.loads(new.decode("utf-8"))
    if p==os.path.join(ROOT,"Uncurser_mods.json") and (not isinstance(document,dict) or document.get("schema")!=1 or not isinstance(document.get("mods"),dict)): raise ValueError("Invalid mod records")
@@ -360,14 +405,14 @@ try:
     if prefix.replace(b"\\r\\n",b"\\n") not in blocks or old.count(prefix)!=1 or not old.startswith(leading+prefix) or leading+old[len(leading)+len(prefix):]!=new: raise ValueError("Recovery changes more than the owned reference")
     expected_backup=os.path.join(ROOT,"recovery","printer."+item["expected"]+".txt")
    else:
-    stem,suffix=os.path.splitext(p); markers={".py":".ptn",".cfg":".cfn",".js":".jfn",".json":".jsn"}
+    stem,suffix=os.path.splitext(p); markers={".py":".ptn",".cfg":".cfn",".js":".jfn",".json":".jsn",".so":".sbn"}
     if suffix not in markers or not os.path.isabs(p) or os.path.normpath(p)!=p: raise ValueError("Invalid recovery target")
     expected_backup=ROOT+"/recovery"+stem+markers[suffix]+"."+item["expected"]+".txt"
     if item["recovery"]=="stock":
      source=item["stock_source"]; expected=item["stock_hash"]
      if not source.startswith("/rom/") or os.path.normpath(source)!=source or source not in r.get("guards",{}) or r["guards"][source]!=expected: raise ValueError("Missing verified stock firmware guard")
-     if item["kind"] not in ("python","config","javascript") or fingerprint(read(source))!=expected: raise ValueError("Stock firmware source changed")
-     if new is None and (expected is not None or os.path.basename(p) not in ("screws_tilt_adjust.py","screws_tilt_adjust.cfg")): raise ValueError("Stock firmware does not prove this helper file absent")
+     if item["kind"] not in ("python","config","javascript","binary") or fingerprint(read(source))!=expected: raise ValueError("Stock firmware source changed")
+    if new is None and (expected is not None or (os.path.basename(p) not in ("screws_tilt_adjust.py","screws_tilt_adjust.cfg") and p not in ADDED_BINARIES)): raise ValueError("Stock firmware does not prove this helper file absent")
     elif item["recovery"]=="records":
      if p!=os.path.join(ROOT,"Uncurser_mods.json") or item["kind"]!="json": raise ValueError("Invalid recovery record update")
      before=json.loads(old.decode("utf-8")); after=json.loads(new.decode("utf-8")) if new is not None else {"mods":{}}
@@ -506,7 +551,7 @@ try:
   if not isinstance(target,str) or not os.path.isabs(target) or os.path.normpath(target)!=target: raise ValueError("Invalid recovery cleanup target")
   if not any(item["path"]==target for item in prepared) and (target not in r.get("guards",{}) or r["guards"][target]!=expected): raise ValueError("Recovery cleanup requires a guarded file")
   if fingerprint(read(target))!=expected: raise ValueError("Working file changed before recovery cleanup: "+target)
-  stem,suffix=os.path.splitext(target); marker={".py":".ptn",".cfg":".cfn",".js":".jfn",".json":".jsn"}.get(suffix)
+  stem,suffix=os.path.splitext(target); marker={".py":".ptn",".cfg":".cfn",".js":".jfn",".json":".jsn",".so":".sbn"}.get(suffix)
   if marker is None: continue
   prefixes=[ROOT+"/recovery"+stem+marker+"."]
   if target=="/mnt/UDISK/printer_data/config/printer.cfg": prefixes.append(os.path.join(ROOT,"recovery","printer."))

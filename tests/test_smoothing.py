@@ -147,6 +147,26 @@ def payload(fixture):
 
 
 class HomingSpeedTests(unittest.TestCase):
+    def test_config_compatibility_ignores_unrelated_macros_and_sections(self):
+        current = SOURCE.replace(b'G4 P100', b'G4 P321') + b'\n[gcode_macro NEW_MACRO]\ngcode:\n  G4 P25\n'
+        for value in (current, mod.transform(current, True)):
+            with self.subTest(enabled=mod.inspect(value)['enabled']):
+                self.assertTrue(mod.inspect(value)['known'])
+                self.assertTrue(mod.inspect(value, SOURCE)['patchable'])
+                self.assertEqual(mod.fingerprint(mod.transform(value, True)), mod.fingerprint(value))
+        self.assertEqual(mod.transform(mod.transform(current, True), False, SOURCE), current)
+
+    def test_config_owned_anchor_and_neighbor_changes_remain_conflicts(self):
+        for value in (SOURCE.replace(mod.ORIGINAL_LINE.encode(), b'G1 X100 Y100 F12000'),
+                      SOURCE.replace(mod.ORIGINAL_LINE.encode(), (mod.ORIGINAL_LINE + '\n  ' + mod.ORIGINAL_LINE).encode()),
+                      SOURCE.replace(b'M204 S2000', b'M204 S3000'),
+                      SOURCE.replace(b'G90\n  M204 S500', b'G90\n  M204 S600')):
+            with self.subTest(value=value):
+                state = mod.inspect(value, SOURCE)
+                self.assertFalse(state['known'])
+                self.assertFalse(state['patchable'])
+                self.assertEqual(state['label'], 'Conflict')
+
     def test_first_xy_pass_and_only_first_pass_uses_5000(self):
         hi = SimpleNamespace(speed=100., second_homing_speed=50., retract_speed=60., retract_dist=10.)
         for axis in (0, 1, 2):

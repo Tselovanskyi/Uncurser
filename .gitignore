@@ -9,6 +9,9 @@
 !/tests/
 !/tools/
 !/third_party/
+!/native/
+/native/*
+!/native/pa/
 !/References/
 /References/*
 !/References/screws_tilt_adjust/

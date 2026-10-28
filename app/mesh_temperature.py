@@ -65,11 +65,8 @@ def inspect(data, original=None):
         lines, initializer, index = anchors(data)
         legacy = lines[index].strip() == ENABLED_CONDITION
         enabled = lines[initializer].strip() == ENABLED_INITIALIZER or legacy
-        reference = fingerprint(original) if original is not None else REFERENCE_HASH
-        known = fingerprint(data) == reference
-        return {"known": known, "enabled": enabled, "legacy": legacy, "patchable": True,
-                "label": "Uncursed" if known and enabled else "Original" if known else "Unknown",
-                "reason": "" if known else "This macro file differs from the recognized original outside this mod."}
+        return {"known": True, "enabled": enabled, "legacy": legacy, "patchable": True,
+                "label": "Uncursed" if enabled else "Original", "reason": ""}
     except (ValueError, UnicodeError) as error:
         return {"known": False, "enabled": None, "patchable": False, "label": "Conflict", "reason": str(error)}
 

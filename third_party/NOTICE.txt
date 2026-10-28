@@ -30,3 +30,10 @@ The Fluidd screw-dialog reference fragment and popup-local grid edits are
 derived from Fluidd (GPLv3): https://github.com/fluidd-core/fluidd
 The modification changes screw-result presentation and is supplied as
 plain-text source in app/assets/screws-grid-edits.json.
+
+The optional Fix Adaptive PA mod includes modified pressure-advance code
+from Klipper, copyright Kevin O'Connor, under GPLv3:
+https://github.com/Klipper3d/klipper
+The corresponding source and build instructions are in native/pa and
+tools/build_pa.py in the Uncurser source repository. The GPL-3.0 license
+text is included in this directory.

@@ -1,0 +1,8 @@
+{
+    global:
+        uncurser_pa_api_version;
+        uncurser_pa_alloc;
+        uncurser_pa_free;
+        uncurser_pa_set;
+    local: *;
+};

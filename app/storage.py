@@ -9,7 +9,7 @@ ROOT = "/mnt/UDISK/Uncurser"
 RECORDS = ROOT + "/Uncurser_mods.json"
 LEGACY_RECORDS = "/mnt/UDISK/printer_data/config/Uncurser_mods.json"
 _ORIGINALS = ROOT + "/originals"
-_MARKERS = {".py": ".ptn", ".cfg": ".cfn", ".js": ".jfn", ".json": ".jsn"}
+_MARKERS = {".py": ".ptn", ".cfg": ".cfn", ".js": ".jfn", ".json": ".jsn", ".so": ".sbn"}
 _ATTRS = ("mode", "uid", "gid")
 
 

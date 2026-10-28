@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QDialogBu
                                QFrame, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox,
                                QPushButton, QPlainTextEdit, QScrollArea, QSizePolicy, QStackedWidget, QStyle, QStyleOptionButton, QVBoxLayout, QWidget)
 
-from . import __version__, engine, mesh, mesh_temperature, mods, network, recovery, screws, settings, smoothing, storage, ui_checks, warmup
+from . import __version__, engine, kamp, mesh, mesh_temperature, mods, network, pa, recovery, screws, settings, smoothing, storage, ui_checks, warmup
+from .orca_dialog import OrcaGcodeDialog
 from .remote import Connection, NewHostKey, trust_key
 
 
@@ -118,9 +119,11 @@ SUPPORT_URL = "https://donatello.to/uncurse"
 MOD_CONTROLS = (
     (mesh.TARGET, "mesh_staged", "Speed up Bed mesh"),
     (smoothing.TARGET, "smoothing_staged", "Speed up homing"),
+    (kamp.TARGET, "kamp_staged", "Adaptive priming (KAMP-style)"),
     (mods.TARGET, "staged", "Heat before homing & calibration"),
     (mesh_temperature.TARGET, "temperature_staged", "Mesh at print temperature"),
     (warmup.TARGET, "warmup_staged", "Don’t delay chamber heating"),
+    (pa.TARGET, "pa_staged", "Fix Adaptive PA"),
     (screws.PYTHON, "screws_staged", "Bed screw adjustment helper"),
 )
 
@@ -1008,6 +1011,8 @@ class Window(QMainWindow):
         self.screws_staged = None
         self.smoothing_staged = None
         self.warmup_staged = None
+        self.kamp_staged = None
+        self.pa_staged = None
         self.restore_pending = False
         self.update_enabled = True
         self.automatic_update_error = ""
@@ -1297,14 +1302,84 @@ class Window(QMainWindow):
         self.warmup_details.setToolTip("View the code for the initial application of this mod")
         self.warmup_item = ModItem(self.warmup_card, self.warmup_pending, self.warmup_toggle,
                                    self.warmup_details, self.warmup_expand)
-        for item in (self.mesh_item, self.smoothing_item, self.heat_item, self.temperature_item, self.warmup_item):
+        self.kamp_card = QWidget()
+        self.kamp_card.setObjectName("modContent")
+        kamp_heading = QHBoxLayout(self.kamp_card)
+        kamp_heading.setContentsMargins(0, 0, 0, 0)
+        kamp_heading.addWidget(label("Adaptive priming (KAMP-style)", "section"))
+        self.kamp_opacity = QGraphicsOpacityEffect(self.kamp_card)
+        self.kamp_card.setGraphicsEffect(self.kamp_opacity)
+        self.kamp_body = QWidget()
+        self.kamp_body.setObjectName("modBody")
+        kamp_layout = QVBoxLayout(self.kamp_body)
+        kamp_layout.setContentsMargins(0, 0, 0, 0)
+        kamp_layout.addWidget(label(
+            "<ul><li>Replaces the L-shaped prime line with a KAMP-style prime line beside the printed model.</li>"
+            "<li>The printer remains compatible with unmodified slicer G-code and will use "
+            "the original L-shaped prime line with it.</li></ul>"
+            "<p><b>Setting up:</b></p>"
+            "<ol><li>Apply the mod.</li>"
+            "<li>Use the <b>G-code for Orca</b> button to convert your <b>Machine start G-code</b>. "
+            "The converter works in both directions, so you can also restore the original L-shaped prime line.</li></ol>", wrap=True))
+        self.kamp_expand = DetailsButton(self.kamp_body)
+        self.kamp_toggle = Switch()
+        self.kamp_toggle.setAccessibleName("Adaptive priming (KAMP-style)")
+        self.kamp_toggle.toggled.connect(self.stage_kamp_toggle)
+        self.kamp_pending = label("Pending", "muted")
+        self.kamp_pending.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pending_size = self.kamp_pending.sizePolicy()
+        pending_size.setRetainSizeWhenHidden(True)
+        self.kamp_pending.setSizePolicy(pending_size)
+        self.kamp_details = ModFilesButton(file_summary(modified=1), lambda: self.show_mod_code(kamp.TARGET))
+        self.kamp_details.setObjectName("modDetails")
+        self.kamp_details.setToolTip("View the code for the initial application of this mod")
+        self.kamp_item = ModItem(self.kamp_card, self.kamp_pending, self.kamp_toggle,
+                                 self.kamp_details, self.kamp_expand)
+        self.orca_button = button("G-code for Orca", self.show_orca_gcode)
+        self.kamp_item.layout().itemAt(0).layout().insertWidget(
+            1, self.orca_button, alignment=Qt.AlignmentFlag.AlignBottom)
+        self.kamp_item.layout().itemAt(0).layout().insertSpacing(2, 12)
+        for item in (self.mesh_item, self.smoothing_item, self.kamp_item, self.heat_item, self.temperature_item, self.warmup_item):
             mod_list.addWidget(item)
+        quality_section, quality_layout = card()
+        quality_layout.addWidget(label("PRINT QUALITY", "groupHeading"))
+        self.pa_card = QWidget()
+        self.pa_card.setObjectName("modContent")
+        pa_heading = QHBoxLayout(self.pa_card)
+        pa_heading.setContentsMargins(0, 0, 0, 0)
+        pa_heading.addWidget(label("Fix Adaptive PA", "section"))
+        self.pa_opacity = QGraphicsOpacityEffect(self.pa_card)
+        self.pa_card.setGraphicsEffect(self.pa_opacity)
+        self.pa_body = QWidget()
+        self.pa_body.setObjectName("modBody")
+        pa_layout = QVBoxLayout(self.pa_body)
+        pa_layout.setContentsMargins(0, 0, 0, 0)
+        pa_layout.addWidget(label(
+            "Adds proper support for Adaptive Pressure Advance. "
+            "This mod should remove ugly corner artifacts when using Adaptive PA", wrap=True))
+        self.pa_expand = DetailsButton(self.pa_body)
+        self.pa_toggle = Switch()
+        self.pa_toggle.setAccessibleName("Fix Adaptive PA")
+        self.pa_toggle.toggled.connect(self.stage_pa_toggle)
+        self.pa_pending = label("Pending", "muted")
+        self.pa_pending.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pending_size = self.pa_pending.sizePolicy()
+        pending_size.setRetainSizeWhenHidden(True)
+        self.pa_pending.setSizePolicy(pending_size)
+        self.pa_details = ModFilesButton(file_summary(modified=1, added=1), lambda: self.show_mod_code(pa.TARGET))
+        self.pa_details.setObjectName("modDetails")
+        self.pa_details.setToolTip("View the code for the initial application of this mod")
+        self.pa_item = ModItem(self.pa_card, self.pa_pending, self.pa_toggle,
+                               self.pa_details, self.pa_expand)
+        quality_layout.addWidget(self.pa_item)
         self.mod_version_rows = {
             mods.TARGET: (self.heat_details, self.heat_details.text()),
             mesh.TARGET: (self.mesh_details, self.mesh_details.text()),
             mesh_temperature.TARGET: (self.temperature_details, self.temperature_details.text()),
             smoothing.TARGET: (self.smoothing_details, self.smoothing_details.text()),
             warmup.TARGET: (self.warmup_details, self.warmup_details.text()),
+            kamp.TARGET: (self.kamp_details, self.kamp_details.text()),
+            pa.TARGET: (self.pa_details, self.pa_details.text()),
         }
         maintenance_section, maintenance_layout = card()
         maintenance_layout.addWidget(label("HELPERS", "groupHeading"))
@@ -1348,7 +1423,7 @@ class Window(QMainWindow):
                                   self.screws_details, self.screws_expand)
         maintenance_layout.addWidget(self.screws_item)
         self.details_buttons = (self.heat_expand, self.mesh_expand, self.temperature_expand, self.smoothing_expand,
-                                self.warmup_expand, self.screws_expand)
+                                self.warmup_expand, self.screws_expand, self.kamp_expand, self.pa_expand)
         for disclosure in self.details_buttons:
             disclosure.toggled.connect(lambda expanded, active=disclosure: self.close_other_details(active, expanded))
         mods_and_footer = QVBoxLayout()
@@ -1361,6 +1436,7 @@ class Window(QMainWindow):
         cards_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         cards_layout.addWidget(self.scan_card)
         cards_layout.addWidget(mod_section)
+        cards_layout.addWidget(quality_section)
         cards_layout.addWidget(maintenance_section)
         self.cards_scroll = SmoothScrollArea()
         self.cards_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
@@ -1792,6 +1868,10 @@ class Window(QMainWindow):
                        "restore": False, "update": False, "full_risk": False}
             if warmup.TARGET in targets:
                 options["warmup_desired"] = targets[warmup.TARGET]
+            if kamp.TARGET in targets:
+                options["kamp_desired"] = targets[kamp.TARGET]
+            if pa.TARGET in targets:
+                options["pa_desired"] = targets[pa.TARGET]
             extra = {"unknown_removals": unknown_removals} if unknown_removals else {}
             engine.prepare_all(engine.cleanup_snapshot(scanned) if scanned.storage_cleanup else scanned, **options, **extra)
         except (ValueError, TypeError, SyntaxError) as error:
@@ -2007,6 +2087,8 @@ class Window(QMainWindow):
         self.screws_staged = None
         self.smoothing_staged = None
         self.warmup_staged = None
+        self.kamp_staged = None
+        self.pa_staged = None
         self.restore_pending = False
         self.update_enabled = update_enabled
         self.update_active = False
@@ -2067,6 +2149,19 @@ class Window(QMainWindow):
     def stage_warmup_toggle(self, value):
         self.stage_mod_toggle(warmup.TARGET, "warmup_staged", value)
 
+    def stage_kamp_toggle(self, value):
+        self.stage_mod_toggle(kamp.TARGET, "kamp_staged", value)
+
+    def stage_pa_toggle(self, value):
+        self.stage_mod_toggle(pa.TARGET, "pa_staged", value)
+
+    def show_orca_gcode(self):
+        dialog = OrcaGcodeDialog(self)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
     def pending_plan(self, choices, needed):
         scope = (id(self.snapshot), self.snapshot_connection, self.policy, self.restore_pending)
         if self.apply_waiting != scope:
@@ -2082,6 +2177,10 @@ class Window(QMainWindow):
                    "full_risk": self.policy == "all", "update": self.update_active}
         if self.warmup_staged is not None:
             options["warmup_desired"] = self.warmup_staged
+        if self.kamp_staged is not None:
+            options["kamp_desired"] = self.kamp_staged
+        if self.pa_staged is not None:
+            options["pa_desired"] = self.pa_staged
         key = (id(self.snapshot), self.snapshot_connection, self.policy, tuple(options.items()))
         if key != self.plan_key:
             self.plan_key, self.plan_result = key, None
@@ -2162,7 +2261,8 @@ class Window(QMainWindow):
         restore_paths = ui_checks.check(snapshot, ("restore", self.policy == "all")) if self.restore_pending else set()
         choices = {mods.TARGET: self.staged, mesh.TARGET: self.mesh_staged,
                    mesh_temperature.TARGET: self.temperature_staged, screws.PYTHON: self.screws_staged,
-                   smoothing.TARGET: self.smoothing_staged, warmup.TARGET: self.warmup_staged}
+                   smoothing.TARGET: self.smoothing_staged, warmup.TARGET: self.warmup_staged,
+                   kamp.TARGET: self.kamp_staged, pa.TARGET: self.pa_staged}
         update_statuses = ui_checks.check(snapshot, "updates")
         outdated_paths = engine.outdated_mods(snapshot, update_statuses, issues)
         update_targets = {path for path in outdated_paths if choices.get(path) is not False} if not self.restore_pending else set()
@@ -2207,6 +2307,10 @@ class Window(QMainWindow):
              self.smoothing_toggle, self.smoothing_pending, self.smoothing_card, self.smoothing_opacity),
             (warmup.TARGET, engine.mod_snapshot(snapshot, warmup.TARGET) if snapshot else None, self.warmup_staged,
              self.warmup_toggle, self.warmup_pending, self.warmup_card, self.warmup_opacity),
+            (kamp.TARGET, engine.mod_snapshot(snapshot, kamp.TARGET) if snapshot else None, self.kamp_staged,
+             self.kamp_toggle, self.kamp_pending, self.kamp_card, self.kamp_opacity),
+            (pa.TARGET, engine.mod_snapshot(snapshot, pa.TARGET) if snapshot else None, self.pa_staged,
+              self.pa_toggle, self.pa_pending, self.pa_card, self.pa_opacity),
         )
         for path, value, staged, toggle, pending, panel, opacity in entries:
             removal = removals.get(path, {})
@@ -2236,8 +2340,9 @@ class Window(QMainWindow):
             pending.setVisible(bool(changed))
             pending.setToolTip("Restore the initial on-printer original" if path in restore_paths else
                                "Update to latest" if path in update_paths and staged is not False else "Staged change")
+            dependency_removal = bool(applied and removable and value and value.analysis.get("dependency_error"))
             allowed = bool(self.connected and access and (removable if maintenance and applied else
-                           maintenance or (value.analysis.get("patchable", False) and not value.backup_error)))
+                           maintenance or dependency_removal or (value.analysis.get("patchable", False) and not value.backup_error)))
             if changed:
                 change_allowed = (bool(removal.get("present") and removal.get("available")) if staged is False else
                                   bool(self.connected and updatable) if maintenance and path in update_paths else allowed)
@@ -2257,9 +2362,12 @@ class Window(QMainWindow):
         self.screws_details.setEnabled(self.connected)
         self.smoothing_details.setEnabled(self.connected)
         self.warmup_details.setEnabled(self.connected)
+        self.kamp_details.setEnabled(self.connected)
+        self.pa_details.setEnabled(self.connected)
         for widget in (self.heat_expand, self.mesh_expand, self.temperature_expand,
                        self.heat_body, self.mesh_body, self.temperature_body, self.screws_expand, self.screws_body,
-                       self.smoothing_expand, self.smoothing_body, self.warmup_expand, self.warmup_body):
+                       self.smoothing_expand, self.smoothing_body, self.warmup_expand, self.warmup_body,
+                       self.kamp_expand, self.kamp_body, self.pa_expand, self.pa_body):
             widget.setEnabled(self.connected)
         for row in self.printer_rows:
             connecting = bool(row is self.active_row and self.scanning and not self.connected and snapshot is None)
@@ -2287,7 +2395,7 @@ class Window(QMainWindow):
                                            and not self.busy and not mandatory_updates and not issues_found))
         self.update_control.setToolTip("Updates are required when enabling another mod." if mandatory_updates
             else "Update active outdated mods in the same Apply batch; mods turned off will be removed instead.")
-        self.cancel_button.setEnabled(not self.busy and (self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.screws_staged is not None or self.smoothing_staged is not None or self.warmup_staged is not None or self.restore_pending or self.update_active))
+        self.cancel_button.setEnabled(not self.busy and (self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.screws_staged is not None or self.smoothing_staged is not None or self.warmup_staged is not None or self.kamp_staged is not None or self.pa_staged is not None or self.restore_pending or self.update_active))
         self.original_button.setEnabled(bool(self.connected and snapshot and not self.busy
                                              and (ui_checks.check(snapshot, ("restore", self.policy == "all"))
                                                   or remove_all_targets(snapshot)[0])))
@@ -2315,7 +2423,9 @@ class Window(QMainWindow):
     def preview(self):
         try:
             diff = engine.difference_all(self.snapshot, self.staged, self.mesh_staged, self.restore_pending, self.policy == "all", self.temperature_staged, self.screws_staged, update=self.update_active, smoothing_desired=self.smoothing_staged,
-                                         **({"warmup_desired": self.warmup_staged} if self.warmup_staged is not None else {}))
+                                         **({"warmup_desired": self.warmup_staged} if self.warmup_staged is not None else {}),
+                                         **({"kamp_desired": self.kamp_staged} if self.kamp_staged is not None else {}),
+                                         **({"pa_desired": self.pa_staged} if self.pa_staged is not None else {}))
         except (ValueError, SyntaxError) as error:
             QMessageBox.warning(self, "Cannot prepare changes", str(error))
             return
@@ -2326,7 +2436,8 @@ class Window(QMainWindow):
             return
         name = {mods.TARGET: "Heat before homing & calibration", mesh.TARGET: "Speed up Bed mesh",
                 mesh_temperature.TARGET: "Mesh at print temperature", screws.MOD_ID: "Bed screw adjustment helper",
-                smoothing.TARGET: "Speed up homing", warmup.TARGET: "Don’t delay chamber heating"}[path]
+                smoothing.TARGET: "Speed up homing", warmup.TARGET: "Don’t delay chamber heating",
+                 kamp.TARGET: "Adaptive priming (KAMP-style)", pa.TARGET: "Fix Adaptive PA"}[path]
         try:
             diff, baseline = engine.initial_difference(self.snapshot, path)
         except (ValueError, SyntaxError, UnicodeError) as error:
@@ -2413,6 +2524,8 @@ class Window(QMainWindow):
         screws_desired = self.screws_staged
         smoothing_desired = self.smoothing_staged
         warmup_desired = self.warmup_staged
+        kamp_desired = self.kamp_staged
+        pa_desired = self.pa_staged
         update = self.update_active
         def applied(result):
             self.staged = None
@@ -2421,6 +2534,8 @@ class Window(QMainWindow):
             self.screws_staged = None
             self.smoothing_staged = None
             self.warmup_staged = None
+            self.kamp_staged = None
+            self.pa_staged = None
             self.restore_pending = False
             self.receive_scan(result["snapshot"], connection, review=False)
             self.apply_button.setToolTip(result["message"])
@@ -2433,7 +2548,9 @@ class Window(QMainWindow):
                                                    mesh_desired=mesh_desired, temperature_desired=temperature_desired,
                                                    screws_desired=screws_desired, update=update,
                                                    smoothing_desired=smoothing_desired,
-                                                   **({"warmup_desired": warmup_desired} if warmup_desired is not None else {})), applied)
+                                                   **({"warmup_desired": warmup_desired} if warmup_desired is not None else {}),
+                                                    **({"kamp_desired": kamp_desired} if kamp_desired is not None else {}),
+                                                    **({"pa_desired": pa_desired} if pa_desired is not None else {})), applied)
 
     def show_write_success(self):
         dialog = QDialog(self)
@@ -2531,7 +2648,7 @@ class Window(QMainWindow):
         if self.busy and not self.scanning:
             QMessageBox.information(self, "Write in progress", "Wait for the printer files to finish writing before closing the app.")
             event.ignore()
-        elif self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.screws_staged is not None or self.smoothing_staged is not None or self.warmup_staged is not None or self.restore_pending:
+        elif self.staged is not None or self.mesh_staged is not None or self.temperature_staged is not None or self.screws_staged is not None or self.smoothing_staged is not None or self.warmup_staged is not None or self.kamp_staged is not None or self.pa_staged is not None or self.restore_pending:
             dialog = QMessageBox(QMessageBox.Icon.Question, "Discard pending edits?",
                                 "Close without applying your pending edits?",
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)

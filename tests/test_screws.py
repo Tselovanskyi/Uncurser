@@ -1,12 +1,13 @@
 """Helper installation, shared-config edits and rollback, using local fixtures."""
 import base64
+import copy
 import json
 import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app import engine, fluidd_screws, mesh, mod_versions, mods, screws
+from app import engine, fluidd_screws, mesh, mod_comments, mod_versions, mods, screws
 from app.remote import APPLY_BATCH, Connection
 from tests import test_mesh as mesh_tests
 
@@ -65,17 +66,86 @@ def snapshot(enabled=False, originals=False, speed=False, grid=None):
 
 
 class ScrewsTests(unittest.TestCase):
+    def test_helper_checks_its_own_files_instead_of_mesh_preset_compatibility(self):
+        current = snapshot()
+        current.mesh.data = current.mesh.data.replace(b'[z_align]', b'[gcode_arcs]\nresolution: 0.006\n[z_align]')
+        current.mesh.analysis.update(known=False, patchable=False,
+            include_error='A mesh preset setting has an included override.', reason='Mesh preset conflict.')
+        analysis = screws.inspect(current.mesh, current.screws.files, {mesh.TARGET: current.mesh.data}, {})
+        self.assertTrue(analysis['known'])
+        self.assertTrue(analysis['patchable'])
+        self.assertFalse(analysis['enabled'])
+        self.assertEqual(analysis['reason'], '')
+        for broken in (b'# UNCURSER invalid metadata\n', b'[invalid header\n'):
+            root = copy.deepcopy(current.mesh)
+            root.data = broken + root.data
+            self.assertFalse(screws.inspect(root, current.screws.files, {mesh.TARGET: root.data}, {})['patchable'])
+
+    def test_helper_baseline_ignores_mesh_specific_include_conflict(self):
+        current = snapshot(True, True)
+        current.mesh.analysis['include_error'] = 'An included file overrides a mesh preset value.'
+        baseline = engine.helper_baseline(current)
+        tree = {'files': {path: {'data': base64.b64encode(data).decode()} for path, data in
+                         ((mesh.TARGET, current.mesh.data), (screws.CONFIG, screws.payload(screws.CONFIG)))},
+                'patterns': {screws.CONFIG: [screws.CONFIG]}}
+        self.assertTrue(engine.inspect_helper_baseline(current, baseline, tree)['patchable'])
+        with self.assertRaisesRegex(ValueError, 'includes'):
+            engine.inspect_helper_baseline(current, baseline, ValueError('Unreadable include tree.'))
+
+    def test_helper_only_apply_does_not_require_mesh_preset_fields(self):
+        current = snapshot()
+        current.mesh.data = current.mesh.data.replace(b'quick_speed: 30\n', b'').replace(
+            b'[z_align]', b'[gcode_arcs]\nresolution: 0.006\n[z_align]')
+        current.mesh.sha256 = mods.digest(current.mesh.data)
+        current.mesh.analysis.update(known=False, patchable=False, enabled=False)
+        current.screws.analysis = screws.inspect(current.mesh, current.screws.files,
+                                                {mesh.TARGET: current.mesh.data}, {})
+        pending = engine.prepare_all(current, None, screws_desired=True)
+        after = copy.deepcopy(current)
+        after.fluidd_macros = engine.category_change(current, pending)['value']
+        for path, data in pending.items():
+            if path == mod_versions.TARGET:
+                after.versions = engine.MeshSnapshot(data, mods.digest(data),
+                    {'known': True, 'enabled': True, 'patchable': True},
+                    original_hash=mods.digest(b''), original_absent=True)
+            else:
+                value = engine.file_snapshot(after, path)
+                value.data, value.sha256 = data, mods.digest(data) if data is not None else None
+        with patch.object(engine, 'scan', side_effect=[copy.deepcopy(current), after]), \
+                patch.object(engine.network, 'require_idle'), \
+                patch.object(engine.network, 'status', return_value=current.status), \
+                patch.object(engine, 'Remote') as remote, \
+                patch.object(mesh, 'Document', side_effect=AssertionError('Unrelated mesh preset validation')):
+            remote.return_value.__enter__.return_value.python.return_value = {}
+            engine.apply(Connection('192.0.2.1'), Path('unused'), current, None, screws_desired=True)
+        script, request = remote.return_value.__enter__.return_value.python.call_args.args
+        self.assertEqual(script, APPLY_BATCH)
+        config = next(item for item in request['files'] if item['path'] == mesh.TARGET)
+        self.assertNotIn('settings', config)
+        self.assertIn(b'resolution: 0.006', base64.b64decode(config['data']))
+
     def test_enable_then_disable_preserves_other_mod_and_calibration(self):
         before = snapshot()
         combined = engine.prepare_all(before, None, mesh_desired=True, screws_desired=True)
         self.assertEqual(len(combined), 5)
-        self.assertEqual(combined[mesh.TARGET], screws.edit_include(mesh.transform(SOURCE, True), True))
+        self.assertEqual(mod_comments.strip(combined[mesh.TARGET]), screws.edit_include(mesh.transform(SOURCE, True), True))
+        self.assertEqual(set(mod_comments.read(combined[mesh.TARGET])), {mesh.TARGET, screws.PYTHON})
         current = snapshot(True, True, True)
+        for path, data in combined.items():
+            if path == mod_versions.TARGET:
+                current.versions = engine.MeshSnapshot(data, mods.digest(data),
+                    {'known': True, 'enabled': True, 'patchable': True},
+                    original_hash=mods.digest(b''), original_absent=True)
+            else:
+                value = engine.file_snapshot(current, path)
+                value.data, value.sha256 = data, mods.digest(data)
         current.mesh.data = current.mesh.data.replace(b'0.1, 0.2', b'0.3, 0.4')
+        current.mesh.sha256 = mods.digest(current.mesh.data)
         disabled = engine.prepare_all(current, None, screws_desired=False)
         self.assertIsNone(disabled[screws.PYTHON])
         self.assertIsNone(disabled[screws.CONFIG])
-        self.assertEqual(disabled[mesh.TARGET], mesh.transform(SOURCE, True).replace(b'0.1, 0.2', b'0.3, 0.4'))
+        self.assertEqual(mod_comments.strip(disabled[mesh.TARGET]), mesh.transform(SOURCE, True).replace(b'0.1, 0.2', b'0.3, 0.4'))
+        self.assertEqual(set(mod_comments.read(disabled[mesh.TARGET])), {mesh.TARGET})
         self.assertTrue(current.screws.analysis['enabled'])
         self.assertTrue(current.mesh.analysis['known'])
 
@@ -123,8 +193,13 @@ class ScrewsTests(unittest.TestCase):
 
     def test_apply_submits_one_combined_config_after_new_files(self):
         before, after = snapshot(), snapshot(True, True, True)
-        ledger = engine.prepare_all(before, None, mesh_desired=True,
-                                    screws_desired=True)[mod_versions.TARGET]
+        pending = engine.prepare_all(before, None, mesh_desired=True, screws_desired=True)
+        for path, data in pending.items():
+            if path != mod_versions.TARGET:
+                value = engine.file_snapshot(after, path)
+                value.data, value.sha256 = data, mods.digest(data)
+        after.fluidd_macros = engine.category_change(before, pending)['value']
+        ledger = pending[mod_versions.TARGET]
         after.versions = engine.MeshSnapshot(ledger, mods.digest(ledger),
             {'known': True, 'enabled': True, 'patchable': True},
             original_hash=mods.digest(b''), original_absent=True)
@@ -132,6 +207,7 @@ class ScrewsTests(unittest.TestCase):
                 patch.object(engine.network, 'require_idle'), \
                 patch.object(engine.network, 'status', return_value=before.status), \
                 patch.object(engine, 'Remote') as remote:
+            remote.return_value.__enter__.return_value.python.return_value = {'saved': list(pending)}
             result = engine.apply(Connection('192.0.2.1'), Path('unused'), before, None,
                                   mesh_desired=True, screws_desired=True)
         script, request = remote.return_value.__enter__.return_value.python.call_args.args

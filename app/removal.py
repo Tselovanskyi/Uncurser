@@ -1,5 +1,5 @@
 """Plan verified, data-only mod removal without requiring tested firmware."""
-from . import fluidd_screws, mesh, mod_comments, mod_versions, mods, screws, smoothing, warmup
+from . import fluidd_screws, kamp, mesh, mod_comments, mod_versions, mods, pa, screws, smoothing, warmup
 
 
 def _data(files, path):
@@ -44,11 +44,19 @@ def _present(files, path):
         return any(after.encode() in data for _, after in fluidd_screws.blocks(fluidd_screws.TARGET))
     if path == warmup.TARGET:
         return warmup.inspect(_data(files, path) or b"").get("enabled") is True
+    if path == kamp.TARGET:
+        state = kamp.inspect(_data(files, path) or b"")
+        return bool(state.get("present") or state.get("enabled") is True)
+    if path == pa.TARGET:
+        return bool(_data(files, pa.LIBRARY) is not None or
+                    pa.inspect(_data(files, path) or b"").get("enabled") is True)
     return False
 
 
 def _commented(files, path):
     for filename in mod_versions.FILES.get(path, ()):
+        if filename.endswith(".so"):
+            continue
         data = _data(files, filename)
         if data is None:
             continue
@@ -87,6 +95,8 @@ def _verified(files, path, *, added=False):
 
 def _undo(path, value, entry, owner):
     data = value.data
+    if "binary_undo" in entry:
+        return mod_versions.undo_binary(data, entry["binary_undo"], allow_original=True)
     regular, generated = mesh.split(data) if path.endswith(".cfg") else (data.decode("utf-8"), "")
     original = mesh.split(value.original)[0] if path.endswith(".cfg") else value.original.decode("utf-8")
     # A fully restored original is proof that insertion-only edits are absent.
@@ -112,13 +122,16 @@ def _undo(path, value, entry, owner):
 
 def _recorded(files, path, record, stock=None):
     scope = mod_versions.file_scope(path, record)
-    entries = record["files"] if "files" in record else {path: {"undo": record["undo"]}}
+    entries = record["files"] if "files" in record else {path: mod_versions.entry(record)}
     result = {}
     for filename in scope:
         entry = entries[filename]
-        if "created" in entry:
+        if "created" in entry or "created_binary" in entry:
             value = _verified(files, filename, added=True)
-            if value.data is not None and not mod_versions.created_matches(value.data, entry["created"], path):
+            matches = value.data is None or (mod_versions.created_binary_matches(value.data, entry["created_binary"])
+                       if "created_binary" in entry else
+                       mod_versions.created_matches(value.data, entry["created"], path))
+            if value.data is not None and not matches:
                 raise ValueError("An added mod file differs from its uninstall record: " + filename)
             result[filename] = None
             if (value.data is not None
@@ -158,6 +171,22 @@ def _missing_recovery_data(files, path, record):
     return missing
 
 
+def pa_incomplete(files, record=None):
+    if any(_data(files, filename) is None for filename in pa.FILES):
+        return True
+    if record is None:
+        return pa.inspect_files({filename: _data(files, filename) for filename in pa.FILES}).get("partial", True)
+    try:
+        # Installed records identify older code too. A restored owned region
+        # makes the installation incomplete; a missing comment alone does not.
+        entries = record["files"]
+        mod_versions.undo(_data(files, pa.TARGET), entries[pa.TARGET])
+        return not mod_versions.created_binary_matches(
+            _data(files, pa.LIBRARY), entries[pa.LIBRARY]["created_binary"])
+    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, SyntaxError):
+        return True
+
+
 def inspect(files, records, *, metadata_error="", stock=None, identity=None, header_fallback=False):
     """Return each mod's presence, removal eligibility, edits and blocking reason."""
     if not isinstance(records, dict):
@@ -172,6 +201,8 @@ def inspect(files, records, *, metadata_error="", stock=None, identity=None, hea
         present = path in records or _present(files, path)
         value = result[path] = {"available": False, "files": {}, "reason": "", "present": present,
                                 "recovery": False, "defaults": False, "details": ""}
+        if path == pa.TARGET and present:
+            value["incomplete"] = pa_incomplete(files, records.get(path))
         try:
             if not present:
                 continue
@@ -179,6 +210,11 @@ def inspect(files, records, *, metadata_error="", stock=None, identity=None, hea
                 raise ValueError(metadata_error)
             record = records.get(path)
             if record is None:
+                if path == kamp.TARGET:
+                    current = _verified(files, path)
+                    baseline = kamp.transform(current.data, False, current.original)
+                    value.update(available=True, files={path: baseline})
+                    continue
                 if header_fallback and _commented(files, path):
                     from .stock_recovery import header_plan
                     value.update(header_plan(files, path, stock, identity=identity))

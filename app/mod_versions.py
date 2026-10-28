@@ -3,7 +3,7 @@ import difflib
 import json
 import re
 
-from . import fluidd_categories, fluidd_screws, mesh, mesh_temperature, mod_comments, mods, screws, smoothing, storage, warmup
+from . import fluidd_categories, fluidd_screws, kamp, mesh, mesh_temperature, mod_comments, mods, pa, screws, smoothing, storage, warmup
 
 TARGET = storage.RECORDS
 ORIGINAL = storage.original(TARGET)
@@ -17,12 +17,14 @@ HELPER_CONFIG_REVISION = "0.1.15"
 VERSIONS = {module: "0.1.16" for module in
             (mods.TARGET, mesh.TARGET, mesh_temperature.TARGET, screws.PYTHON, smoothing.TARGET, warmup.TARGET)}
 VERSIONS[screws.PYTHON] = "0.1.17"
-MODULES = {module.TARGET: module for module in (mods, mesh, mesh_temperature, smoothing, warmup)}
+VERSIONS[kamp.TARGET] = "0.1.18"
+VERSIONS[pa.TARGET] = "0.1.18"
+MODULES = {module.TARGET: module for module in (mods, mesh, mesh_temperature, smoothing, warmup, kamp, pa)}
 # Every mod must declare its complete file scope before it can be applied.
-FILES = {path: (path,) for path in MODULES}
+FILES = {path: tuple(getattr(module, "FILES", (path,))) for path, module in MODULES.items()}
 FILES[screws.PYTHON] = (mesh.TARGET, screws.PYTHON, screws.CONFIG, fluidd_screws.TARGET)
 FILES[smoothing.TARGET] = (smoothing.TARGET, smoothing.HOMING.TARGET)
-ADDED_FILES = {path: () for path in MODULES}
+ADDED_FILES = {path: tuple(getattr(module, "ADDED_FILES", ())) for path, module in MODULES.items()}
 ADDED_FILES[screws.PYTHON] = (screws.PYTHON, screws.CONFIG)
 
 
@@ -61,7 +63,8 @@ def require_registered(choices):
         if (not filenames or len(set(filenames)) != len(filenames)
                 or not set(ADDED_FILES[path]).issubset(filenames)
                 or any(not isinstance(filename, str) or not filename.startswith("/") for filename in filenames)
-                or (path in MODULES and (path not in filenames or ADDED_FILES[path]))):
+                or (path in MODULES and (path not in filenames
+                    or tuple(ADDED_FILES[path]) != tuple(getattr(MODULES[path], "ADDED_FILES", ()))))):
             raise ValueError("Invalid registered mod uninstall file scope.")
 
 
@@ -73,6 +76,90 @@ def validate_changes(changes):
                 or not isinstance(change["before"], str) or not isinstance(change["after"], str)
                 or not change["after"] or change["before"] == change["after"]):
             raise ValueError("Invalid mod undo text.")
+
+
+def validate_binary_undo(operation):
+    if (not isinstance(operation, dict) or set(operation) != {"size", "changes"}
+            or type(operation["size"]) is not int or not 1 <= operation["size"] <= 2 * 1024 * 1024
+            or not isinstance(operation["changes"], list) or not 1 <= len(operation["changes"]) <= 64):
+        raise ValueError("Invalid binary uninstall instructions.")
+    end = 0
+    for change in operation["changes"]:
+        if (not isinstance(change, dict) or set(change) != {"offset", "before", "after"}
+                or type(change["offset"]) is not int or change["offset"] < end
+                or any(not isinstance(change[key], str) or not re.fullmatch(r"(?:[0-9a-f]{2})+", change[key])
+                       for key in ("before", "after"))
+                or len(change["before"]) != len(change["after"]) or change["before"] == change["after"]):
+            raise ValueError("Invalid binary uninstall byte range.")
+        end = change["offset"] + len(change["after"]) // 2
+        if end > operation["size"]:
+            raise ValueError("A binary uninstall byte range is outside its file.")
+
+
+def validate_entry(value):
+    if isinstance(value, dict) and set(value) == {"undo"}:
+        validate_changes(value["undo"])
+    elif isinstance(value, dict) and set(value) == {"binary_undo"}:
+        validate_binary_undo(value["binary_undo"])
+    else:
+        raise ValueError("Invalid existing-file uninstall instructions.")
+
+
+def validate_created_binary(value):
+    if (not isinstance(value, dict) or set(value) != {"sha256", "size"}
+            or not isinstance(value["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])
+            or type(value["size"]) is not int or not 52 <= value["size"] <= 2 * 1024 * 1024):
+        raise ValueError("Invalid added-binary ownership record.")
+
+
+def binary_created(data):
+    """Record an added ARM shared library without storing executable contents."""
+    if (not isinstance(data, bytes) or not 52 <= len(data) <= 2 * 1024 * 1024
+            or data[:7] != b"\x7fELF\x01\x01\x01" or data[16:20] != b"\x03\x00\x28\x00"):
+        raise ValueError("An added native helper must be a supported ARM shared library.")
+    return {"sha256": mods.digest(data), "size": len(data)}
+
+
+def created_binary_matches(data, recorded):
+    validate_created_binary(recorded)
+    return isinstance(data, bytes) and len(data) == recorded["size"] and mods.digest(data) == recorded["sha256"]
+
+
+def entry(record):
+    result = {key: record[key] for key in ("undo", "binary_undo") if key in record}
+    validate_entry(result)
+    return result
+
+
+def undo_binary(data, operation, *, allow_original=False):
+    validate_binary_undo(operation)
+    if not isinstance(data, bytes) or len(data) != operation["size"]:
+        raise ValueError("The binary file size differs from its uninstall record.")
+    result = bytearray(data)
+    for change in operation["changes"]:
+        offset = change["offset"]
+        before, after = bytes.fromhex(change["before"]), bytes.fromhex(change["after"])
+        present = data[offset:offset + len(after)]
+        if present == after:
+            result[offset:offset + len(after)] = before
+        elif not allow_original or present != before:
+            raise ValueError("The binary mod byte range differs from its uninstall record.")
+    return bytes(result)
+
+
+def binary_changes(before, after):
+    if not isinstance(before, bytes) or not isinstance(after, bytes) or len(before) != len(after):
+        raise ValueError("Binary edits must preserve the file size.")
+    changes, start = [], None
+    for offset, (old, new) in enumerate(zip(before, after)):
+        if old != new and start is None:
+            start = offset
+        elif old == new and start is not None:
+            changes.append({"offset": start, "before": before[start:offset].hex(), "after": after[start:offset].hex()})
+            start = None
+    if start is not None:
+        changes.append({"offset": start, "before": before[start:].hex(), "after": after[start:].hex()})
+    return changes
 
 
 def version(value):
@@ -103,7 +190,7 @@ def discovery_scope(path, record):
     _unknown_record(path, record)
     if isinstance(record.get("files"), dict) and record["files"] and "undo" not in record:
         scope = tuple(record["files"])
-    elif "undo" in record and "files" not in record:
+    elif ("undo" in record or "binary_undo" in record) and "files" not in record:
         scope = (path,)
     else:
         raise ValueError("The unknown mod's file ownership could not be determined: " + path)
@@ -124,19 +211,21 @@ def _unknown_scope(path, record):
     if "fluidd_category" in record:
         fluidd_categories.validate_record(record["fluidd_category"])
         optional.add("fluidd_category")
-    if set(record) == {"version", "undo"} | optional:
-        validate_changes(record["undo"])
+    if set(record) in ({"version", "undo"} | optional, {"version", "binary_undo"} | optional):
+        entry(record)
         scope = (path,)
     elif set(record) == {"version", "files"} | optional:
         files = record["files"]
         if not isinstance(files, dict) or not 1 <= len(files) <= 64:
             raise ValueError("Invalid unknown mod file scope.")
         scope = tuple(files)
-        for entry in files.values():
-            if isinstance(entry, dict) and set(entry) == {"undo"}:
-                validate_changes(entry["undo"])
-            elif (not isinstance(entry, dict) or set(entry) != {"created"}
-                    or not isinstance(entry["created"], str) or not entry["created"]):
+        for owned in files.values():
+            if isinstance(owned, dict) and set(owned) in ({"undo"}, {"binary_undo"}):
+                validate_entry(owned)
+            elif isinstance(owned, dict) and set(owned) == {"created_binary"}:
+                validate_created_binary(owned["created_binary"])
+            elif (not isinstance(owned, dict) or set(owned) != {"created"}
+                    or not isinstance(owned["created"], str) or not owned["created"]):
                 raise ValueError("Invalid unknown mod file uninstall operation.")
     else:
         raise ValueError("Invalid unknown mod uninstall record.")
@@ -145,7 +234,10 @@ def _unknown_scope(path, record):
     for filename in scope:
         # Existing backup naming also validates normalization and file types.
         storage.original(filename)
-        if (not filename.startswith(roots) or filename == storage.LEGACY_RECORDS
+        owned = record["files"][filename] if "files" in record else entry(record)
+        if "created_binary" in owned and not filename.endswith(".so"):
+            raise ValueError("Added-binary ownership requires a native helper path.")
+        if ((not filename.startswith(roots) and filename not in (pa.TARGET, pa.LIBRARY)) or filename == storage.LEGACY_RECORDS
                 or ".Original.txt" in filename or "/__pycache__/" in filename
                 or any(ord(char) < 32 or ord(char) == 127 for char in filename)):
             raise ValueError("Unknown mod references an unsupported working file: " + filename)
@@ -185,9 +277,10 @@ def load(data):
             fluidd_categories.validate_record(record["fluidd_category"])
             optional.add("fluidd_category")
         if len(FILES[path]) == 1:
-            if set(record) != {"version", "undo"} | optional:
+            operation = "binary_undo" if getattr(MODULES.get(path), "BINARY", False) else "undo"
+            if set(record) != {"version", operation} | optional:
                 raise ValueError("Invalid single-file mod record.")
-            validate_changes(record["undo"])
+            validate_entry({operation: record[operation]})
         else:
             files = record.get("files")
             if set(record) != {"version", "files"} | optional or not isinstance(files, dict):
@@ -198,10 +291,12 @@ def load(data):
                 if not isinstance(entry, dict):
                     raise ValueError("Invalid mod file record.")
                 if set(entry) == {"created"}:
-                    if not isinstance(entry["created"], str) or not entry["created"] or filename not in added:
+                    if not isinstance(entry["created"], str) or not entry["created"] or filename not in added or filename.endswith(".so"):
                         raise ValueError("Invalid added-file uninstall record.")
-                elif set(entry) == {"undo"} and filename not in added:
-                    validate_changes(entry["undo"])
+                elif set(entry) == {"created_binary"} and filename in added and filename.endswith(".so"):
+                    validate_created_binary(entry["created_binary"])
+                elif set(entry) in ({"undo"}, {"binary_undo"}) and filename not in added:
+                    validate_entry(entry)
                 else:
                     raise ValueError("Invalid mod file uninstall operation.")
     return records
@@ -216,6 +311,8 @@ def dump(records):
 def undo(data, record):
     # Exact, unique text matching prevents number concatenation and prevents
     # overwriting manual edits within the recorded owned regions.
+    if "binary_undo" in record:
+        return undo_binary(data, record["binary_undo"])
     text = data.decode("utf-8")
     for change in reversed(record["undo"]):
         matches = text.count(change["after"])
@@ -266,7 +363,11 @@ def undo_files(path, current, record):
     result = {}
     for filename, entry in record["files"].items():
         data = current[filename]
-        if "created" in entry:
+        if "created_binary" in entry:
+            if data is not None and not created_binary_matches(data, entry["created_binary"]):
+                raise ValueError("An added native helper differs from its uninstall record: " + filename)
+            result[filename] = None
+        elif "created" in entry:
             if not created_matches(data, entry["created"], path):
                 raise ValueError("An added mod file differs from its uninstall record: " + filename)
             result[filename] = None
@@ -290,19 +391,21 @@ def preserve_shared_changes(before, after, records, selected):
                 raise ValueError("Cannot verify files owned by the unknown mod: " + owner) from None
             continue
         for path in changed.intersection(scope):
-            entry = record["files"][path] if "files" in record else {"undo": record.get("undo")}
+            owned = record["files"][path] if "files" in record else entry(record)
             if owner not in VERSIONS:
-                if isinstance(entry, dict) and set(entry) == {"undo"}:
-                    validate_changes(entry["undo"])
-                elif (not isinstance(entry, dict) or set(entry) != {"created"}
-                        or not isinstance(entry["created"], str) or not entry["created"]):
+                if isinstance(owned, dict) and set(owned) in ({"undo"}, {"binary_undo"}):
+                    validate_entry(owned)
+                elif isinstance(owned, dict) and set(owned) == {"created_binary"}:
+                    validate_created_binary(owned["created_binary"])
+                elif (not isinstance(owned, dict) or set(owned) != {"created"}
+                        or not isinstance(owned["created"], str) or not owned["created"]):
                     raise ValueError("Cannot verify the unknown mod's ownership of: " + path)
-            if "created" in entry:
+            if "created" in owned or "created_binary" in owned:
                 raise ValueError("Another mod owns the file being changed: " + path)
             if not isinstance(before.get(path), bytes) or not isinstance(after[path], bytes):
                 raise ValueError("Another mod owns the file being changed: " + path)
-            undo(before[path], entry)
-            undo(after[path], entry)
+            undo(before[path], owned)
+            undo(after[path], owned)
 
 
 def capture_files(path, baseline, enabled, replacements, *, firmware=None):
@@ -315,7 +418,14 @@ def capture_files(path, baseline, enabled, replacements, *, firmware=None):
         if before is None:
             if after is None:
                 raise ValueError("An added mod file has no installed content.")
-            files[filename] = {"created": after.decode("utf-8")}
+            if filename not in ADDED_FILES[path]:
+                raise ValueError("A file may only be created within its registered added-file scope.")
+            files[filename] = ({"created_binary": binary_created(after)} if filename.endswith(".so")
+                               else {"created": after.decode("utf-8")})
+        elif filename.endswith(".so"):
+            operation = {"size": len(before), "changes": binary_changes(before, after)}
+            validate_binary_undo(operation)
+            files[filename] = {"binary_undo": operation}
         else:
             body = [{"before": old, "after": new} for old, new in replacements[filename]]
             files[filename] = {"undo": body + _header_change(path, before, after)}
@@ -331,7 +441,10 @@ def capture(path, baseline, enabled, *, firmware=None):
     require_registered({path: True})
     if len(FILES[path]) != 1:
         raise ValueError("A multi-file mod requires an uninstall record for every affected file.")
-    result = {"version": VERSIONS[path], "undo": capture_changes(path, baseline, enabled)}
+    operation = ({"binary_undo": MODULES[path].capture(baseline, enabled)}
+                 if getattr(MODULES.get(path), "BINARY", False)
+                 else {"undo": capture_changes(path, baseline, enabled)})
+    result = {"version": VERSIONS[path], **operation}
     if firmware is not None:
         result["firmware"] = validate_firmware(firmware)
     load(dump({path: result}))

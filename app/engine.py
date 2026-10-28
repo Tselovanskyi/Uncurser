@@ -14,7 +14,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 
-from . import fluidd_categories, fluidd_screws, mesh, mesh_temperature, mod_comments, mod_versions, mods, network, recovery, screws, smoothing, stock, storage, warmup
+from . import fluidd_categories, fluidd_screws, kamp, mesh, mesh_temperature, mod_comments, mod_versions, mods, network, pa, recovery, screws, smoothing, stock, storage, warmup
 from .remote import APPLY_BATCH, CONFIG_TREE, Remote
 
 
@@ -78,6 +78,10 @@ class Snapshot:
     fluidd_macros: dict | None = None
     fluidd_error: str = ""
     recovery_cleanup: tuple = ()
+    kamp: MeshSnapshot | None = None
+    pa: MeshSnapshot | None = None
+    pa_library: MeshSnapshot | None = None
+    pa_dependencies: dict = field(default_factory=dict)
 
 
 def version_snapshot(snapshot):
@@ -161,7 +165,7 @@ def version_details(snapshot, path):
             return "v" + record["version"]
         headers = [stamp for filename in mod_versions.FILES[path]
                    for value in (file_snapshot(snapshot, filename),) if value and value.data is not None
-                   for owner, stamp in mod_comments.read(value.data).items() if owner == path]
+                   for owner, stamp in ({} if filename.endswith(".so") else mod_comments.read(value.data)).items() if owner == path]
         if headers and all(stamp == headers[0] for stamp in headers):
             return "v" + headers[0]["version"]
         value = mod_snapshot(snapshot, path)
@@ -196,7 +200,7 @@ def update_statuses(snapshot):
                     # Local builds can share a revision; verify the installed
                     # implementation as well as its version and macro category.
                     status["needed"] |= any(not screws.recognized(filename, entry["created"].encode())
-                        for filename, entry in record["files"].items() if "created" in entry)
+                        for filename, entry in record["files"].items() if "created" in entry or "created_binary" in entry)
                 if revision > current:
                     raise ValueError("This mod was installed by a newer app; use that app or Restore original.")
             elif value and value.analysis.get("enabled") is True and value.analysis.get("known"):
@@ -232,6 +236,8 @@ def update_statuses(snapshot):
                 capture_helper(helper_baseline(snapshot), helper_current(snapshot))
             elif path == smoothing.TARGET:
                 capture_homing(homing_baseline(snapshot), homing_current(snapshot))
+            elif path == pa.TARGET:
+                capture_pa(pa_baseline(snapshot), pa_current(snapshot))
             else:
                 if not value.analysis.get("patchable"):
                     raise ValueError(value.analysis.get("reason") or "The installed mod code cannot be enrolled safely.")
@@ -301,6 +307,8 @@ def automatic_updates(snapshot, choices):
                     capture_helper(helper_baseline(snapshot), helper_current(snapshot))
                 elif path == smoothing.TARGET:
                     capture_homing(homing_baseline(snapshot), homing_current(snapshot))
+                elif path == pa.TARGET:
+                    capture_pa(pa_baseline(snapshot), pa_current(snapshot))
                 else:
                     baseline = mod_versions.disabled(path, value.data, value.original)
                     mod_versions.capture(path, baseline, value.data)
@@ -469,6 +477,12 @@ def scan_config(remote, module, tree):
             except ValueError as error:
                 analysis = {**analysis, "known": False, "patchable": False, "label": "Conflict", "reason": str(error),
                             "include_error": str(error)}
+            if module is mesh and not analysis.get("include_error"):
+                try:
+                    mesh.validate_dependencies(data, included)
+                except ValueError as error:
+                    analysis = {**analysis, "patchable": False, "label": "Conflict", "reason": str(error),
+                                "dependency_error": str(error)}
         except (ValueError, RuntimeError, OSError) as error:
             analysis = {"known": False, "enabled": None, "patchable": False,
                         "label": "Unavailable", "reason": str(error), "include_error": str(error)}
@@ -496,7 +510,10 @@ def scan_homing(remote, module=smoothing.HOMING):
                         or meta.get("absent", False) is not False
                         or any(not isinstance(meta.get(key), int) for key in ("mode", "uid", "gid"))):
                     raise ValueError("The original homing module backup is damaged.")
-                ast.parse(original["data"].decode("utf-8"))
+                if getattr(module, "BINARY", False):
+                    module.validate(original["data"])
+                else:
+                    ast.parse(original["data"].decode("utf-8"))
                 identity = original_identity(meta)
             except (ValueError, SyntaxError, AttributeError, UnicodeError) as error:
                 backup_error = str(error)
@@ -520,6 +537,10 @@ def scan_paths():
         paths.extend((module.TARGET, module.ORIGINAL, module.MANIFEST))
     paths.extend((smoothing.HOMING.TARGET, smoothing.HOMING.ORIGINAL, smoothing.HOMING.MANIFEST))
     paths.extend((warmup.TARGET, warmup.ORIGINAL, warmup.MANIFEST))
+    paths.extend((kamp.TARGET, kamp.ORIGINAL, kamp.MANIFEST))
+    for path in pa.FILES:
+        paths.extend((path, storage.original(path), storage.original(path) + ".json"))
+    paths.extend(pa.DEPENDENCIES)
     for module in screws.SCAN_FILES:
         paths.extend((module.TARGET, module.ORIGINAL, module.MANIFEST))
     paths.append(fluidd_screws.INDEX)
@@ -575,6 +596,23 @@ def scan_recorded_file(remote, path):
                        module.MANIFEST: manifest["sha256"] if manifest else None}, original_identity=identity)
 
 
+def scan_pa(remote):
+    source = scan_homing(remote, pa)
+    library = scan_recorded_file(remote, pa.LIBRARY)
+    dependencies = {}
+    for path in pa.DEPENDENCIES:
+        current = remote.read(path)
+        dependencies[path] = current["data"] if current else None
+        source.guards[path] = current["sha256"] if current else None
+    state = pa.inspect_files({pa.TARGET: source.data, pa.LIBRARY: library.data},
+                             {pa.TARGET: source.original, pa.LIBRARY: library.original}, dependencies)
+    source.analysis = dict(state)
+    library.analysis = dict(state)
+    if library.data is None:
+        library.analysis.update(enabled=False, label="Not installed")
+    return source, library, dependencies
+
+
 def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods=(), unknown_paths=()):
     progress("Reading current printer files…")
     with Remote(connection, known_hosts) as remote:
@@ -610,11 +648,13 @@ def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods
         smoothing_snapshot = scan_config(remote, smoothing, tree)
         homing_snapshot = scan_homing(remote)
         warmup_snapshot = scan_homing(remote, warmup)
+        kamp_snapshot = scan_homing(remote, kamp)
+        pa_snapshot, pa_library, pa_dependencies = scan_pa(remote)
         screws_snapshot = scan_screws(remote, mesh_snapshot, tree)
         versions_snapshot = scan_versions(remote)
         records = mod_versions.load(versions_snapshot.data) if versions_snapshot.analysis["known"] else {}
         known_paths = {mods.TARGET, mesh.TARGET, mesh_temperature.TARGET, smoothing.TARGET,
-                       smoothing.HOMING.TARGET, warmup.TARGET, *(module.TARGET for module in screws.SCAN_FILES),
+                       smoothing.HOMING.TARGET, warmup.TARGET, kamp.TARGET, *pa.FILES, *(module.TARGET for module in screws.SCAN_FILES),
                        *(module.TARGET for module in fluidd_screws.FILES)}
         scopes = record_scopes(records, strict=True)
         extra_paths = set(unknown_paths) | {filename for owner, scope in scopes.items()
@@ -638,21 +678,30 @@ def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods
         # Stock data is a recovery source, never a replacement for originals.
         values = {mesh.TARGET: mesh_snapshot, mesh_temperature.TARGET: temperature_snapshot,
                   smoothing.TARGET: smoothing_snapshot, smoothing.HOMING.TARGET: homing_snapshot,
-                  warmup.TARGET: warmup_snapshot,
+                  warmup.TARGET: warmup_snapshot, kamp.TARGET: kamp_snapshot,
+                  pa.TARGET: pa_snapshot, pa.LIBRARY: pa_library,
                   **(screws_snapshot.files if screws_snapshot else {}),
                   **(screws_snapshot.frontend if screws_snapshot else {})}
         values.update(unknown_files)
+        from . import removal
+        pa_recovery = bool((pa.TARGET in records or pa_snapshot.analysis.get("present"))
+            and (pa.TARGET not in records or removal.pa_incomplete(values, records[pa.TARGET])))
         missing_proof = versions_snapshot.data is None or bool(versions_snapshot.backup_error) or any(
             (original is None if filename == mods.TARGET else
-             values.get(filename) is None or values[filename].original is None)
+             values.get(filename) is None or bool(values[filename].backup_error)
+             or (values[filename].original is None and not (
+                 values[filename].original_absent
+                 and values[filename].original_hash == mods.digest(b"")
+                 and values[filename].original_identity == network.device_identity(state))))
             for path, record in records.items() for filename in (scopes.get(path) or ()))
         changed_firmware = any(record.get("firmware") != network.device_identity(state)[1]
                                for record in records.values())
         added_paths = {filename for owner, record in records.items()
                        if owner not in mod_versions.VERSIONS and scopes.get(owner) is not None
-                       for filename, entry in record.get("files", {}).items() if "created" in entry}
+                       for filename, entry in record.get("files", {}).items()
+                       if "created" in entry or "created_binary" in entry}
         if (network.device_identity(state)[0] == "F008"
-                and (missing_proof or changed_firmware or network.is_untested(state)
+                and (missing_proof or changed_firmware or pa_recovery or network.is_untested(state)
                      or added_paths or any(pair.get("reason", "obsolete") != "obsolete" for pair in storage_cleanup))):
             progress("Checking stock firmware recovery files…")
             stock_snapshot = stock.scan(remote, state, **({"extra_paths": tuple(sorted(added_paths))} if added_paths else {}))
@@ -686,7 +735,8 @@ def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods
                     recovery=recovery.inspect(state, *recovery_files), storage_moves=storage_moves,
                     original_identity=original_source, stock=stock_snapshot, storage_cleanup=storage_cleanup,
                     unknown_files=unknown_files, ignored_mods=tuple(ignored_mods), warmup=warmup_snapshot,
-                    fluidd_macros=macro_preferences, fluidd_error=macro_error)
+                    fluidd_macros=macro_preferences, fluidd_error=macro_error, kamp=kamp_snapshot,
+                    pa=pa_snapshot, pa_library=pa_library, pa_dependencies=pa_dependencies)
     result.storage_error = "\n".join(dict.fromkeys(
         value.backup_error for module, value in file_entries(result) if value and value.backup_error
         and module.TARGET not in result.unknown_files
@@ -695,10 +745,10 @@ def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods
         result.storage_error = result.storage_error or versions_snapshot.analysis["reason"]
     if versions_snapshot.analysis["known"]:
         for path, record in installed_records(result).items():
-            if path not in mod_versions.VERSIONS or path in (screws.PYTHON, smoothing.TARGET):
+            if path not in mod_versions.VERSIONS or path in (screws.PYTHON, smoothing.TARGET, pa.TARGET):
                 continue
             value = file_snapshot(result, path)
-            if value.analysis.get("include_error"):
+            if value.analysis.get("include_error") or value.analysis.get("dependency_error"):
                 continue
             try:
                 baseline = mod_versions.undo(value.data, record)
@@ -732,6 +782,32 @@ def scan(connection, known_hosts, progress=lambda message: None, *, ignored_mods
                 for value in (result.smoothing, result.homing):
                     value.analysis = {"known": False, "enabled": None, "patchable": False,
                                       "label": "Conflict", "reason": str(error)}
+        pa_record = installed_records(result).get(pa.TARGET)
+        if pa_record and result.pa and result.pa_library:
+            try:
+                baseline = pa_baseline(result, pa_record)
+                original = {pa.TARGET: result.pa.original, pa.LIBRARY: None}
+                state = pa.inspect_files(baseline, original, result.pa_dependencies)
+                # The saved uninstall instructions verify installed code and
+                # helper bytes, including older revisions. The current
+                # implementation only needs to accept their cleaned baseline.
+                complete = result.pa.data is not None and result.pa_library.data is not None
+                if state.get("patchable"):
+                    pa.transform_files(baseline, True, original, result.pa_dependencies)
+                newer = mod_versions.version(pa_record["version"]) > mod_versions.version(mod_versions.VERSIONS[pa.TARGET])
+                state.update(enabled=True if complete else None, present=True, partial=not complete,
+                    known=bool(state.get("known") and complete),
+                    patchable=bool(state.get("patchable") and complete and not newer),
+                    label="Uncursed" if complete and state.get("known") else "Unknown + Uncursed" if complete else "Incomplete",
+                    reason="This mod was installed by a newer app." if newer else
+                           "The PA native helper is missing." if not complete else state.get("reason", ""))
+                result.pa.analysis = dict(state)
+                result.pa_library.analysis = dict(state)
+                if result.pa_library.data is None:
+                    result.pa_library.analysis.update(enabled=False, label="Not installed")
+            except (ValueError, SyntaxError, TypeError, AttributeError, UnicodeError) as error:
+                result.pa.analysis = {"known": False, "enabled": None, "patchable": False,
+                                      "label": "Conflict", "reason": str(error), "present": True}
         helper_record = installed_records(result).get(screws.PYTHON)
         if helper_record and result.screws:
             try:
@@ -785,6 +861,9 @@ def prepare_mesh(snapshot, desired, restore=False, full_risk=False, module=mesh)
     if restore:
         if snapshot.original is None:
             raise ValueError("There is no initial " + filename + " backup on the printer.")
+        if getattr(module, "BINARY", False):
+            module.validate(snapshot.original)
+            return snapshot.original
         regular, _ = mesh.split(snapshot.original)
         _, generated = mesh.split(snapshot.data)
         mesh.parser(regular)
@@ -801,7 +880,8 @@ def prepare_mesh(snapshot, desired, restore=False, full_risk=False, module=mesh)
 
 def file_entries(snapshot):
     return ((mods, snapshot), (mesh, snapshot.mesh), (mesh_temperature, snapshot.mesh_temperature),
-            (smoothing, snapshot.smoothing), (smoothing.HOMING, snapshot.homing), (warmup, snapshot.warmup)) + tuple(
+            (smoothing, snapshot.smoothing), (smoothing.HOMING, snapshot.homing), (warmup, snapshot.warmup), (kamp, snapshot.kamp),
+            (pa, snapshot.pa), (recorded_file(pa.LIBRARY), snapshot.pa_library)) + tuple(
         (module, snapshot.screws.files[module.TARGET]) for module in screws.SCAN_FILES
         if snapshot.screws and module.TARGET in snapshot.screws.files) + tuple(
         (module, snapshot.screws.frontend[module.TARGET]) for module in fluidd_screws.FILES
@@ -936,9 +1016,16 @@ def firmware_issues(snapshot, *, removals=None):
             continue
         invalid_backup = bool(damaged.intersection(mod_versions.FILES[path])) or (path == screws.PYTHON and screws.LEGACY_CONFIG in damaged)
         obsolete_backup = bool(obsolete.intersection(mod_versions.FILES[path])) or (path == screws.PYTHON and screws.LEGACY_CONFIG in obsolete)
-        if status["present"] and (installed != current or invalid_backup or obsolete_backup or status.get("header")):
+        missing_pa_proof = bool(path == pa.TARGET and path in records and (
+            snapshot.pa is None or snapshot.pa.original is None or snapshot.pa.original_hash is None
+            or snapshot.pa_library is None or not snapshot.pa_library.original_absent
+            or snapshot.pa_library.original_hash != mods.digest(b"")))
+        if status["present"] and (installed != current or invalid_backup or obsolete_backup or missing_pa_proof
+                                  or status.get("header") or status.get("incomplete")):
             result[path] = {**status, "installed_firmware": installed, "current_firmware": current,
-                            "firmware_reason": ("Its original backup is damaged or incomplete." if invalid_backup else
+                            "firmware_reason": ("Its installed files are incomplete." if status.get("incomplete") else
+                                                "Its original backup is damaged or incomplete." if invalid_backup else
+                                                "Its original backup or absence proof is missing." if missing_pa_proof else
                                                 "Its uninstall record is missing." if status.get("header") and installed == current else
                                                 "Installed firmware is unknown." if installed is None else
                                                 "Installed on firmware " + installed + "; current firmware is " + current + "." if installed != current else
@@ -1017,6 +1104,11 @@ def require_apply_policy(status, choices, restore=False, update=False):
 def mod_snapshot(snapshot, path):
     if path == screws.PYTHON:
         return snapshot.screws
+    if path == pa.TARGET:
+        if snapshot.pa is None or snapshot.pa_library is None:
+            return None
+        return replace(snapshot.pa, backup_error=" ".join(value.backup_error for value in
+            (snapshot.pa, snapshot.pa_library) if value.backup_error))
     if path != smoothing.TARGET:
         return file_snapshot(snapshot, path)
     if snapshot.smoothing is None or snapshot.homing is None:
@@ -1064,6 +1156,31 @@ def capture_homing(baseline, enabled, *, firmware=None):
              mod_versions.capture_changes(path, mod_comments.strip(baseline[path]), mod_comments.strip(enabled[path]))]
              for path in mod_versions.FILES[smoothing.TARGET]}
     return mod_versions.capture_files(smoothing.TARGET, baseline, enabled, pairs, firmware=firmware)
+
+
+def pa_current(snapshot):
+    if snapshot.pa is None or snapshot.pa_library is None:
+        raise ValueError("Scan both Adaptive PA mod files before changing it.")
+    return {path: file_snapshot(snapshot, path).data for path in pa.FILES}
+
+
+def pa_baseline(snapshot, record=None):
+    current = pa_current(snapshot)
+    source, library = snapshot.pa, snapshot.pa_library
+    for value in (source, library):
+        if value.backup_error:
+            raise ValueError("The Adaptive PA original backups need attention: " + value.backup_error)
+    if record:
+        if source.original is None or not library.original_absent or library.original_hash != mods.digest(b""):
+            raise ValueError("The Adaptive PA original backup or helper absence proof is missing.")
+        return mod_versions.undo_files(pa.TARGET, current, record)
+    return pa.transform_files(current, False, {pa.TARGET: source.original, pa.LIBRARY: library.original})
+
+
+def capture_pa(baseline, enabled, *, firmware=None):
+    replacements = {pa.TARGET: [(change["before"], change["after"]) for change in
+        pa.replacements(mod_comments.strip(baseline[pa.TARGET]), mod_comments.strip(enabled[pa.TARGET]))]}
+    return mod_versions.capture_files(pa.TARGET, baseline, enabled, replacements, firmware=firmware)
 
 
 def helper_scope(snapshot, record=None):
@@ -1114,6 +1231,8 @@ def record_baseline(snapshot, path, record):
         return helper_baseline(snapshot, record)
     if path == smoothing.TARGET:
         return homing_baseline(snapshot, record)
+    if path == pa.TARGET:
+        return pa_baseline(snapshot, record)
     return mod_versions.undo(file_snapshot(snapshot, path).data, record)
 
 
@@ -1163,7 +1282,7 @@ def category_difference(change):
 
 
 def inspect_helper_baseline(snapshot, baseline, tree):
-    if isinstance(tree, Exception) or snapshot.mesh.analysis.get("include_error"):
+    if isinstance(tree, Exception):
         raise ValueError("The helper's active configuration includes need attention.")
     included = {path: base64.b64decode(value["data"]) for path, value in tree["files"].items()}
     active = screws.screws_include_path(mesh.split(snapshot.mesh.data)[0])
@@ -1257,6 +1376,13 @@ def restorable(snapshot, full_risk=False):
         # A partial restore must not leave half this mod installed or discard
         # the recorded ownership of a file that could not be restored.
         paths.difference_update(homing_paths)
+    if snapshot.pa is not None and snapshot.pa_library is not None:
+        library = snapshot.pa_library
+        if (pa.TARGET in paths and not library.backup_error and library.original_absent
+                and library.original_hash == mods.digest(b"") and library.original_identity == identity):
+            paths.add(pa.LIBRARY)
+        elif snapshot.pa.analysis.get("enabled") is not False or library.data is not None:
+            paths.difference_update(pa.FILES)
     if snapshot.screws:
         helper = snapshot.screws
         candidates = {path: value for path, value in helper.files.items()
@@ -1329,6 +1455,8 @@ def prepare_versioned(snapshot, path, desired, full_risk=False):
         raise ValueError("The mod's initial original backup is missing or damaged.")
     if value.analysis.get("include_error"):
         raise ValueError(value.analysis["include_error"])
+    if desired and value.analysis.get("dependency_error"):
+        raise ValueError(value.analysis["dependency_error"])
     if not value.analysis.get("known") and not full_risk:
         raise ValueError("This mod affects unknown files. Review compatibility first.")
     if mod_versions.version(record["version"]) > mod_versions.version(mod_versions.VERSIONS[path]):
@@ -1364,6 +1492,32 @@ def prepare_homing(snapshot, desired, full_risk=False, record=None):
     return result
 
 
+def prepare_pa(snapshot, desired, full_risk=False, record=None):
+    value = mod_snapshot(snapshot, pa.TARGET)
+    if value is None:
+        raise ValueError("Scan both Adaptive PA files before changing it.")
+    if value.backup_error:
+        raise ValueError(value.backup_error)
+    if not value.analysis.get("known") and not full_risk:
+        raise ValueError("The Adaptive PA mod affects unknown files. Review compatibility first.")
+    if record and mod_versions.version(record["version"]) > mod_versions.version(mod_versions.VERSIONS[pa.TARGET]):
+        raise ValueError("This mod was installed by a newer app; use that app or Restore original.")
+    if desired:
+        pa.validate_dependencies(snapshot.pa_dependencies)
+        if not value.analysis.get("patchable"):
+            raise ValueError(value.analysis.get("reason") or "The Adaptive PA mod cannot be installed safely.")
+    baseline = pa_baseline(snapshot, record) if record else pa_current(snapshot)
+    if not record and value.analysis.get("enabled") is True:
+        if snapshot.pa.original is None or not snapshot.pa_library.original_absent:
+            raise ValueError("The installed Adaptive PA mod requires its original backups or verified cleanup.")
+        baseline = pa_baseline(snapshot)
+    if desired:
+        return pa.transform_files(baseline, True, {pa.TARGET: snapshot.pa.original,
+                                                  pa.LIBRARY: snapshot.pa_library.original})
+    return baseline if record else pa.transform_files(baseline, False, {
+        pa.TARGET: snapshot.pa.original, pa.LIBRARY: snapshot.pa_library.original})
+
+
 def unknown_record_ids(snapshot):
     data = version_snapshot(snapshot).data
     try:
@@ -1374,9 +1528,10 @@ def unknown_record_ids(snapshot):
         return set()
 
 
-def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=False, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, *, warmup_desired=None, repair_targets=None, unknown_removals=()):
+def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=False, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, *, warmup_desired=None, kamp_desired=None, pa_desired=None, repair_targets=None, unknown_removals=()):
     choices = {mods.TARGET: desired, mesh.TARGET: mesh_desired, mesh_temperature.TARGET: temperature_desired,
-               screws.PYTHON: screws_desired, smoothing.TARGET: smoothing_desired, warmup.TARGET: warmup_desired}
+               screws.PYTHON: screws_desired, smoothing.TARGET: smoothing_desired, warmup.TARGET: warmup_desired,
+               kamp.TARGET: kamp_desired, pa.TARGET: pa_desired}
     mod_versions.require_registered(choices)
     unknown_removals = set(unknown_removals)
     if unknown_removals:
@@ -1446,7 +1601,7 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
                 raise ValueError("Verify this mod's cleanup before reinstalling it: " + path)
     baselines = {}
     for path in touched if not restore else ():
-        if choices[path] is True and path not in (screws.PYTHON, smoothing.TARGET):
+        if choices[path] is True and path not in (screws.PYTHON, smoothing.TARGET, pa.TARGET):
             value = file_snapshot(snapshot, path)
             if value is None:
                 raise ValueError("Scan this mod's files before changing it: " + path)
@@ -1466,6 +1621,19 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
     warmup_desired = choices[warmup.TARGET]
     if warmup_desired is not None or warmup.TARGET in originals:
         results[warmup.TARGET] = snapshot.warmup.original if restore else prepare_versioned(snapshot, warmup.TARGET, warmup_desired, full_risk)
+    kamp_desired = choices[kamp.TARGET]
+    if kamp_desired is not None or kamp.TARGET in originals:
+        results[kamp.TARGET] = (prepare_mesh(snapshot.kamp, None, True, full_risk, kamp) if restore
+                                else prepare_versioned(snapshot, kamp.TARGET, kamp_desired, full_risk))
+    pa_desired = choices[pa.TARGET]
+    if restore and pa.TARGET in originals:
+        results.update({pa.TARGET: snapshot.pa.original, pa.LIBRARY: None})
+    elif pa_desired is not None:
+        pa_record = records.get(pa.TARGET)
+        results.update(prepare_pa(snapshot, pa_desired, full_risk, pa_record))
+        if pa_desired:
+            baselines[pa.TARGET] = (pa_baseline(snapshot, pa_record)
+                if pa_record or snapshot.pa.analysis.get("enabled") is True else pa_current(snapshot))
     if restore:
         if smoothing.TARGET in originals:
             results[smoothing.TARGET] = prepare_mesh(snapshot.smoothing, None, True, full_risk, smoothing)
@@ -1481,6 +1649,8 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
     for path in enrollment - records.keys():
         if path == smoothing.TARGET:
             results.update(homing_current(snapshot))
+        elif path == pa.TARGET:
+            results.update(pa_current(snapshot))
         elif path != screws.PYTHON and not file_snapshot(snapshot, path).analysis.get("legacy"):
             results[path] = file_snapshot(snapshot, path).data
     if screws_desired is not None or screws.PYTHON in originals:
@@ -1534,8 +1704,8 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
     if not restore:
         firmware = network.device_identity(snapshot.status)[1]
         def stamp(data, filename, own=None):
-            if data is None:
-                return None
+            if data is None or filename.endswith(".so"):
+                return data
             for owner, choice in choices.items():
                 if choice is None or filename not in mod_versions.FILES[owner]:
                     continue
@@ -1565,6 +1735,8 @@ def prepare_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=F
                     records[path]["fluidd_category"] = category
                 elif path == smoothing.TARGET:
                     records[path] = capture_homing(baselines[path], {name: results[name] for name in mod_versions.FILES[path]}, firmware=firmware)
+                elif path == pa.TARGET:
+                    records[path] = capture_pa(baselines[path], {name: results[name] for name in pa.FILES}, firmware=firmware)
                 else:
                     records[path] = mod_versions.capture(path, baselines[path], results[path], firmware=firmware)
         ledger = version_snapshot(snapshot)
@@ -1611,11 +1783,12 @@ def storage_plan(snapshot, choices, restore=False, *, cleanup_all=False):
     return deferred_storage_view(view, deferred), tuple(retire), moves
 
 
-def difference_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=False, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, *, warmup_desired=None):
+def difference_all(snapshot, desired, mesh_desired=None, restore=False, full_risk=False, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, *, warmup_desired=None, kamp_desired=None, pa_desired=None):
     choices = {mods.TARGET: desired, mesh.TARGET: mesh_desired, mesh_temperature.TARGET: temperature_desired,
-               screws.PYTHON: screws_desired, smoothing.TARGET: smoothing_desired, warmup.TARGET: warmup_desired}
+               screws.PYTHON: screws_desired, smoothing.TARGET: smoothing_desired, warmup.TARGET: warmup_desired,
+               kamp.TARGET: kamp_desired, pa.TARGET: pa_desired}
     snapshot, retire, pending_moves = storage_plan(snapshot, choices, restore)
-    prepared = prepare_all(snapshot, desired, mesh_desired, restore, full_risk, temperature_desired, screws_desired, update, smoothing_desired, warmup_desired=warmup_desired)
+    prepared = prepare_all(snapshot, desired, mesh_desired, restore, full_risk, temperature_desired, screws_desired, update, smoothing_desired, warmup_desired=warmup_desired, kamp_desired=kamp_desired, pa_desired=pa_desired)
     moves = "".join("Move " + item["source"] + "\n  to " + item["destination"] + "\n" for item in pending_moves)
     deleted = "".join("Delete " + file["path"] + "\n" for pair in retire for file in pair["files"] if file["sha256"] is not None)
     statuses = removal_statuses(snapshot) if not restore and any(c is False for c in choices.values()) else {}
@@ -1631,6 +1804,17 @@ def difference_all(snapshot, desired, mesh_desired=None, restore=False, full_ris
 def file_difference(path, before, after, fromfile, tofile):
     if path == fluidd_screws.TARGET:
         return fluidd_screws.difference(path, before, after, fromfile, tofile)
+    if path.endswith(".so"):
+        if before == after:
+            return ""
+        if before is not None and after is not None and len(before) == len(after):
+            changes = mod_versions.binary_changes(before, after)
+            old = [f"0x{change['offset']:08x}: {change['before']}\n" for change in changes]
+            new = [f"0x{change['offset']:08x}: {change['after']}\n" for change in changes]
+        else:
+            old = [f"Binary: {len(before)} bytes, SHA256 {mods.digest(before)}\n"] if before is not None else []
+            new = [f"Binary: {len(after)} bytes, SHA256 {mods.digest(after)}\n"] if after is not None else []
+        return "".join(difflib.unified_diff(old, new, fromfile=fromfile, tofile=tofile, n=0))
     return "".join(difflib.unified_diff((before or b"").decode().splitlines(True),
         (after or b"").decode().splitlines(True), fromfile=fromfile, tofile=tofile, n=3))
 
@@ -1641,6 +1825,8 @@ def initial_difference(snapshot, path):
         raise ValueError("Scan the printer to load the files for this comparison.")
     owner = screws.PYTHON if path == screws.MOD_ID else path
     def stamp(filename, data):
+        if filename.endswith(".so"):
+            return data
         return mod_comments.put(data, owner, mod_versions.VERSIONS[owner],
                                 network.device_identity(snapshot.status)[1], filename)
     if path == screws.MOD_ID:
@@ -1689,6 +1875,22 @@ def initial_difference(snapshot, path):
                 ("Original " if value.original is not None else "Scanned baseline ") + module.TARGET,
                 "Enabled " + module.TARGET))
         return "".join(diffs) or "The baseline already contains the enabled values.", "Baseline: on-printer original backups, or scanned files before the first Apply."
+    if path == pa.TARGET:
+        value = mod_snapshot(snapshot, path)
+        if value is None:
+            raise ValueError("Both Adaptive PA files have not been scanned yet.")
+        if value.backup_error:
+            raise ValueError(value.backup_error)
+        if snapshot.pa.original is None and value.analysis.get("enabled") is not False:
+            raise ValueError("The original extruder module is missing; the initial changes cannot be reconstructed.")
+        before = {pa.TARGET: snapshot.pa.original if snapshot.pa.original is not None else snapshot.pa.data,
+                  pa.LIBRARY: None}
+        pa.validate_dependencies(snapshot.pa_dependencies)
+        after = pa.transform_files(before, True, before)
+        after = {filename: stamp(filename, data) for filename, data in after.items()}
+        return "".join(file_difference(filename, before[filename], data,
+            "Original " + filename if before[filename] is not None else "/dev/null",
+            "Enabled " + filename) for filename, data in after.items()), "Baseline: on-printer original backup, or scanned files before the first Apply."
     if path == mods.TARGET:
         module, value = mods, snapshot
     elif path == mesh.TARGET:
@@ -1697,6 +1899,8 @@ def initial_difference(snapshot, path):
         module, value = mesh_temperature, snapshot.mesh_temperature
     elif path == warmup.TARGET:
         module, value = warmup, snapshot.warmup
+    elif path == kamp.TARGET:
+        module, value = kamp, snapshot.kamp
     else:
         raise ValueError("Unknown mod file.")
     if value is None:
@@ -1716,8 +1920,7 @@ def initial_difference(snapshot, path):
         baseline = "Baseline: scanned file; no original backup exists yet."
         before_name = "Scanned baseline " + path
     enabled = stamp(path, module.transform(original, True))
-    diff = "".join(difflib.unified_diff(original.decode().splitlines(True), enabled.decode().splitlines(True),
-                                        fromfile=before_name, tofile="Enabled " + path, n=3))
+    diff = file_difference(path, original, enabled, before_name, "Enabled " + path)
     return diff or "The baseline already contains this mod's enabled values; no file changes are needed.", baseline
 
 
@@ -1740,7 +1943,8 @@ def unknown_startup_repair(snapshot, targets):
     try:
         missing = posixpath.normpath(match[1])
         records = installed_records(snapshot, removal=True)
-        owned = any("created" in records[owner].get("files", {}).get(missing, {}) for owner in targets)
+        owned = any(any(key in records[owner].get("files", {}).get(missing, {})
+                        for key in ("created", "created_binary")) for owner in targets)
         value = file_snapshot(snapshot, missing)
         if (not owned or value.data is not None or value.sha256 is not None or value.backup_error
                 or not value.original_absent or value.original_hash != mods.digest(b"")):
@@ -1760,13 +1964,13 @@ def unknown_startup_repair(snapshot, targets):
         return False
 
 
-def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore, full_risk, progress, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None, unknown_removals=(), *, warmup_desired=None, cleanup_recovery=False):
+def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore, full_risk, progress, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None, unknown_removals=(), *, warmup_desired=None, kamp_desired=None, pa_desired=None, cleanup_recovery=False):
     progress("Checking fresh file contents and printer activity…")
     fresh = rescan(connection, known_hosts, scanned, progress)
     if fresh.status is None:
         raise RuntimeError("Cannot verify printer activity: " + fresh.status_error)
-    choices = (desired, mesh_desired, temperature_desired, screws_desired, smoothing_desired, warmup_desired)
-    selected = dict(zip((mods.TARGET, mesh.TARGET, mesh_temperature.TARGET, screws.PYTHON, smoothing.TARGET, warmup.TARGET), choices))
+    choices = (desired, mesh_desired, temperature_desired, screws_desired, smoothing_desired, warmup_desired, kamp_desired, pa_desired)
+    selected = dict(zip((mods.TARGET, mesh.TARGET, mesh_temperature.TARGET, screws.PYTHON, smoothing.TARGET, warmup.TARGET, kamp.TARGET, pa.TARGET), choices))
     selected.update({path: False for path in unknown_removals})
     orphan_copies = ()
     if cleanup_recovery:
@@ -1827,6 +2031,10 @@ def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore,
     scope = {"repair_targets": repair["targets"]} if repair is not None else {}
     if warmup_desired is not None:
         scope["warmup_desired"] = warmup_desired
+    if kamp_desired is not None:
+        scope["kamp_desired"] = kamp_desired
+    if pa_desired is not None:
+        scope["pa_desired"] = pa_desired
     if unknown_removals:
         scope["unknown_removals"] = unknown_removals
     before = prepare_all(scanned, desired, mesh_desired, restore, full_risk, temperature_desired, screws_desired, update, smoothing_desired, **scope)
@@ -1844,7 +2052,7 @@ def apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore,
         old = file_snapshot(scanned, path)
         new = file_snapshot(fresh, path)
         unchanged = (new.sha256 == old.sha256 and new.guards == old.guards) if new.data is None or old.data is None or path in (fluidd_screws.TARGET, mod_versions.TARGET) else (
-            (new.sha256 == old.sha256) if path in fresh.unknown_files or path in (mods.TARGET, screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG, smoothing.HOMING.TARGET, warmup.TARGET) else (
+            (new.sha256 == old.sha256 and (path != pa.TARGET or new.guards == old.guards)) if path.endswith(".so") or path in fresh.unknown_files or path in (mods.TARGET, screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG, smoothing.HOMING.TARGET, warmup.TARGET, pa.TARGET) else (
             mesh.stable_digest(new.data) == mesh.stable_digest(old.data)
             and (new.stable_guards or new.guards) == (old.stable_guards or old.guards)
             and new.patterns == old.patterns))
@@ -1914,13 +2122,29 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
                     "original_absent": getattr(value, "original_absent", False),
                     "reference": module.REFERENCE_HASH, "restore": restore,
                     "kind": "python" if path.endswith(".py") else "json" if path.endswith(".json") else "config"}
+            if path.endswith(".so"):
+                item["kind"] = "binary"
+                if path == pa.LIBRARY and restore and data is None:
+                    # Full Restore uses the immutable absence backup, even
+                    # when the currently installed helper is unrecognized.
+                    pass
+                elif path == pa.LIBRARY:
+                    item["created_binary"] = mod_versions.binary_created(data if data is not None else value.data)
+                    if data is not None and value.data is not None:
+                        item["previous_created_binary"] = mod_versions.binary_created(value.data)
+                elif not restore:
+                    item.update(binary_size=len(value.data), binary_changes=mod_versions.binary_changes(value.data, data))
             if path.endswith(".js") and path in unknown_files and data is not None:
                 item.update(kind="javascript", replacements=[(value.data.decode("utf-8"), data.decode("utf-8"))])
             if path == mesh.TARGET:
                 if screws.screws_include_path(mesh.split(value.data)[0]) is not None:
                     item["may_capture_original"] = False
                 if not restore and (strict_files is None or path in strict_files):
-                    item["settings"] = [[section, key, raw] for (section, key), raw in mesh.Document(data).raw.items()]
+                    old_config = mesh.parser(mesh.split(value.data)[0])
+                    new_config = mesh.parser(mesh.split(data)[0])
+                    if any(old_config.get(section, key, fallback=None) != new_config.get(section, key, fallback=None)
+                           for section, key in mesh.VALUES):
+                        item["settings"] = [[section, key, raw] for (section, key), raw in mesh.Document(data).raw.items()]
             elif path == mesh_temperature.TARGET and not restore and (strict_files is None or path in strict_files):
                 item["settings"] = mesh_temperature.settings(data)
             elif path == smoothing.TARGET and not restore and (strict_files is None or path in strict_files):
@@ -1947,7 +2171,7 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
             items.append(item)
         # Install dependencies before adding the include; remove the include
         # before deleting dependencies. printer.cfg is written once for all mods.
-        helper_paths = (screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG)
+        helper_paths = (screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG, pa.LIBRARY)
         items.sort(key=lambda item: (0 if item["data"] is not None else 2)
                    if item["path"] in helper_paths else 1)
         if unknown_removals:
@@ -2090,9 +2314,13 @@ print(json.dumps(all(token in text for token in ("def check_cancel_running(","de
 
 
 def apply(connection, known_hosts, scanned, desired, restore=False, full_risk=False,
-          progress=lambda message: None, mesh_desired=None, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None, unknown_removals=(), warmup_desired=None, cleanup_recovery=False):
-    require_apply_policy(scanned.status, (desired, mesh_desired, temperature_desired, screws_desired, smoothing_desired, warmup_desired), restore, update)
+          progress=lambda message: None, mesh_desired=None, temperature_desired=None, screws_desired=None, update=False, smoothing_desired=None, retire_old_backups=False, repair=None, unknown_removals=(), warmup_desired=None, cleanup_recovery=False, kamp_desired=None, pa_desired=None):
+    require_apply_policy(scanned.status, (desired, mesh_desired, temperature_desired, screws_desired, smoothing_desired, warmup_desired, kamp_desired, pa_desired), restore, update)
     extra = {"warmup_desired": warmup_desired} if warmup_desired is not None else {}
+    if kamp_desired is not None:
+        extra["kamp_desired"] = kamp_desired
+    if pa_desired is not None:
+        extra["pa_desired"] = pa_desired
     if cleanup_recovery:
         extra["cleanup_recovery"] = True
     return apply_many(connection, known_hosts, scanned, desired, mesh_desired, restore, full_risk,
@@ -2117,6 +2345,10 @@ def fix_issues(connection, known_hosts, scanned, progress=lambda message: None, 
               screws.PYTHON: "screws_desired", smoothing.TARGET: "smoothing_desired"}
     if warmup.TARGET in targets or warmup.TARGET in reinstall_targets:
         fields[warmup.TARGET] = "warmup_desired"
+    if kamp.TARGET in targets or kamp.TARGET in reinstall_targets:
+        fields[kamp.TARGET] = "kamp_desired"
+    if pa.TARGET in targets or pa.TARGET in reinstall_targets:
+        fields[pa.TARGET] = "pa_desired"
     options = {field: False if path in targets else None for path, field in fields.items()}
     extra = {"unknown_removals": tuple(sorted(unknown_removals))} if unknown_removals else {}
     result = apply(connection, known_hosts, scanned, progress=progress, **options, **extra,

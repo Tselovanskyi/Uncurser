@@ -117,7 +117,11 @@ def edit_include(data, enabled):
 
 def inspect(root, files, included, patterns):
     try:
-        active_config = screws_include_path(mesh.split(root.data)[0])
+        mod_comments.read(root.data)
+        regular, generated = mesh.split(root.data)
+        mesh.parser(regular)
+        mesh.generated_parser(generated)
+        active_config = screws_include_path(regular)
         enabled = active_config is not None
         sections = {"screws_tilt_adjust", "gcode_macro BED_SCREW_HELPER", "gcode_macro SCREWS_TILT_CALCULATE",
                     "gcode_macro _ORIGIN_SCREWS_TILT_CALCULATE"}
@@ -141,10 +145,9 @@ def inspect(root, files, included, patterns):
             actual = mod_comments.strip(value.data).replace(b"\r\n", b"\n") if value.data is not None else None
             if actual != expected:
                 raise ValueError("An existing, edited, or incomplete helper needs review: " + path)
-        known = root.analysis["known"]
-        return {"known": known, "enabled": enabled, "patchable": True,
-                "label": "Uncursed" if enabled and known else "Original" if known else "Unknown",
-                "reason": "" if known else "printer.cfg differs from the supported reference."}
+        # This helper owns its include and payloads, not the mesh-speed preset.
+        return {"known": True, "enabled": enabled, "patchable": True,
+                "label": "Uncursed" if enabled else "Original", "reason": ""}
     except (ValueError, UnicodeError) as error:
         return {"known": False, "enabled": None, "patchable": False,
                 "label": "Conflict", "reason": str(error)}

@@ -1,0 +1,8 @@
+{
+  "api": 1,
+  "target": "arm-linux-gnueabihf.2.17",
+  "cpu": "cortex_a7",
+  "size": 3788,
+  "sha256": "692199652c08484ff657304b769d61f8c8054f670662edee87020eef4e4f2dad",
+  "source_sha256": "1da568a57ee9985e6d6912b59e73b0b5640b4cc79a88a92d2436f8d39a6574b3"
+}

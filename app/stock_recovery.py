@@ -4,8 +4,8 @@ import posixpath
 import re
 from dataclasses import replace
 
-from . import (config_blocks, fluidd_screws, mesh, mesh_temperature, mod_comments,
-               mod_versions, mods, screws, smoothing, warmup)
+from . import (config_blocks, fluidd_screws, kamp, mesh, mesh_temperature, mod_comments,
+               mod_versions, mods, pa, screws, smoothing, warmup)
 
 
 def stock_data(stock, path):
@@ -147,9 +147,59 @@ def chamber(files, stock, entries):
     return {path: warmup.transform(data, False, reference)}, state["enabled"]
 
 
-def ui_undo(data, reference, entry):
-    if entry is None:
-        return fluidd_screws.recovery_undo(fluidd_screws.TARGET, data, reference)
+def adaptive_purge(files, stock, entries):
+    path = kamp.TARGET
+    data, reference = current_data(files, path), _baseline(stock, path)
+    if reference is None:
+        raise ValueError("The firmware's probing module is missing.")
+    if data == reference:
+        return {path: data}, False
+    if mods.digest(reference) != kamp.REFERENCE_HASH:
+        raise ValueError("The current firmware's native probing module does not match the verified binary layout.")
+    # Exact module hashes verify every native instruction, including all patch
+    # sites. A comment or a similar firmware filename cannot authorize removal.
+    state = kamp.inspect(data, reference)
+    if kamp.fingerprint(data) != kamp.REFERENCE_HASH or not state.get("present"):
+        raise ValueError(state.get("reason") or "The probing module is not a verified KAMP installation.")
+    return {path: kamp.transform(data, False, reference)}, True
+
+
+def adaptive_pa(files, stock, entries):
+    source, library = pa.TARGET, pa.LIBRARY
+    reference, native_library = _baseline(stock, source), _baseline(stock, library)
+    if reference is None:
+        raise ValueError("The firmware's extruder module is missing.")
+    data = current_data(files, source, absent=True)
+    binary = current_data(files, library, absent=True)
+    result, present = {source: data, library: binary}, False
+    native = pa.inspect(reference, reference)
+    if data is not None and native.get("enabled") is not True:
+        # Saved instructions can uninstall any verified revision. Without them,
+        # only the current implementation's exact owned regions are accepted.
+        entry = entries.get(source)
+        if entry is None:
+            enabled = pa.transform(reference, True, reference)
+            entry = {"undo": pa.replacements(reference, enabled)}
+        else:
+            owned_record(source, data, reference, entry)
+        restored = recorded_undo(data, reference, entry, source)
+        pa.transform(restored, True, reference)
+        result[source], present = restored, restored != data
+    if binary is not None:
+        if native_library is not None:
+            if binary != native_library:
+                raise ValueError("The current firmware supplies a different PA helper; automatic deletion is blocked.")
+        else:
+            entry = entries.get(library, {})
+            identity = entry.get("created_binary") or mod_versions.binary_created(pa.helper_data())
+            if not mod_versions.created_binary_matches(binary, identity):
+                raise ValueError("The PA helper differs from its verified installed contents.")
+            result[library], present = None, True
+    return result, present
+
+
+def recorded_undo(data, reference, entry, owner):
+    """Undo owned regions while accepting ones already restored by firmware."""
     text, stock_text = data.decode("utf-8"), reference.decode("utf-8")
     if text == stock_text:
         return data
@@ -157,16 +207,22 @@ def ui_undo(data, reference, entry):
         before, after = change["before"], change["after"]
         if text.count(after) == 1:
             if (before and stock_text.count(before) != 1) or (not before and after in stock_text):
-                raise ValueError("The stored helper-interface default differs from the current firmware.")
+                raise ValueError("The recorded default differs from the current firmware.")
             text = text.replace(after, before, 1)
-        elif (text.count(after) == 0 and mod_versions.optional_metadata_change(change, screws.PYTHON)
-              and screws.PYTHON not in mod_comments.read(text.encode("utf-8"))):
+        elif (text.count(after) == 0 and mod_versions.optional_metadata_change(change, owner)
+              and owner not in mod_comments.read(text.encode("utf-8"))):
             continue
         elif text.count(after) == 0 and before and text.count(before) == 1 and stock_text.count(before) == 1:
             continue
         else:
-            raise ValueError("The helper interface was edited or is ambiguously incomplete.")
+            raise ValueError("The owned code was edited or is ambiguously incomplete.")
     return text.encode("utf-8")
+
+
+def ui_undo(data, reference, entry):
+    if entry is None:
+        return fluidd_screws.recovery_undo(fluidd_screws.TARGET, data, reference)
+    return recorded_undo(data, reference, entry, screws.PYTHON)
 
 
 def helper(files, stock, entries, *, partial=False):
@@ -232,11 +288,12 @@ def helper(files, stock, entries, *, partial=False):
 
 
 def plan(files, path, stock, record=None):
-    entries = record.get("files", {path: {"undo": record.get("undo", [])}}) if record else {}
+    entries = (record["files"] if "files" in record else {path: mod_versions.entry(record)}) if record else {}
     operation = {mods.TARGET: early, mesh.TARGET: bed_mesh, mesh_temperature.TARGET: temperature,
-                 smoothing.TARGET: homing, screws.PYTHON: helper, warmup.TARGET: chamber}[path]
+                 smoothing.TARGET: homing, screws.PYTHON: helper, warmup.TARGET: chamber,
+                 kamp.TARGET: adaptive_purge, pa.TARGET: adaptive_pa}[path]
     result, present = operation(files, stock, entries)
-    result = {filename: mod_comments.remove(data, path) if data is not None else None
+    result = {filename: mod_comments.remove(data, path) if data is not None and not filename.endswith(".so") else data
               for filename, data in result.items()}
     for filename, data in result.items():
         if filename.endswith(".cfg") and data is not None:
@@ -257,7 +314,7 @@ def header_plan(files, path, stock=None, *, identity=None):
     headers, clean = [], {}
     for filename in scanned:
         data = current_data(files, filename, absent=True)
-        if data is not None:
+        if data is not None and not filename.endswith(".so"):
             stamp = mod_comments.read(data).get(path)
             if stamp is not None:
                 headers.append(stamp)
@@ -290,10 +347,10 @@ def header_plan(files, path, stock=None, *, identity=None):
                 return None
             if (not value.original_absent and isinstance(value.original, bytes)
                     and value.original_hash == mods.digest(value.original)):
-                return mod_comments.strip(value.original)
+                return value.original if filename.endswith(".so") else mod_comments.strip(value.original)
         data = stock_data(stock, filename)
         rom_files.add(filename)
-        return mod_comments.strip(data) if data is not None else None
+        return (data if filename.endswith(".so") else mod_comments.strip(data)) if data is not None else None
 
     if path == smoothing.TARGET:
         result = {}
@@ -317,6 +374,8 @@ def header_plan(files, path, stock=None, *, identity=None):
                 result[filename] = data if native else module.transform(data, False)
     elif path == screws.PYTHON:
         result, _ = helper(clean, baseline, {}, partial=True)
+    elif path == pa.TARGET:
+        result, _ = adaptive_pa(clean, baseline, {})
     elif current_data(clean, path, absent=True) is None:
         result = {path: None}
     else:

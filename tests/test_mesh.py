@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from app import engine, mesh, mods, network
+from app import engine, mesh, mod_versions, mods, network
 from app.remote import APPLY_BATCH, Connection
 
 
@@ -39,6 +39,47 @@ retries: 5
 
 
 class MeshTests(unittest.TestCase):
+    def test_unrelated_configuration_is_compatible_and_preserved(self):
+        source = SOURCE.replace(b'[z_align]\n', b'[gcode_arcs]\nresolution: 0.006\n# user setting\n[z_align]\n')
+        self.assertTrue(mesh.inspect(source)['known'])
+        self.assertTrue(mesh.inspect(source)['patchable'])
+        self.assertNotEqual(mesh.fingerprint(source), mesh.fingerprint(SOURCE))
+        enabled = mesh.transform(source, True)
+        self.assertEqual(mesh.fingerprint(enabled), mesh.fingerprint(source))
+        self.assertIn(b'resolution: 0.006\n# user setting', enabled)
+        self.assertEqual(mesh.transform(enabled, False, SOURCE), source)
+
+    def test_preset_dependencies_use_only_relevant_local_and_included_values(self):
+        lagrange = SOURCE.replace(b'probe_count: 7,7', b'probe_count: 5,5').replace(b'algorithm: bicubic', b'algorithm: lagrange')
+        with self.assertRaisesRegex(ValueError, '9×9'):
+            mesh.validate_dependencies(lagrange)
+        direct = lagrange.replace(b'algorithm: lagrange', b'algorithm: lagrange\nmesh_pps: 0,0')
+        mesh.validate_dependencies(direct)
+        split = SOURCE.replace(b'algorithm: bicubic\n', b'')
+        mesh.validate_dependencies(split, {'mesh.cfg': b'[bed_mesh]\nalgorithm: bicubic\n'})
+        with self.assertRaisesRegex(ValueError, 'defined more than once'):
+            mesh.validate_dependencies(SOURCE, {'mesh.cfg': b'[bed_mesh]\nalgorithm: bicubic\n'})
+        limited = SOURCE.replace(b'max_velocity: 800', b'max_velocity: 40')
+        self.assertTrue(mesh.inspect(limited)['known'])
+        self.assertFalse(mesh.inspect(limited)['patchable'])
+        with self.assertRaisesRegex(ValueError, 'exceeds'):
+            mesh.validate_dependencies(limited)
+
+    def test_incompatible_preset_dependency_blocks_enable_but_not_recorded_disable(self):
+        original = SOURCE.replace(b'probe_count: 7,7', b'probe_count: 5,5').replace(b'algorithm: bicubic', b'algorithm: lagrange')
+        enabled = mesh.transform(original, True)
+        record = mod_versions.capture(mesh.TARGET, original, enabled, firmware='1.1.7.0')
+        ledger = mod_versions.dump({mesh.TARGET: record})
+        analysis = {**mesh.inspect(enabled), 'patchable': False,
+                    'dependency_error': 'The 9×9 preset requires bicubic interpolation or mesh_pps: 0,0.'}
+        value = engine.MeshSnapshot(enabled, mods.digest(enabled), analysis, original, mods.digest(original))
+        snapshot = engine.Snapshot(b'', '', {}, None, None, '', {}, '', {}, 0, mesh=value,
+            versions=engine.MeshSnapshot(ledger, mods.digest(ledger), {},
+                original_hash=mods.digest(b''), original_absent=True))
+        self.assertEqual(engine.prepare_versioned(snapshot, mesh.TARGET, False), original)
+        with self.assertRaisesRegex(ValueError, '9×9'):
+            engine.prepare_versioned(snapshot, mesh.TARGET, True)
+
     def test_exact_values_roundtrip_and_idempotence(self):
         modified = mesh.transform(SOURCE, True)
         self.assertEqual(mesh.transform(modified, True), modified)

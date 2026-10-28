@@ -14,7 +14,7 @@ class PendingValidationTests(unittest.TestCase):
                                  snapshot_connection=("192.0.2.1", "root"),
                                  connected=True, closing=False, busy=False, policy="known",
                                  staged=False, mesh_staged=None, temperature_staged=None,
-                                 screws_staged=None, smoothing_staged=None, warmup_staged=None, restore_pending=False,
+                                 screws_staged=None, smoothing_staged=None, warmup_staged=None, kamp_staged=None, restore_pending=False,
                                  update_active=False, plan_key=None, plan_request=None, plan_result=None,
                                  plan_task=None, plan_timer=Mock(), refresh=Mock(), apply_waiting=None,
                                  apply_button=Mock(), connection=lambda: Connection("192.0.2.1"),

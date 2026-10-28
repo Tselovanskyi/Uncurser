@@ -3,14 +3,14 @@ import base64
 import hashlib
 import re
 
-from . import fluidd_screws, mesh, mesh_temperature, mods, network, screws, smoothing, storage, warmup
+from . import fluidd_screws, kamp, mesh, mesh_temperature, mods, network, pa, screws, smoothing, storage, warmup
 
 
 INIT = "/rom/etc/init.d/klipper"
 _TOOLS = ("/usr/bin/get_sn_mac.sh", "/usr/bin/keybox", "/usr/sbin/fw_printenv", "/etc/fw_env.config")
 _CONFIGS = ("printer.cfg", "gcode_macro.cfg", "sensorless.cfg", "screws_tilt_adjust.cfg")
-_COMMON = (mods.TARGET, smoothing.HOMING.TARGET, warmup.TARGET, screws.PYTHON, screws.CONFIG,
-           fluidd_screws.TARGET, fluidd_screws.INDEX)
+_COMMON = (mods.TARGET, smoothing.HOMING.TARGET, warmup.TARGET, kamp.TARGET, screws.PYTHON, screws.CONFIG,
+           fluidd_screws.TARGET, fluidd_screws.INDEX, *pa.FILES, *pa.DEPENDENCIES)
 _CONFIG_ROOT = "/mnt/UDISK/printer_data/config/"
 _EXTRA_ROOTS = (_CONFIG_ROOT, "/usr/share/klipper/klippy/extras/", "/usr/share/fluidd/assets/")
 
@@ -132,7 +132,7 @@ def scan(remote, status, *, extra_paths=()):
         extra_paths = tuple(dict.fromkeys(extra_paths))
         for path in extra_paths:
             storage.original(path)
-            if (not path.startswith(_EXTRA_ROOTS) or path == storage.LEGACY_RECORDS
+            if ((not path.startswith(_EXTRA_ROOTS) and path not in (*pa.FILES, *pa.DEPENDENCIES)) or path == storage.LEGACY_RECORDS
                     or ".Original.txt" in path or "/__pycache__/" in path
                     or any(ord(char) < 32 or ord(char) == 127 for char in path)):
                 raise ValueError("Unsupported extra firmware file: " + path)
@@ -176,7 +176,7 @@ def scan(remote, status, *, extra_paths=()):
             if source not in records:
                 raise ValueError("The selected ROM source was not scanned: " + source)
             value = records[source]
-            absent = value is None and path in (screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG, *extra_paths)
+            absent = value is None and path in (screws.PYTHON, screws.CONFIG, screws.LEGACY_CONFIG, pa.LIBRARY, *extra_paths)
             files[path] = dict(value or dict(data=None, sha256=None, source=source),
                                available=value is not None or absent, absent=absent,
                                reason="" if value is not None or absent else "The current ROM file is unavailable.")

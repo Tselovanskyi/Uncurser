@@ -151,6 +151,28 @@ def fingerprint(data):
     return hashlib.sha256((text.replace("\r\n", "\n").rstrip() + "\n").encode()).hexdigest()
 
 
+def validate_dependencies(data, includes=None, *, complete=True):
+    """Check only settings that can make this preset invalid at startup."""
+    configs = [parser(split(source)[0]) for source in (data, *(includes or {}).values())]
+    def get(section, key, default=None):
+        values = [config.get(section, key) for config in configs if config.has_option(section, key)]
+        if len(values) > 1:
+            raise ValueError(f"The preset dependency [{section}] {key} is defined more than once.")
+        return values[0] if values else default
+    maximum = get("printer", "max_velocity")
+    if maximum is not None and numeric(("printer", "max_velocity"), maximum) < Decimal(VALUES[("printer", "max_z_velocity")]):
+        raise ValueError("The preset's 50 mm/s Z limit exceeds [printer] max_velocity.")
+    algorithm = get("bed_mesh", "algorithm", "lagrange" if complete else "").strip().lower()
+    if algorithm and algorithm not in ("bicubic", "lagrange"):
+        raise ValueError("The preset requires a recognized [bed_mesh] algorithm.")
+    pps = get("bed_mesh", "mesh_pps", "2,2" if complete else None)
+    if pps is not None:
+        if not re.fullmatch(r"\s*\d+\s*(?:,\s*\d+\s*)?", pps):
+            raise ValueError("[bed_mesh] mesh_pps must contain one or two nonnegative integers.")
+        if algorithm == "lagrange" and any(int(value) for value in pps.split(",")):
+            raise ValueError("The 9×9 preset requires bicubic interpolation or mesh_pps: 0,0.")
+
+
 def inspect(data, original=None):
     try:
         doc = Document(data)
@@ -162,10 +184,14 @@ def inspect(data, original=None):
         applied = applied or legacy
         original_values = Document(original).values if original is not None else None
         partial = original_values is not None and doc.values != original_values and not applied
-        known = fingerprint(data) in (REFERENCE_HASH, LEGACY_REFERENCE_HASH)
-        return {"known": known, "enabled": None if partial else applied, "patchable": True, "legacy": legacy,
-                "label": ("Partial" if partial else "Uncursed" if applied else "Original") if known else "Unknown",
-                "reason": "" if known else "printer.cfg differs from the captured reference outside the mesh preset settings."}
+        dependency_error = ""
+        try:
+            validate_dependencies(data, complete=False)
+        except ValueError as error:
+            dependency_error = str(error)
+        return {"known": True, "enabled": None if partial else applied, "patchable": not dependency_error, "legacy": legacy,
+                "label": "Conflict" if dependency_error else "Partial" if partial else "Uncursed" if applied else "Original",
+                "reason": dependency_error}
     except (ValueError, UnicodeError) as error:
         return {"known": False, "enabled": None, "patchable": False, "label": "Conflict", "reason": str(error)}
 

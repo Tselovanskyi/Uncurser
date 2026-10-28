@@ -7,7 +7,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from app import engine, mesh, mesh_temperature, mod_versions, mods, screws
+from app import engine, mesh, mesh_temperature, mod_comments, mod_versions, mods, screws, storage
 from app.remote import Connection
 from tests import test_mesh, test_mesh_temperature, test_mods, test_screws
 
@@ -159,9 +159,12 @@ class ModVersionTests(unittest.TestCase):
         self.assertEqual(set(records), {*SOURCES, screws.PYTHON})
         self.assertEqual(records[screws.PYTHON]["version"], mod_versions.VERSIONS[screws.PYTHON])
         for path in (mods.TARGET, mesh_temperature.TARGET):
-            self.assertEqual(pending[path], engine.file_snapshot(current, path).data)
-        self.assertEqual(pending[mesh.TARGET], screws.edit_include(current.mesh.data, True))
-        self.assertEqual(mod_versions.undo(pending[mesh.TARGET], records[mesh.TARGET]),
+            self.assertEqual(mod_comments.strip(pending[path]), engine.file_snapshot(current, path).data)
+            self.assertEqual(mod_comments.read(pending[path])[path]["version"], mod_versions.VERSIONS[path])
+        self.assertEqual(mod_comments.strip(pending[mesh.TARGET]), screws.edit_include(current.mesh.data, True))
+        restored = mod_versions.undo(pending[mesh.TARGET], records[mesh.TARGET])
+        self.assertEqual(set(mod_comments.read(restored)), {screws.PYTHON})
+        self.assertEqual(mod_comments.strip(restored),
                          screws.edit_include(test_mesh.SOURCE, True))
 
     def test_new_helper_verifies_latest_records_and_updates_only_older_stamps(self):
@@ -179,7 +182,7 @@ class ModVersionTests(unittest.TestCase):
         self.assertEqual(engine.automatic_updates(current, choices), {mesh_temperature.TARGET})
         pending = engine.prepare_all(current, None, screws_desired=True)
         updated = mod_versions.load(pending[mod_versions.TARGET])
-        self.assertEqual(updated[mesh_temperature.TARGET]["version"], "0.1.5")
+        self.assertEqual(updated[mesh_temperature.TARGET]["version"], mod_versions.VERSIONS[mesh_temperature.TARGET])
         self.assertEqual(updated[mods.TARGET], records[mods.TARGET])
         damaged = helper_ready_snapshot(stamped=True)
         damaged.data = damaged.data.replace(b"chamber = float(match.group(2))", b"chamber = 99")
@@ -220,7 +223,8 @@ class ModVersionTests(unittest.TestCase):
         self.assertEqual(set(records), {mesh.TARGET, mesh_temperature.TARGET})
         for path in records:
             self.assertEqual(records[path]["version"], mod_versions.VERSIONS[path])
-            self.assertEqual(combined[path], engine.file_snapshot(current, path).data)
+            self.assertEqual(mod_comments.strip(combined[path]), engine.file_snapshot(current, path).data)
+            self.assertEqual(mod_comments.read(combined[path])[path]["version"], mod_versions.VERSIONS[path])
 
     def test_legacy_three_enroll_without_runtime_changes(self):
         current = installed_snapshot()
@@ -234,7 +238,8 @@ class ModVersionTests(unittest.TestCase):
         self.assertEqual(set(records), set(SOURCES))
         for path, original in SOURCES.items():
             with self.subTest(path=path):
-                self.assertEqual(pending[path], engine.file_snapshot(current, path).data)
+                self.assertEqual(mod_comments.strip(pending[path]), engine.file_snapshot(current, path).data)
+                self.assertEqual(mod_comments.read(pending[path])[path]["version"], mod_versions.VERSIONS[path])
                 self.assertEqual(records[path]["version"], mod_versions.VERSIONS[path])
                 self.assertEqual(mod_versions.undo(pending[path], records[path]), original)
 
@@ -267,7 +272,9 @@ class ModVersionTests(unittest.TestCase):
                     records = mod_versions.load(automatic[mod_versions.TARGET])
                     self.assertEqual(mesh.Document(automatic[mesh.TARGET]).raw[('bed_mesh', 'speed')], '600')
                     self.assertEqual(records[mesh.TARGET]['version'], mod_versions.VERSIONS[mesh.TARGET])
-                    self.assertEqual(mod_versions.undo(automatic[mesh.TARGET], records[mesh.TARGET]),
+                    restored = mod_versions.undo(automatic[mesh.TARGET], records[mesh.TARGET])
+                    self.assertEqual(set(mod_comments.read(restored)), {screws.PYTHON})
+                    self.assertEqual(mod_comments.strip(restored),
                                      screws.edit_include(test_mesh.SOURCE, True).replace(b'0.1, 0.2', b'0.3, 0.4'))
 
     def test_recorded_undo_ignores_latest_templates_and_preserves_other_data(self):
@@ -363,6 +370,12 @@ class ModVersionTests(unittest.TestCase):
         harness.setUp()
         try:
             current = installed_snapshot()
+            # These supplementary tags already exist; enrolling the missing
+            # ledger can therefore be a genuinely metadata-only transaction.
+            for path in SOURCES:
+                value = engine.file_snapshot(current, path)
+                value.data = mod_comments.put(value.data, path, mod_versions.VERSIONS[path], "1.1.6.4", path)
+                value.sha256 = mods.digest(value.data)
             paths = {mods.TARGET: harness.py, mesh.TARGET: harness.cfg,
                      mesh_temperature.TARGET: harness.root / "gcode_macro.cfg",
                      mod_versions.TARGET: harness.root / "Uncurser_mods.json"}
@@ -407,7 +420,11 @@ class ModVersionTests(unittest.TestCase):
                         document["path"] = mod_versions.TARGET
                         data = json.dumps(document).encode()
                     return {"data": data, "sha256": mods.digest(data)}
-                def python(self, script, request):
+                def python(self, script, request=None):
+                    if request is None:
+                        if "def check_cancel_running(" in script:
+                            return True
+                        raise AssertionError("Unexpected maintenance probe")
                     requests.append(copy.deepcopy(request))
                     mapped = copy.deepcopy(request)
                     for item in mapped["files"]:
@@ -416,6 +433,8 @@ class ModVersionTests(unittest.TestCase):
                     mapped["guards"] = {str(paths[path]): digest for path, digest in mapped["guards"].items()}
                     mapped["patterns"] = {str(harness.root / "*.cfg"):
                         [str(paths[path]) for path in members] for pattern, members in mapped["patterns"].items()}
+                    mapped["recovery_targets"] = {str(paths[path]): digest
+                        for path, digest in mapped.get("recovery_targets", {}).items()}
                     harness.run_request(mapped)
 
             remote = LocalRemote()
@@ -515,14 +534,19 @@ class ModVersionTests(unittest.TestCase):
             def read(self, path):
                 data = documents.get(path)
                 return None if data is None else {"data": data, "sha256": mods.digest(data)}
-            def python(self, *args):
-                return tree
+            def python(self, script, request=None):
+                if script == engine.CONFIG_TREE:
+                    return tree
+                if script == storage._RECOVERY_COPIES:
+                    return []
+                raise AssertionError("Unexpected maintenance probe")
             def identity(self):
                 return {"history": True}
             def prefetch(self, paths):
                 pass
         with patch.object(engine, "Remote", return_value=Reader()), \
                 patch.object(engine, "scan_screws", return_value=None), \
+                patch.object(engine.stock, "scan", return_value=None), \
                 patch.object(engine.network, "status", return_value=STATUS), \
                 patch.object(mesh, "REFERENCE_HASH", mesh.fingerprint(test_mesh.SOURCE)):
             result = engine.scan(Connection("192.0.2.1"), Path("unused"))
